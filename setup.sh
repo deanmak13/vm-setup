@@ -14,6 +14,9 @@ set -euo pipefail
 
 S3_BUCKET="s3://pneuma-dev-state"
 BOOTSTRAP_PATH="scripts/bootstrap.sh"
+LOCAL_BIN="$HOME/.local/bin"
+
+export PATH="$LOCAL_BIN:$PATH"
 
 log() { echo "[vm-setup] $*"; }
 err() { echo "[vm-setup] ERROR: $*" >&2; exit 1; }
@@ -21,10 +24,11 @@ err() { echo "[vm-setup] ERROR: $*" >&2; exit 1; }
 # --- Install AWS CLI if missing ---
 if ! command -v aws &>/dev/null; then
     log "Installing AWS CLI..."
+    mkdir -p "$LOCAL_BIN"
     apt-get update -qq && apt-get install -y -qq unzip curl > /dev/null 2>&1 || true
     curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
     unzip -qo /tmp/awscliv2.zip -d /tmp/aws-cli-install
-    sudo /tmp/aws-cli-install/aws/install --update 2>/dev/null || /tmp/aws-cli-install/aws/install --update
+    /tmp/aws-cli-install/aws/install --install-dir "$HOME/.local/aws-cli" --bin-dir "$LOCAL_BIN" --update
     rm -rf /tmp/awscliv2.zip /tmp/aws-cli-install
     log "AWS CLI installed: $(aws --version)"
 else
