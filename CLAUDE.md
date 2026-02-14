@@ -1,37 +1,58 @@
 # vm-setup
 
-Generic VM bootstrap script. No project-specific content — just the ignition key
-that pulls the real environment from AWS S3.
+Generic VM bootstrap for restoring a dev environment from AWS S3.
 
-## What this repo does
+## How to use this repo
 
-`setup.sh` is the only thing that matters here. It:
-1. Installs the AWS CLI (if missing)
-2. Prompts for AWS credentials (or reads from env vars with `--env`)
-3. Pulls `bootstrap.sh` from a private S3 bucket
-4. Runs `bootstrap.sh`, which restores dotfiles, Claude Code state, repos, etc.
+When the user asks to "set up my environment", "run setup", "bootstrap", or anything similar:
 
-## Usage on a fresh VM
+1. Run `bash ~/vm-setup/setup.sh`
+2. The script will prompt the user for AWS credentials interactively (unless AWS env vars are already set)
+3. It handles everything else automatically: installs AWS CLI, pulls bootstrap.sh from S3, runs it
 
+That's it. Do not modify setup.sh or add project-specific logic here.
+
+If setup.sh is not found at `~/vm-setup/setup.sh`, clone it first:
 ```bash
 git clone https://github.com/deanmak13/vm-setup.git ~/vm-setup
-bash ~/vm-setup/setup.sh
 ```
 
-Or with env vars (no interactive prompt):
-```bash
-AWS_ACCESS_KEY_ID=xxx AWS_SECRET_ACCESS_KEY=xxx AWS_DEFAULT_REGION=us-east-1 bash ~/vm-setup/setup.sh --env
+## What the full flow does
+
 ```
+setup.sh (this repo, from GitHub)
+  → Installs AWS CLI
+  → Prompts for AWS credentials
+  → Pulls bootstrap.sh from s3://pneuma-dev-state/scripts/
+  → Runs bootstrap.sh, which:
+      → Restores ~/.aws/ (AWS config)
+      → Restores dotfiles (.bashrc, .gitconfig, etc.)
+      → Restores ~/.claude/ (Claude Code memories, settings, plugins)
+      → Restores ~/.claude.json (Claude Code auth and project state)
+      → Restores ~/.config/gh/ (GitHub CLI auth)
+      → Clones project repos from GitHub
+      → Restores bootstrap.sh and save-state.sh to ~/
+```
+
+## Before shutting down a VM
+
+Remind the user to run:
+```bash
+bash ~/save-state.sh
+```
+This syncs all state back to S3. If the user says "shutting down", "saving state",
+or "tearing down", run that command.
 
 ## What lives where
 
 | Location | Contents |
 |----------|----------|
-| **This repo (GitHub)** | `setup.sh` — generic, no secrets, no project config |
-| **S3 bucket** | bootstrap.sh, save-state.sh, dotfiles, Claude Code state, AWS config, gh CLI auth |
+| **This repo (GitHub)** | `setup.sh` only — generic, no secrets, no project config |
+| **S3 (`pneuma-dev-state`)** | bootstrap.sh, save-state.sh, dotfiles, Claude Code state, AWS config, gh auth |
 | **Project repos (GitHub)** | Source code, CLAUDE.md files |
 
 ## Rules
+
 - Never commit credentials, tokens, or secrets to this repo
 - Keep setup.sh generic — no project-specific logic belongs here
 - All sensitive/personal state goes to S3 via save-state.sh
