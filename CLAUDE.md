@@ -51,6 +51,19 @@ or "tearing down", run that command.
 | **S3 (`pneuma-dev-state`)** | bootstrap.sh, save-state.sh, dotfiles, Claude Code state, AWS config, gh auth |
 | **Project repos (GitHub)** | Source code, CLAUDE.md files |
 
+## GPU Setup (k3s + NVIDIA)
+
+If the VM has an NVIDIA GPU and runs k3s:
+
+```bash
+sudo bash ~/vm-setup/gpu-k3s-setup.sh
+```
+
+This configures containerd to use the NVIDIA runtime, restarts k3s, and deploys the
+NVIDIA device plugin DaemonSet so pods can request `nvidia.com/gpu` resources.
+
+Prerequisites: NVIDIA drivers + `nvidia-container-toolkit` must be installed first.
+
 ## Rules
 
 - Never commit credentials, tokens, or secrets to this repo
