@@ -37,20 +37,29 @@ if ! systemctl is-active --quiet k3s; then
 fi
 log "k3s is active."
 
-# --- Configure containerd for NVIDIA runtime (set as default) ---
-CONTAINERD_CONFIG="/var/lib/rancher/k3s/agent/etc/containerd/config.toml.tmpl"
-log "Configuring containerd NVIDIA runtime at $CONTAINERD_CONFIG ..."
-nvidia-ctk runtime configure \
-    --runtime=containerd \
-    --config="$CONTAINERD_CONFIG" \
-    --set-as-default
-log "containerd config written."
+# --- Set nvidia as the default containerd runtime for k3s ---
+# k3s v1.31+ (containerd 2.0) auto-detects nvidia-container-runtime and adds
+# it as a named runtime. We just need to set it as default so the device plugin
+# pod can detect the GPU. We extend the base template (not replace it).
+CONTAINERD_DIR="/var/lib/rancher/k3s/agent/etc/containerd"
+CONTAINERD_TMPL="$CONTAINERD_DIR/config.toml.tmpl"
+mkdir -p "$CONTAINERD_DIR"
+
+log "Writing containerd config template at $CONTAINERD_TMPL ..."
+cat > "$CONTAINERD_TMPL" <<'TMPL'
+{{ template "base" . }}
+
+[plugins.'io.containerd.cri.v1.runtime'.containerd]
+  default_runtime_name = "nvidia"
+TMPL
+log "containerd config template written."
 
 # --- Restart k3s to pick up new runtime ---
 log "Restarting k3s..."
-systemctl restart k3s
-log "k3s restarted. Waiting for node to be ready..."
-sleep 10
+k3s-killall.sh 2>/dev/null || true
+systemctl start k3s
+log "k3s started. Waiting for node to be ready..."
+sleep 15
 
 # --- Deploy NVIDIA device plugin DaemonSet ---
 DEVICE_PLUGIN_VERSION="v0.17.0"
