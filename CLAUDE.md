@@ -64,6 +64,20 @@ NVIDIA device plugin DaemonSet so pods can request `nvidia.com/gpu` resources.
 
 Prerequisites: NVIDIA drivers + `nvidia-container-toolkit` must be installed first.
 
+## Cloudflare Origin Firewall
+
+To restrict HTTP/HTTPS traffic to Cloudflare IPs only (for proxied subdomains):
+
+```bash
+sudo bash ~/vm-setup/cloudflare-origin-firewall.sh --dry-run   # Preview rules
+sudo bash ~/vm-setup/cloudflare-origin-firewall.sh --apply      # Apply rules
+sudo bash ~/vm-setup/cloudflare-origin-firewall.sh --remove     # Remove rules
+```
+
+**WARNING**: Do NOT apply if you have DNS-only (grey cloud) subdomains that need
+direct access from non-Cloudflare IPs (e.g. Meta webhooks). In that case, use
+Traefik middleware (IPAllowList) on a per-ingress basis instead.
+
 ## Rules
 
 - Never commit credentials, tokens, or secrets to this repo
