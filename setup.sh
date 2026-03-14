@@ -14,22 +14,43 @@ set -euo pipefail
 
 S3_BUCKET="s3://pneuma-dev-state"
 BOOTSTRAP_PATH="scripts/bootstrap.sh"
-LOCAL_BIN="$HOME/.local/bin"
 
+# Resolve target user — if run as root, install for the non-root user
+if [ "$(id -u)" -eq 0 ]; then
+    TARGET_USER="${SUDO_USER:-$(ls /home/ | head -1)}"
+    TARGET_HOME="/home/$TARGET_USER"
+    log_prefix="[vm-setup] (as root, target: $TARGET_USER)"
+else
+    TARGET_USER="$(whoami)"
+    TARGET_HOME="$HOME"
+    log_prefix="[vm-setup]"
+fi
+
+LOCAL_BIN="$TARGET_HOME/.local/bin"
 export PATH="$LOCAL_BIN:$PATH"
 
-log() { echo "[vm-setup] $*"; }
-err() { echo "[vm-setup] ERROR: $*" >&2; exit 1; }
+log() { echo "$log_prefix $*"; }
+err() { echo "$log_prefix ERROR: $*" >&2; exit 1; }
+
+# --- Install prerequisites ---
+log "Installing prerequisites (unzip, curl, Playwright system deps)..."
+apt-get update -qq
+apt-get install -y -qq unzip curl \
+    libatk1.0-0 libatk-bridge2.0-0 libcups2 libxdamage1 libxrandr2 \
+    libgbm1 libpango-1.0-0 libcairo2 libasound2t64 libnspr4 libnss3 \
+    libxcomposite1 libxfixes3 libdrm2 libxkbcommon0 \
+    || err "Failed to install prerequisites. Check apt."
 
 # --- Install AWS CLI if missing ---
 if ! command -v aws &>/dev/null; then
     log "Installing AWS CLI..."
     mkdir -p "$LOCAL_BIN"
-    apt-get update -qq && apt-get install -y -qq unzip curl > /dev/null 2>&1 || true
     curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
     unzip -qo /tmp/awscliv2.zip -d /tmp/aws-cli-install
-    /tmp/aws-cli-install/aws/install --install-dir "$HOME/.local/aws-cli" --bin-dir "$LOCAL_BIN" --update
+    /tmp/aws-cli-install/aws/install --install-dir "$TARGET_HOME/.local/aws-cli" --bin-dir "$LOCAL_BIN" --update
     rm -rf /tmp/awscliv2.zip /tmp/aws-cli-install
+    # Fix ownership if running as root
+    [ "$(id -u)" -eq 0 ] && chown -R "$TARGET_USER:$TARGET_USER" "$TARGET_HOME/.local"
     log "AWS CLI installed: $(aws --version)"
 else
     log "AWS CLI already installed: $(aws --version)"
@@ -63,10 +84,15 @@ fi
 
 # --- Pull bootstrap.sh from S3 and run it ---
 log "Pulling bootstrap.sh from S3..."
-if aws s3 cp "$S3_BUCKET/$BOOTSTRAP_PATH" "$HOME/bootstrap.sh"; then
-    chmod +x "$HOME/bootstrap.sh"
+if aws s3 cp "$S3_BUCKET/$BOOTSTRAP_PATH" "$TARGET_HOME/bootstrap.sh"; then
+    chmod +x "$TARGET_HOME/bootstrap.sh"
+    [ "$(id -u)" -eq 0 ] && chown "$TARGET_USER:$TARGET_USER" "$TARGET_HOME/bootstrap.sh"
     log "Running bootstrap.sh..."
-    bash "$HOME/bootstrap.sh"
+    if [ "$(id -u)" -eq 0 ]; then
+        su - "$TARGET_USER" -c "bash $TARGET_HOME/bootstrap.sh"
+    else
+        bash "$TARGET_HOME/bootstrap.sh"
+    fi
 else
     err "bootstrap.sh not found in S3 at $S3_BUCKET/$BOOTSTRAP_PATH. Run save-state.sh on an existing instance first."
 fi
