@@ -78,6 +78,36 @@ sudo bash ~/vm-setup/cloudflare-origin-firewall.sh --remove     # Remove rules
 direct access from non-Cloudflare IPs (e.g. Meta webhooks). In that case, use
 Traefik middleware (IPAllowList) on a per-ingress basis instead.
 
+## Automatic Updates & Security Patches
+
+To enable unattended security upgrades and a weekly reboot:
+
+```bash
+sudo bash ~/vm-setup/auto-updates.sh
+```
+
+This installs `unattended-upgrades` (security-only), configures daily auto-updates,
+and schedules a reboot every Sunday at 4:00 AM via a systemd timer. The reboot has
+a ±5 minute randomized delay to avoid thundering herd on multi-VM setups.
+
+Verify the timer: `systemctl list-timers weekly-reboot.timer`
+
+## Zombie Process Monitor
+
+To set up early-warning alerts for zombie process accumulation:
+
+```bash
+sudo bash ~/vm-setup/zombie-monitor.sh                # Default threshold: 5
+sudo bash ~/vm-setup/zombie-monitor.sh --threshold 3   # Custom threshold
+```
+
+Runs every 5 minutes via cron. When zombie count exceeds the threshold, it logs to
+both syslog (`daemon.warning`) and `/var/log/zombie-alerts.log` with full process
+details (PID, PPID, command).
+
+Check alerts: `cat /var/log/zombie-alerts.log`
+Check syslog: `journalctl -t zombie-monitor`
+
 ## Rules
 
 - Never commit credentials, tokens, or secrets to this repo
