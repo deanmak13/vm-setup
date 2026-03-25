@@ -39,6 +39,8 @@ apt-get install -y -qq unzip curl \
     libatk1.0-0 libatk-bridge2.0-0 libcups2 libxdamage1 libxrandr2 \
     libgbm1 libpango-1.0-0 libcairo2 libasound2t64 libnspr4 libnss3 \
     libxcomposite1 libxfixes3 libdrm2 libxkbcommon0 \
+    libxcursor1 libxi6 libxtst6 libxss1 libx11-xcb1 \
+    libpangocairo-1.0-0 libgdk-pixbuf2.0-0 \
     || err "Failed to install prerequisites. Check apt."
 
 # --- Install AWS CLI if missing ---
