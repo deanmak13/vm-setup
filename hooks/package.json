@@ -1,0 +1,12 @@
+{
+  "name": "pneuma-portal-scripts",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "seed": "tsx seed-control-data.ts"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.49.4",
+    "tsx": "^4.19.4"
+  }
+}
