@@ -98,3 +98,18 @@ if aws s3 cp "$S3_BUCKET/$BOOTSTRAP_PATH" "$TARGET_HOME/bootstrap.sh"; then
 else
     err "bootstrap.sh not found in S3 at $S3_BUCKET/$BOOTSTRAP_PATH. Run save-state.sh on an existing instance first."
 fi
+
+# ── Playwright: disable AppArmor sandbox restriction ──
+# Required for Chromium to run without --no-sandbox on Ubuntu 23.10+
+echo "kernel.apparmor_restrict_unprivileged_userns=0" | sudo tee /etc/sysctl.d/99-playwright.conf
+sudo sysctl -p /etc/sysctl.d/99-playwright.conf
+
+# --- Pneuma: disable dead IPv6 egress (2026-06-11) ---
+# The Contabo node's IPv6 path to ghcr.io is broken (connection reset),
+# but containerd resolves AAAA + tries IPv6 first → ImagePullBackOff that
+# never self-heals. Disable IPv6 so all registry pulls use the working IPv4.
+sudo tee /etc/sysctl.d/99-pneuma-disable-dead-ipv6.conf >/dev/null <<'SYSCTL'
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+SYSCTL
+sudo sysctl --system >/dev/null 2>&1 || true
