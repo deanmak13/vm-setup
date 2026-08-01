@@ -1,0 +1,87 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: wireguard
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wireguard
+  namespace: wireguard
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: wireguard
+  template:
+    metadata:
+      labels:
+        app: wireguard
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: wireguard
+          image: lscr.io/linuxserver/wireguard:latest
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            capabilities:
+              add:
+                - NET_ADMIN
+                - SYS_MODULE
+          env:
+            - name: PUID
+              value: "0"
+            - name: PGID
+              value: "0"
+            - name: TZ
+              value: Europe/Berlin
+            # Replace this with the replacement host's public IP/DNS name.
+            - name: SERVERURL
+              value: 109.199.96.150
+            - name: SERVERPORT
+              value: "51820"
+            - name: PEERS
+              value: phone
+            - name: PEERDNS
+              value: 1.1.1.1
+            - name: INTERNAL_SUBNET
+              value: 10.13.13.0
+            - name: ALLOWEDIPS
+              value: 0.0.0.0/0
+            - name: PERSISTENTKEEPALIVE_PEERS
+              value: all
+            - name: LOG_CONFS
+              value: "true"
+          ports:
+            - name: wireguard
+              containerPort: 51820
+              protocol: UDP
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "wg show wg0 >/dev/null 2>&1"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", "wg show wg0 >/dev/null 2>&1"]
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          volumeMounts:
+            - name: config
+              mountPath: /config
+            - name: modules
+              mountPath: /lib/modules
+              readOnly: true
+      volumes:
+        - name: config
+          hostPath:
+            path: /var/lib/wireguard
+            type: DirectoryOrCreate
+        - name: modules
+          hostPath:
+            path: /lib/modules
+            type: Directory
