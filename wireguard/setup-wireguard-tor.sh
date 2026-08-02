@@ -146,7 +146,7 @@ spec:
             - |
               export DEBIAN_FRONTEND=noninteractive
               apt-get update -qq
-              apt-get install -y -qq --no-install-recommends ca-certificates iptables tor
+              apt-get -y -qq -o Dpkg::Options::=--force-confold --no-install-recommends install ca-certificates iptables tor
               mkdir -p /var/lib/tor
               chown -R debian-tor:debian-tor /var/lib/tor
               iptables -t nat -N WG_TOR 2>/dev/null || true
@@ -183,6 +183,7 @@ spec:
             type: DirectoryOrCreate
 EOF
 
+kubectl -n "$NS" rollout restart deployment/tor-gateway >/dev/null
 kubectl -n "$NS" rollout status deployment/wireguard --timeout=300s
 kubectl -n "$NS" rollout status deployment/tor-gateway --timeout=600s
 echo "WireGuard-over-Tor installed; exit country=${EXIT_COUNTRY,,}; endpoint=$SERVER_URL:51820"
