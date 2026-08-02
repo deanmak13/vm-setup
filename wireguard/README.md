@@ -42,6 +42,12 @@ This directory contains the reproducible, non-secret deployment definition for t
 
 The WireGuard keys and peer configuration are intentionally not stored in this repository. Losing the encrypted backup means existing phone profiles must be regenerated.
 
+## Optional Tor gateway
+
+Run `setup-wireguard-tor.sh install --exit-country de` as root on the host to route WireGuard client TCP and DNS through Tor while blocking other forwarded traffic. Tor does not transparently carry general UDP, so games, calls, QUIC, and some apps may not work. The host's own management traffic remains direct.
+
+Change the exit-country constraint later with `setup-wireguard-tor.sh set-exit nl` (or another two-letter country code), then verify the phone's public IP. This changes the Tor circuit constraint; it does not make the connection anonymous by itself.
+
 ## Location switching
 
 WireGuard exits through the host where it runs. To offer other countries, deploy another exit node in that country and create a separate peer profile, or configure this server as a client of a multi-location VPN provider.

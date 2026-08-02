@@ -33,9 +33,10 @@ torrc() {
   cat <<EOF
 DataDirectory /var/lib/tor
 RunAsDaemon 0
+User debian-tor
 SocksPort 0
-TransPort 9040
-DNSPort 5353
+TransPort 0.0.0.0:9040
+DNSPort 0.0.0.0:5353
 AutomapHostsOnResolve 1
 VirtualAddrNetworkIPv4 10.192.0.0/10
 ClientUseIPv6 0
