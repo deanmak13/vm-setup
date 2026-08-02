@@ -147,7 +147,7 @@ spec:
             - |
               export DEBIAN_FRONTEND=noninteractive
               apt-get update -qq
-              apt-get -y -qq -o Dpkg::Options::=--force-confold --no-install-recommends install ca-certificates iptables tor
+              apt-get -y -qq -o Dpkg::Options::=--force-confold --no-install-recommends install ca-certificates iptables tor tor-geoipdb
               mkdir -p /var/lib/tor
               chown -R debian-tor:debian-tor /var/lib/tor
               iptables -t nat -N WG_TOR 2>/dev/null || true
