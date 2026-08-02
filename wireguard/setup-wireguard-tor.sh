@@ -9,11 +9,12 @@ NS=wireguard
 ACTION=install
 EXIT_COUNTRY=de
 SERVER_URL=
+RESTORE_DIR=
 
 usage() {
   cat <<'EOF'
 Usage:
-  setup-wireguard-tor.sh install [--exit-country CC] [--server-url HOST]
+  setup-wireguard-tor.sh install [--exit-country CC] [--server-url HOST] [--restore-dir DIR]
   setup-wireguard-tor.sh set-exit CC
   setup-wireguard-tor.sh status
 
@@ -50,6 +51,7 @@ while (($#)); do
     install|set-exit|status) ACTION=$1; shift ;;
     --exit-country) EXIT_COUNTRY=$2; shift 2 ;;
     --server-url) SERVER_URL=$2; shift 2 ;;
+    --restore-dir) RESTORE_DIR=$2; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *)
       if [[ $ACTION == set-exit && $EXIT_COUNTRY == de ]]; then
@@ -109,6 +111,13 @@ kind: Namespace
 metadata:
   name: $NS
 EOF
+
+if [[ -n $RESTORE_DIR ]]; then
+  [[ -d $RESTORE_DIR ]] || die "restore directory does not exist: $RESTORE_DIR"
+  install -d -m 700 /var/lib/wireguard
+  cp -a "$RESTORE_DIR"/. /var/lib/wireguard/
+  chmod -R go-rwx /var/lib/wireguard
+fi
 
 sed "s#value: 109.199.96.150#value: $SERVER_URL#" "$ROOT_DIR/wireguard-k3s.yaml" | kubectl apply -f - >/dev/null
 
