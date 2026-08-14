@@ -77,23 +77,33 @@ done < <(ps -eo pid,etimes,args | grep '[R]unner.Worker' || true)
 for repo in "${!OLDEST[@]}"; do
     age=${OLDEST[$repo]}
     (( age < GRACE )) && continue
-    # A run can report status "queued" while one of its jobs is already
-    # executing on a runner (observed 2026-08-14: run queued, job
-    # in_progress — the first reaper build counted only in_progress and
-    # killed a live 25-minute gate). Treat BOTH as live.
-    live=0
-    for st in in_progress queued; do
-        n=$(curl -sf -m 20 \
-            -H "Authorization: Bearer $TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/$OWNER/$repo/actions/runs?status=$st&per_page=1" \
-            | python3 -c 'import json,sys; print(json.load(sys.stdin)["total_count"])' 2>/dev/null)
-        # API failure → do nothing (never reap blind).
-        [[ "$n" =~ ^[0-9]+$ ]] || { live=-1; break; }
-        (( live += n ))
-    done
-    (( live < 0 )) && { note "skip $repo: API check failed"; continue; }
-    (( live > 0 )) && continue
+    # Two observed failure shapes pull in opposite directions:
+    #  - a run can report "queued" while its job is already executing
+    #    (2026-08-14 AM: reaper killed a live 25-min gate), so queued
+    #    cannot simply mean dead;
+    #  - a wedged runner holds workers busy while runs sit queued for
+    #    HOURS (2026-08-14 PM: 13h-old queue, zero in_progress), so
+    #    queued cannot simply mean alive either.
+    # Resolution: in_progress always blocks reaping; queued blocks only
+    # while the newest queued run is younger than QUEUED_GRACE — the
+    # status-lag window is minutes, a wedge is hours.
+    QUEUED_GRACE=1200
+    api() { curl -sf -m 20 -H "Authorization: Bearer $TOKEN" \
+        -H "Accept: application/vnd.github+json" \
+        "https://api.github.com/repos/$OWNER/$repo/actions/runs?status=$1&per_page=1"; }
+    inprog=$(api in_progress | python3 -c 'import json,sys; print(json.load(sys.stdin)["total_count"])' 2>/dev/null)
+    [[ "$inprog" =~ ^[0-9]+$ ]] || { note "skip $repo: API check failed"; continue; }
+    (( inprog > 0 )) && continue
+    queued_age=$(api queued | python3 -c '
+import json,sys,datetime
+d=json.load(sys.stdin)
+runs=d.get("workflow_runs") or []
+if not runs: print(-1)
+else:
+    t=datetime.datetime.fromisoformat(runs[0]["created_at"].replace("Z","+00:00"))
+    print(int((datetime.datetime.now(datetime.timezone.utc)-t).total_seconds()))' 2>/dev/null)
+    [[ "$queued_age" =~ ^-?[0-9]+$ ]] || { note "skip $repo: API check failed"; continue; }
+    if (( queued_age >= 0 && queued_age < QUEUED_GRACE )); then continue; fi
     units=$(systemctl list-units "actions.runner.$OWNER-$repo.*" --no-legend --plain | awk '{print $1}')
     [[ -n "$units" ]] || continue
     note "REAP $repo: Worker age ${age}s, in_progress=0 — restarting: $units"
