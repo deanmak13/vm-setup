@@ -77,14 +77,23 @@ done < <(ps -eo pid,etimes,args | grep '[R]unner.Worker' || true)
 for repo in "${!OLDEST[@]}"; do
     age=${OLDEST[$repo]}
     (( age < GRACE )) && continue
-    inprog=$(curl -sf -m 20 \
-        -H "Authorization: Bearer $TOKEN" \
-        -H "Accept: application/vnd.github+json" \
-        "https://api.github.com/repos/$OWNER/$repo/actions/runs?status=in_progress&per_page=1" \
-        | python3 -c 'import json,sys; print(json.load(sys.stdin)["total_count"])' 2>/dev/null)
-    # API failure → do nothing (never reap blind).
-    [[ "$inprog" =~ ^[0-9]+$ ]] || { note "skip $repo: API check failed"; continue; }
-    (( inprog > 0 )) && continue
+    # A run can report status "queued" while one of its jobs is already
+    # executing on a runner (observed 2026-08-14: run queued, job
+    # in_progress — the first reaper build counted only in_progress and
+    # killed a live 25-minute gate). Treat BOTH as live.
+    live=0
+    for st in in_progress queued; do
+        n=$(curl -sf -m 20 \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$OWNER/$repo/actions/runs?status=$st&per_page=1" \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["total_count"])' 2>/dev/null)
+        # API failure → do nothing (never reap blind).
+        [[ "$n" =~ ^[0-9]+$ ]] || { live=-1; break; }
+        (( live += n ))
+    done
+    (( live < 0 )) && { note "skip $repo: API check failed"; continue; }
+    (( live > 0 )) && continue
     units=$(systemctl list-units "actions.runner.$OWNER-$repo.*" --no-legend --plain | awk '{print $1}')
     [[ -n "$units" ]] || continue
     note "REAP $repo: Worker age ${age}s, in_progress=0 — restarting: $units"
