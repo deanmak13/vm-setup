@@ -68,7 +68,10 @@ while read -r pid etimes args; do
     # /home/ubuntu/actions-runner-<repo>[-N]/bin.../Runner.Worker
     dir=${args#*actions-runner-}
     repo=${dir%%/*}
+    # Runner dirs carry the RUNNER name (…-contabo, …-contabo-2); the repo is
+    # what remains after stripping that suffix (2026-08-15 rebuild).
     repo=${repo%-2}; repo=${repo%-3}
+    repo=${repo%-contabo}
     [[ -n "$repo" ]] || continue
     cur=${OLDEST[$repo]:-0}
     (( etimes > cur )) && OLDEST[$repo]=$etimes
