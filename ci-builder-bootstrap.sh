@@ -55,12 +55,16 @@ RUNNERS=$(cat <<'EOF'
 pneuma pneuma-contabo y
 pneuma-engine pneuma-engine-contabo y
 pneuma-engine pneuma-engine-contabo-2 y
+pneuma-engine pneuma-engine-contabo-3 y
+pneuma-engine pneuma-engine-contabo-4 y
 pneuma-portal pneuma-portal-contabo y
 pneuma-portal pneuma-portal-contabo-2 y
+pneuma-portal pneuma-portal-contabo-3 y
 pneuma-proto pneuma-proto-contabo y
 pneuma-helm-charts pneuma-helm-charts-contabo y
 pneuma-deployments pneuma-deployments-contabo y
 pneuma-deployments pneuma-deployments-contabo-2 y
+pneuma-deployments pneuma-deployments-contabo-3 y
 pneuma-branding pneuma-branding-contabo n
 pneuma-docs pneuma-docs-contabo n
 pneuma-mem0 pneuma-mem0-contabo n
