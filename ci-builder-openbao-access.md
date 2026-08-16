@@ -49,8 +49,8 @@ needs a TST kubeconfig or network route.
    mkdir -p /etc/cloudflared
    cat > /etc/cloudflared/openbao-access.env <<EOF
    CF_ACCESS_HOSTNAME=openbao-ci-tst.neopneuma.com
-   CF_ACCESS_CLIENT_ID=<client_id from step 2>
-   CF_ACCESS_CLIENT_SECRET=<client_secret from step 2>
+   TUNNEL_SERVICE_TOKEN_ID=<client_id from step 2>
+   TUNNEL_SERVICE_TOKEN_SECRET=<client_secret from step 2>
    EOF
    chmod 600 /etc/cloudflared/openbao-access.env
    ```

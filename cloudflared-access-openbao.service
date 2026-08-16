@@ -11,15 +11,25 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# SECURITY: the service token travels ONLY via environment. cloudflared
+# reads TUNNEL_SERVICE_TOKEN_ID / TUNNEL_SERVICE_TOKEN_SECRET natively, so
+# no --service-token-* flags — systemd resolves ${VAR} in ExecStart into
+# argv, which any local user could read via ps//proc/<pid>/cmdline on this
+# shared 13-runner host.
 EnvironmentFile=/etc/cloudflared/openbao-access.env
 ExecStart=/usr/local/bin/cloudflared access tcp \
     --hostname ${CF_ACCESS_HOSTNAME} \
-    --url 127.0.0.1:18200 \
-    --service-token-id ${CF_ACCESS_CLIENT_ID} \
-    --service-token-secret ${CF_ACCESS_CLIENT_SECRET}
+    --url 127.0.0.1:18200
 Restart=always
 RestartSec=5
-User=root
+# Least privilege: binds only 127.0.0.1:18200 (unprivileged) + outbound
+# HTTPS — no root capability needed. DynamicUser gives a transient
+# unprivileged account with no home/persistent state to manage.
+DynamicUser=yes
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target
