@@ -229,10 +229,32 @@ while read -r repo runner_name was_enabled; do
     fi
 done <<< "$RUNNERS"
 
+# --- OpenBao access for CI (cloudflared Access TCP proxy) ---
+# Declarative replacement for the old "ssh -R 18200 reverse tunnel, nobody
+# maintains it" OPEN ITEM. See ci-builder-openbao-access.md for the
+# one-time Cloudflare Access setup this depends on. Safe to re-run: skips
+# cleanly if the operator hasn't done the one-time credential drop yet.
+if ! command -v cloudflared >/dev/null 2>&1; then
+    log "installing cloudflared"
+    curl -fsSL -o /usr/local/bin/cloudflared \
+        https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+    chmod +x /usr/local/bin/cloudflared
+fi
+
+if [[ -f /etc/cloudflared/openbao-access.env ]]; then
+    install -m 0644 "$REPO_DIR/cloudflared-access-openbao.service" \
+        /etc/systemd/system/cloudflared-access-openbao.service
+    systemctl daemon-reload
+    systemctl enable --now cloudflared-access-openbao.service
+    log "cloudflared-access-openbao.service enabled — verify with: systemctl status cloudflared-access-openbao"
+else
+    log "OPEN ITEM: /etc/cloudflared/openbao-access.env missing — OpenBao CI access proxy NOT installed. See ci-builder-openbao-access.md."
+fi
+
 log "bootstrap complete. Verify with:"
 log "  systemctl list-units 'actions.runner.*' --no-legend"
 log "  kubectl get all -A"
 log "  systemctl list-timers | grep -E 'reaper|janitor'"
-log "OPEN ITEM: OpenBao reverse tunnel (ssh -R 18200 from TST) is NOT automated — see ci-builder-migration.md."
+log "  systemctl status cloudflared-access-openbao"
 log "OPEN ITEM: run the WireGuard manifest apply command printed in step 7 (not automated)."
 
