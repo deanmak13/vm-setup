@@ -1,0 +1,25 @@
+[Unit]
+Description=cloudflared Access TCP proxy — ci-builder to TST OpenBao
+# Replaces the old ssh -R 18200 reverse tunnel / kubectl port-forward, both
+# of which required a human to keep a session alive and died silently.
+# This proxies through Cloudflare Access instead: outbound-only from
+# ci-builder (no inbound port needed on the TST side), authenticated with a
+# Cloudflare Access Service Token, and restarted automatically by systemd.
+# See ci-builder-openbao-access.md for the one-time setup this depends on.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/cloudflared/openbao-access.env
+ExecStart=/usr/local/bin/cloudflared access tcp \
+    --hostname ${CF_ACCESS_HOSTNAME} \
+    --url 127.0.0.1:18200 \
+    --service-token-id ${CF_ACCESS_CLIENT_ID} \
+    --service-token-secret ${CF_ACCESS_CLIENT_SECRET}
+Restart=always
+RestartSec=5
+User=root
+
+[Install]
+WantedBy=multi-user.target
