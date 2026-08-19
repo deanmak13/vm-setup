@@ -11,22 +11,46 @@
 # clean. Nothing reaps these workers; a human had to notice and restart
 # runner services by hand.
 #
-# THE CURE: every 5 minutes, for each repo runner whose Runner.Worker
-# process has existed longer than a grace period, ask GitHub whether that
-# repo has ANY in-progress workflow run. No in-progress run + old Worker
-# = zombie → restart that repo's runner services (restart is safe: the
-# listener re-registers and picks queued work up immediately).
+# THE CURE (v3, 2026-08-19 — evidence that cannot lie): every 5 minutes,
+# for each repo runner whose Runner.Worker process has existed longer
+# than a grace period, gather TWO independent liveness signals before
+# ever touching it:
 #
-# A repo with at least one in-progress run is always left alone — we
-# cannot attribute runs to a specific runner cheaply, so a zombie can
-# only survive while a sibling run of the SAME repo is genuinely live,
-# and it is reaped on the first quiet cycle after.
+#   1. JOB-level GitHub check. Run-level status ("queued"/"in_progress")
+#      is provably unreliable: GitHub has been observed reporting a run
+#      as "queued" while its job is actively executing under
+#      commit-keyed concurrency (2026-08-19: killed two legitimate
+#      5h-queued engine builds this way, at 22:15:54 and 00:10:38). So
+#      we never trust run.status. Instead we take the newest 3
+#      non-completed runs for the repo and ask the JOBS endpoint
+#      directly — any job.status == "in_progress" means the repo is
+#      alive, full stop.
+#   2. Local CPU-progress check. Each tick we snapshot every Worker
+#      PID's utime+stime from /proc; a worker whose CPU time grew by
+#      more than 2s since the last tick is BUILDING and can never be
+#      reaped, regardless of what the API says. A repo must show near-
+#      zero CPU growth for TWO consecutive ticks (~10 minutes of real
+#      idle) before it counts as CPU-dead.
+#
+# A repo is only reaped when BOTH signals agree it is dead: the jobs API
+# shows nothing in-progress AND CPU has been flat for two ticks running.
+# Either signal alone blocks reaping — this is deliberately biased
+# toward leaving a wedged runner alone over killing a live build.
+#
+# Runner-name → repo derivation also had a bug: stripping only "-2"/"-3"
+# suffixes missed "-4" (or any future -N), causing "API check failed"
+# skips for that runner forever. Fixed with a single suffix-agnostic
+# regex.
 #
 # Requires: a GitHub token with repo read scope at /root/.runner-reaper-token
 # (mode 600). The installer copies it from --token-file.
 #
 # Usage:
 #   sudo bash runner-reaper.sh --token-file /path/to/token [--grace-seconds 600]
+#
+# The installed /usr/local/bin/runner-reaper also accepts --dry-run: it
+# runs the full evidence-gathering pipeline and logs what it WOULD do,
+# without ever calling systemctl restart.
 
 set -euo pipefail
 
@@ -50,69 +74,190 @@ done
 install -m 600 "$TOKEN_FILE" /root/.runner-reaper-token
 log "token installed at /root/.runner-reaper-token"
 
+mkdir -p /var/lib/runner-reaper
+
 cat > /usr/local/bin/runner-reaper <<'SCRIPT'
 #!/usr/bin/env bash
 # Reap GitHub Actions Runner.Worker zombies. Installed by vm-setup/runner-reaper.sh.
+# See the header comment in vm-setup/runner-reaper.sh for the full design rationale.
 set -uo pipefail
 
 GRACE=__GRACE__
 TOKEN=$(cat /root/.runner-reaper-token)
 OWNER=deanmak13
 LOG=/var/log/runner-reaper.log
+STATE_DIR=/var/lib/runner-reaper
+CPU_STATE_FILE="$STATE_DIR/cpu-state.tsv"
+QUIET_STATE_FILE="$STATE_DIR/quiet-streak.tsv"
+CLK_TCK=$(getconf CLK_TCK 2>/dev/null || echo 100)
+CPU_ACTIVE_THRESHOLD_SEC=2
+QUIET_TICKS_REQUIRED=2
+# newest N non-completed runs to check at job level (>=3 per design)
+JOB_CHECK_RUNS=3
+
+DRY_RUN=0
+[[ "${1:-}" == "--dry-run" ]] && DRY_RUN=1
+
+mkdir -p "$STATE_DIR"
 
 note() { echo "$(date -Is) $*" >> "$LOG"; logger -t runner-reaper "$*"; }
 
-# repo → oldest Worker age (seconds), from the worker's runner directory path.
+# ---- job-level liveness: sets JOB_ALIVE_EVIDENCE, returns 0=alive 1=dead 2=API failure
+job_level_alive() {
+    local repo=$1
+    local runs_json ids checked=0 alive_jobs=0 id jobs_json n
+    runs_json=$(curl -sf -m 20 -H "Authorization: Bearer $TOKEN" \
+        -H "Accept: application/vnd.github+json" \
+        "https://api.github.com/repos/$OWNER/$repo/actions/runs?per_page=10") || return 2
+    ids=$(echo "$runs_json" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+runs=[r for r in (d.get('workflow_runs') or []) if r.get('status') != 'completed']
+for r in runs[:$JOB_CHECK_RUNS]:
+    print(r['id'])
+") || return 2
+    if [[ -z "$ids" ]]; then
+        JOB_ALIVE_EVIDENCE="runs_checked=0 jobs_in_progress=0"
+        return 1
+    fi
+    for id in $ids; do
+        checked=$((checked+1))
+        jobs_json=$(curl -sf -m 20 -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$OWNER/$repo/actions/runs/$id/jobs") || return 2
+        n=$(echo "$jobs_json" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+jobs=d.get('jobs') or []
+print(sum(1 for j in jobs if j.get('status')=='in_progress'))
+") || return 2
+        alive_jobs=$((alive_jobs+n))
+    done
+    JOB_ALIVE_EVIDENCE="runs_checked=$checked jobs_in_progress=$alive_jobs"
+    (( alive_jobs > 0 )) && return 0
+    return 1
+}
+
+# ---- load prior-tick state
+declare -A PREV_CPU
+if [[ -f "$CPU_STATE_FILE" ]]; then
+    while read -r pid ticks; do PREV_CPU[$pid]=$ticks; done < "$CPU_STATE_FILE"
+fi
+declare -A PREV_QUIET
+if [[ -f "$QUIET_STATE_FILE" ]]; then
+    while read -r repo cnt; do PREV_QUIET[$repo]=$cnt; done < "$QUIET_STATE_FILE"
+fi
+
+# ---- scan current Worker processes: repo -> oldest age, repo -> pid list, pid -> cpu ticks now
 declare -A OLDEST
+declare -A WORKER_PIDS
+declare -A CUR_CPU
+
 while read -r pid etimes args; do
-    # /home/ubuntu/actions-runner-<repo>[-N]/bin.../Runner.Worker
+    # /home/ubuntu/actions-runner-<repo>-contabo[-N]/bin.../Runner.Worker
     dir=${args#*actions-runner-}
     repo=${dir%%/*}
-    # Runner dirs carry the RUNNER name (…-contabo, …-contabo-2); the repo is
-    # what remains after stripping that suffix (2026-08-15 rebuild).
-    repo=${repo%-2}; repo=${repo%-3}
-    repo=${repo%-contabo}
+    # Runner dirs carry the RUNNER name suffix (-contabo, -contabo-2, ...,
+    # -contabo-N); strip it regardless of N (2026-08-19 fix — the old
+    # code only stripped -2/-3 and silently broke on -4).
+    repo=$(echo "$repo" | sed -E 's/(-contabo)(-[0-9]+)?$//')
     [[ -n "$repo" ]] || continue
+
     cur=${OLDEST[$repo]:-0}
     (( etimes > cur )) && OLDEST[$repo]=$etimes
+    WORKER_PIDS[$repo]="${WORKER_PIDS[$repo]:-} $pid"
+
+    stat_line=$(cat "/proc/$pid/stat" 2>/dev/null)
+    if [[ -n "$stat_line" ]]; then
+        # comm can contain spaces/parens; split after the LAST ') ' so the
+        # remaining fields line up regardless of comm content.
+        rest=${stat_line##*) }
+        set -- $rest
+        # rest field 1=state ... field 12=utime field 13=stime
+        utime=${12:-0}; stime=${13:-0}
+        CUR_CPU[$pid]=$(( utime + stime ))
+    fi
 done < <(ps -eo pid,etimes,args | grep '[R]unner.Worker' || true)
+
+declare -A NEW_QUIET
 
 for repo in "${!OLDEST[@]}"; do
     age=${OLDEST[$repo]}
     (( age < GRACE )) && continue
-    # Two observed failure shapes pull in opposite directions:
-    #  - a run can report "queued" while its job is already executing
-    #    (2026-08-14 AM: reaper killed a live 25-min gate), so queued
-    #    cannot simply mean dead;
-    #  - a wedged runner holds workers busy while runs sit queued for
-    #    HOURS (2026-08-14 PM: 13h-old queue, zero in_progress), so
-    #    queued cannot simply mean alive either.
-    # Resolution: in_progress always blocks reaping; queued blocks only
-    # while the newest queued run is younger than QUEUED_GRACE — the
-    # status-lag window is minutes, a wedge is hours.
-    QUEUED_GRACE=1200
-    api() { curl -sf -m 20 -H "Authorization: Bearer $TOKEN" \
-        -H "Accept: application/vnd.github+json" \
-        "https://api.github.com/repos/$OWNER/$repo/actions/runs?status=$1&per_page=1"; }
-    inprog=$(api in_progress | python3 -c 'import json,sys; print(json.load(sys.stdin)["total_count"])' 2>/dev/null)
-    [[ "$inprog" =~ ^[0-9]+$ ]] || { note "skip $repo: API check failed"; continue; }
-    (( inprog > 0 )) && continue
-    queued_age=$(api queued | python3 -c '
-import json,sys,datetime
-d=json.load(sys.stdin)
-runs=d.get("workflow_runs") or []
-if not runs: print(-1)
-else:
-    t=datetime.datetime.fromisoformat(runs[0]["created_at"].replace("Z","+00:00"))
-    print(int((datetime.datetime.now(datetime.timezone.utc)-t).total_seconds()))' 2>/dev/null)
-    [[ "$queued_age" =~ ^-?[0-9]+$ ]] || { note "skip $repo: API check failed"; continue; }
-    if (( queued_age >= 0 && queued_age < QUEUED_GRACE )); then continue; fi
+
+    # --- local CPU-progress signal for this repo's workers
+    cpu_status="quiet"
+    cpu_evidence=""
+    for pid in ${WORKER_PIDS[$repo]}; do
+        cur_ticks=${CUR_CPU[$pid]:-}
+        if [[ -z "$cur_ticks" ]]; then
+            cpu_status="unknown"; cpu_evidence="$cpu_evidence pid=$pid:no-stat"; continue
+        fi
+        prev_ticks=${PREV_CPU[$pid]:-}
+        if [[ -z "$prev_ticks" ]]; then
+            cpu_status="unknown"; cpu_evidence="$cpu_evidence pid=$pid:no-baseline"; continue
+        fi
+        delta_ticks=$(( cur_ticks - prev_ticks ))
+        (( delta_ticks < 0 )) && delta_ticks=0
+        delta_sec=$(( delta_ticks / CLK_TCK ))
+        cpu_evidence="$cpu_evidence pid=$pid:cpu_delta=${delta_sec}s"
+        (( delta_sec > CPU_ACTIVE_THRESHOLD_SEC )) && cpu_status="active"
+    done
+
+    if [[ "$cpu_status" == "quiet" ]]; then
+        quiet_count=$(( ${PREV_QUIET[$repo]:-0} + 1 ))
+    else
+        quiet_count=0
+    fi
+    NEW_QUIET[$repo]=$quiet_count
+    cpu_confirmed_dead=0
+    (( quiet_count >= QUIET_TICKS_REQUIRED )) && cpu_confirmed_dead=1
+
+    # --- job-level GitHub signal
+    JOB_ALIVE_EVIDENCE=""
+    job_level_alive "$repo"
+    job_rc=$?
+
+    evidence="age=${age}s cpu_status=$cpu_status quiet_streak=$quiet_count [$cpu_evidence ] job=[$JOB_ALIVE_EVIDENCE]"
+
+    if (( job_rc == 2 )); then
+        note "skip $repo: job API check failed ($evidence)"
+        continue
+    fi
+
+    if (( job_rc == 0 )); then
+        note "alive $repo: job in-progress — not reaping ($evidence)"
+        continue
+    fi
+
+    if (( cpu_confirmed_dead == 0 )); then
+        note "alive $repo: cpu not yet confirmed dead, need $QUIET_TICKS_REQUIRED consecutive quiet ticks — not reaping ($evidence)"
+        continue
+    fi
+
     units=$(systemctl list-units "actions.runner.$OWNER-$repo.*" --no-legend --plain | awk '{print $1}')
-    [[ -n "$units" ]] || continue
-    note "REAP $repo: Worker age ${age}s, in_progress=0 — restarting: $units"
-    # shellcheck disable=SC2086
-    systemctl restart $units
+    if [[ -z "$units" ]]; then
+        note "skip $repo: no matching systemd units ($evidence)"
+        continue
+    fi
+
+    if (( DRY_RUN == 1 )); then
+        note "DRY-RUN REAP $repo: would restart: $units ($evidence)"
+    else
+        note "REAP $repo: restarting: $units ($evidence)"
+        systemctl restart $units
+        NEW_QUIET[$repo]=0
+    fi
 done
+
+# ---- persist state for next tick (self-prunes: only currently-seen pids/repos survive)
+{
+    for pid in "${!CUR_CPU[@]}"; do printf '%s\t%s\n' "$pid" "${CUR_CPU[$pid]}"; done
+} > "$CPU_STATE_FILE.tmp" && mv "$CPU_STATE_FILE.tmp" "$CPU_STATE_FILE"
+
+{
+    for repo in "${!NEW_QUIET[@]}"; do printf '%s\t%s\n' "$repo" "${NEW_QUIET[$repo]}"; done
+} > "$QUIET_STATE_FILE.tmp" && mv "$QUIET_STATE_FILE.tmp" "$QUIET_STATE_FILE"
 SCRIPT
 sed -i "s/__GRACE__/$GRACE/" /usr/local/bin/runner-reaper
 chmod 755 /usr/local/bin/runner-reaper
