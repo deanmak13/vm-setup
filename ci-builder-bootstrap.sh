@@ -49,29 +49,37 @@ done
 [[ -n "$GH_TOKEN_FILE" && -f "$GH_TOKEN_FILE" ]] || err "--gh-token-file is required and must exist"
 GH_TOKEN=$(cat "$GH_TOKEN_FILE")
 
-# Repo → runner-name list, mirroring the live host inventoried 2026-08-15.
-# Format: "<repo> <runner-name> <enabled-on-old-host: y/n>"
+# Runner inventory — one row per runner. Mirrors the live ci-builder as of
+# 2026-09-02 (12 services after the 2026-09-01 drain of engine-3/-4, portal-3
+# and deployments-3: >5 concurrent jobs made every job slower on the shared
+# host), plus pneuma-ops, whose scheduled [self-hosted, ci-builder] workflows
+# had queued unrun since the migration because no runner was ever registered
+# for that repo. pneuma-branding/-docs/-mem0 run on ubuntu-latest only, so
+# they have no row.
+#
+# GitHub adds self-hosted/Linux/X64 itself. The labels column is the lane the
+# workflows' runs-on: selects: `ci-builder` for gate jobs, `ci-builder-build`
+# for image builds (engine and portal keep the lanes apart so a build never
+# queues behind gates and vice versa). enabled=n installs the service but
+# leaves it stopped.
+# Format: "<repo> <runner-name> <labels> <enabled: y/n>"
 RUNNERS=$(cat <<'EOF'
-pneuma pneuma-contabo y
-pneuma-engine pneuma-engine-contabo y
-pneuma-engine pneuma-engine-contabo-2 y
-pneuma-engine pneuma-engine-contabo-3 y
-pneuma-engine pneuma-engine-contabo-4 y
-pneuma-portal pneuma-portal-contabo y
-pneuma-portal pneuma-portal-contabo-2 y
-pneuma-portal pneuma-portal-contabo-3 y
-pneuma-proto pneuma-proto-contabo y
-pneuma-helm-charts pneuma-helm-charts-contabo y
-pneuma-deployments pneuma-deployments-contabo y
-pneuma-deployments pneuma-deployments-contabo-2 y
-pneuma-deployments pneuma-deployments-contabo-3 y
-pneuma-branding pneuma-branding-contabo n
-pneuma-docs pneuma-docs-contabo n
-pneuma-mem0 pneuma-mem0-contabo n
-pneuma-ops pneuma-ops-contabo n
+pneuma pneuma-contabo ci-builder y
+pneuma-engine pneuma-engine-contabo ci-builder y
+pneuma-engine pneuma-engine-contabo-2 ci-builder y
+pneuma-engine pneuma-engine-contabo-build-1 ci-builder-build y
+pneuma-engine pneuma-engine-contabo-build-2 ci-builder-build y
+pneuma-portal pneuma-portal-contabo ci-builder y
+pneuma-portal pneuma-portal-contabo-2 ci-builder y
+pneuma-portal pneuma-portal-contabo-build-1 ci-builder-build y
+pneuma-proto pneuma-proto-contabo ci-builder y
+pneuma-helm-charts pneuma-helm-charts-contabo ci-builder y
+pneuma-deployments pneuma-deployments-contabo ci-builder y
+pneuma-deployments pneuma-deployments-contabo-2 ci-builder y
+pneuma-ops pneuma-ops-contabo ci-builder y
 EOF
 )
-RUNNER_LABELS="self-hosted,ci-builder"
+RUNNER_BASE_LABELS="self-hosted"
 RUNNER_VERSION="2.336.0"
 
 # ── 1. Packages ──────────────────────────────────────────────────────────
@@ -190,17 +198,20 @@ mint_reg_token() {
         | jq -r .token
 }
 
-while read -r repo runner_name was_enabled; do
+while read -r repo runner_name labels enabled; do
     [[ -n "$repo" ]] || continue
-    dir="/home/ubuntu/actions-runner-${repo}"
-    [[ "$runner_name" == *-2 ]] && dir="${dir}-2"
+    # One directory per RUNNER, never per repo: a repo has up to four runners
+    # here, and runner-reaper, ci-disk-janitor and the export manifest all key
+    # off actions-runner-<runner-name>.
+    dir="/home/ubuntu/actions-runner-${runner_name}"
+    runner_labels="$RUNNER_BASE_LABELS,$labels"
 
     if [[ -f "$dir/.runner" ]]; then
         log "runner $runner_name already registered in $dir — skipping"
         continue
     fi
 
-    log "registering $runner_name for $OWNER/$repo (labels: $RUNNER_LABELS)"
+    log "registering $runner_name for $OWNER/$repo (labels: $runner_labels)"
     su - ubuntu -c "mkdir -p '$dir'"
     su - ubuntu -c "
         cd '$dir' &&
@@ -216,14 +227,14 @@ while read -r repo runner_name was_enabled; do
           --url https://github.com/$OWNER/$repo \
           --token '$REG_TOKEN' \
           --name '$runner_name' \
-          --labels '$RUNNER_LABELS' \
+          --labels '$runner_labels' \
           --work _work
     "
     ( cd "$dir" && ./svc.sh install ubuntu )
-    if [[ "$was_enabled" == "y" ]]; then
+    if [[ "$enabled" == "y" ]]; then
         ( cd "$dir" && ./svc.sh start )
     else
-        log "  $runner_name was disabled on old host — service installed but left stopped/disabled"
+        log "  $runner_name is disabled in the inventory — service installed but left stopped"
         systemctl disable "actions.runner.$OWNER-$repo.$runner_name.service" 2>/dev/null || true
         systemctl stop "actions.runner.$OWNER-$repo.$runner_name.service" 2>/dev/null || true
     fi
