@@ -39,9 +39,12 @@ check() {
 check "conf is valid Perl" perl -c "$CONF"
 
 # Every runner unit the bootstrap registers is skipped, by exactly one regex.
-while read -r repo runner _enabled; do
+# (The range anchors on the table's line prefix, not its heredoc opener: a
+# literal opener here is one kcov's parser would wait to see terminated, and
+# it instruments nothing past it.)
+while read -r repo runner _; do
     expect "actions.runner.${OWNER}-${repo}.${runner}.service" skip 1
-done < <(sed -n "/^RUNNERS=\$(cat <<'EOF'\$/,/^EOF\$/p" "$BOOTSTRAP" | sed '1d;$d')
+done < <(sed -n '/^RUNNERS=/,/^EOF$/p' "$BOOTSTRAP" | sed '1d;$d')
 
 # Everything else on the host keeps needrestart's normal behaviour.
 for unit in k3s.service docker.service containerd.service ssh.service dbus.service \
