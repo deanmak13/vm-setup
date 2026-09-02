@@ -26,6 +26,11 @@
 # --state-tarball is optional; if omitted, the script skips WireGuard/reaper
 #   state restore and just prints what's missing.
 #
+# DRY_RUN=1 (env var) plans step 9's runner registrations without touching
+#   anything — no directories created, no GitHub API calls, no services
+#   installed/started. Packages/Docker/k3s/Kodus/cloudflared steps still run
+#   their own pre-existing "already present" checks either way.
+#
 # Safe to re-run: every step checks for existing state before acting.
 set -euo pipefail
 
@@ -49,30 +54,43 @@ done
 [[ -n "$GH_TOKEN_FILE" && -f "$GH_TOKEN_FILE" ]] || err "--gh-token-file is required and must exist"
 GH_TOKEN=$(cat "$GH_TOKEN_FILE")
 
-# Repo → runner-name list, mirroring the live host inventoried 2026-08-15.
-# Format: "<repo> <runner-name> <enabled-on-old-host: y/n>"
+# Repo → runner-name list, mirroring the live host inventoried 2026-08-15
+# (build lanes added 2026-09-02: they were registered by hand after that
+# inventory and were missing here, so a teardown → restart would not bring
+# them back — see [reference_ci_runner_scope_and_concurrency_lock]).
+# Format: "<repo> <runner-name> <enabled: y/n> <labels>"
 RUNNERS=$(cat <<'EOF'
-pneuma pneuma-contabo y
-pneuma-engine pneuma-engine-contabo y
-pneuma-engine pneuma-engine-contabo-2 y
-pneuma-engine pneuma-engine-contabo-3 y
-pneuma-engine pneuma-engine-contabo-4 y
-pneuma-portal pneuma-portal-contabo y
-pneuma-portal pneuma-portal-contabo-2 y
-pneuma-portal pneuma-portal-contabo-3 y
-pneuma-proto pneuma-proto-contabo y
-pneuma-helm-charts pneuma-helm-charts-contabo y
-pneuma-deployments pneuma-deployments-contabo y
-pneuma-deployments pneuma-deployments-contabo-2 y
-pneuma-deployments pneuma-deployments-contabo-3 y
-pneuma-branding pneuma-branding-contabo n
-pneuma-docs pneuma-docs-contabo n
-pneuma-mem0 pneuma-mem0-contabo n
-pneuma-ops pneuma-ops-contabo n
+pneuma pneuma-contabo y self-hosted,ci-builder
+pneuma-engine pneuma-engine-contabo y self-hosted,ci-builder
+pneuma-engine pneuma-engine-contabo-2 y self-hosted,ci-builder
+pneuma-engine pneuma-engine-contabo-3 n self-hosted,ci-builder
+pneuma-engine pneuma-engine-contabo-4 n self-hosted,ci-builder
+pneuma-engine pneuma-engine-contabo-build-1 y self-hosted,ci-builder-build
+pneuma-engine pneuma-engine-contabo-build-2 y self-hosted,ci-builder-build
+pneuma-portal pneuma-portal-contabo y self-hosted,ci-builder
+pneuma-portal pneuma-portal-contabo-2 y self-hosted,ci-builder
+pneuma-portal pneuma-portal-contabo-3 n self-hosted,ci-builder
+pneuma-portal pneuma-portal-contabo-build-1 y self-hosted,ci-builder-build
+pneuma-proto pneuma-proto-contabo y self-hosted,ci-builder
+pneuma-helm-charts pneuma-helm-charts-contabo y self-hosted,ci-builder
+pneuma-deployments pneuma-deployments-contabo y self-hosted,ci-builder
+pneuma-deployments pneuma-deployments-contabo-2 y self-hosted,ci-builder
+pneuma-deployments pneuma-deployments-contabo-3 n self-hosted,ci-builder
+pneuma-branding pneuma-branding-contabo n self-hosted,ci-builder
+pneuma-docs pneuma-docs-contabo n self-hosted,ci-builder
+pneuma-mem0 pneuma-mem0-contabo n self-hosted,ci-builder
+pneuma-ops pneuma-ops-contabo n self-hosted,ci-builder
 EOF
 )
-RUNNER_LABELS="self-hosted,ci-builder"
+# Declared-set ceiling (2026-09-02 decision; [reference_ci_runner_scope_and_concurrency_lock]):
+# engine/portal/deployments cap at 2 base + their dedicated build lane(s) each.
+# The *-3/*-4 PR-check overflow runners are kept as "n" (registered-but-
+# stopped, same treatment as pneuma-branding/docs/mem0/ops below) — do not
+# flip them back to "y": 16 live runners on 8 cores + k3s drove load to 16
+# and slowed every job (2026-09-01 drain, runner-drain-to-declared.sh).
+RUNNER_LABELS="self-hosted,ci-builder"   # fallback if a row omits column 4
 RUNNER_VERSION="2.336.0"
+DRY_RUN="${DRY_RUN:-0}"                  # 1 = plan step 9 only, mutate nothing
 
 # ── 1. Packages ──────────────────────────────────────────────────────────
 log "installing base packages"
@@ -190,17 +208,28 @@ mint_reg_token() {
         | jq -r .token
 }
 
-while read -r repo runner_name was_enabled; do
+while read -r repo runner_name was_enabled labels; do
     [[ -n "$repo" ]] || continue
-    dir="/home/ubuntu/actions-runner-${repo}"
-    [[ "$runner_name" == *-2 ]] && dir="${dir}-2"
+    labels="${labels:-$RUNNER_LABELS}"
+    # Directory = full runner name, matching every live WorkingDirectory=
+    # (verified via `systemctl show -p WorkingDirectory` 2026-09-02). The old
+    # "${repo}[-2]" formula only matched by coincidence and collides two rows
+    # into one directory for any -3/-4/-build-* name — e.g. it would have
+    # sent pneuma-engine-contabo-build-1 into the same dir as
+    # pneuma-engine-contabo, silently skipping the build lane's registration.
+    dir="/home/ubuntu/actions-runner-${runner_name}"
 
     if [[ -f "$dir/.runner" ]]; then
         log "runner $runner_name already registered in $dir — skipping"
         continue
     fi
 
-    log "registering $runner_name for $OWNER/$repo (labels: $RUNNER_LABELS)"
+    log "registering $runner_name for $OWNER/$repo (labels: $labels)"
+    if [[ "$DRY_RUN" == "1" ]]; then
+        log "  DRY_RUN: would download v${RUNNER_VERSION} into $dir, mint a registration token for $OWNER/$repo,"
+        log "  DRY_RUN: config.sh --name '$runner_name' --labels '$labels', install the service, was_enabled=$was_enabled"
+        continue
+    fi
     su - ubuntu -c "mkdir -p '$dir'"
     su - ubuntu -c "
         cd '$dir' &&
@@ -216,7 +245,7 @@ while read -r repo runner_name was_enabled; do
           --url https://github.com/$OWNER/$repo \
           --token '$REG_TOKEN' \
           --name '$runner_name' \
-          --labels '$RUNNER_LABELS' \
+          --labels '$labels' \
           --work _work
     "
     ( cd "$dir" && ./svc.sh install ubuntu )
