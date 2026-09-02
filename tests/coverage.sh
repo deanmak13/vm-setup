@@ -10,7 +10,10 @@
 # marker never recurs, which tests/runner-inventory.test.sh scans every test
 # file for. This runner is the one script in tests/ the report leaves out: it
 # runs on the host, outside the kcov it launches, so kcov could only ever
-# report it at zero.
+# report it at zero. kcov applies its filters when it writes a report and
+# --merge writes a fresh one from the per-test data, so the same filters go to
+# every run and to the merge: given to the runs alone, the merged report counts
+# every excluded line again.
 #
 # Run: bash tests/coverage.sh            (exit = the tests' own verdict)
 set -euo pipefail
@@ -22,12 +25,13 @@ OUT="$REPO_DIR/cov"
 [[ -d "$OUT" ]] && docker run --rm -v "$REPO_DIR:/src" "$IMAGE" rm -rf /src/cov
 docker run --rm -v "$REPO_DIR:/src" -w /src -e "HOST_ID=$(id -u):$(id -g)" "$IMAGE" bash -c '
     apt-get -qq update >/dev/null && apt-get -qq install -y jq >/dev/null
+    filters=(--include-path=/src --exclude-pattern=/src/tests/coverage.sh)
     rc=0
     for t in tests/*.test.sh; do
         printf "==> %s\n" "$t"
-        kcov --include-path=/src --exclude-pattern=/src/tests/coverage.sh /src/cov "$t" || rc=1
+        kcov "${filters[@]}" /src/cov "$t" || rc=1
     done
-    kcov --merge /src/cov/merged /src/cov/*.test.sh.*
+    kcov "${filters[@]}" --merge /src/cov/merged /src/cov/*.test.sh.* || rc=1
     chown -R "$HOST_ID" /src/cov
     exit "$rc"' || rc=$?
 REPORT="$OUT/merged/kcov-merged/cobertura.xml"

@@ -121,6 +121,10 @@ expect_fail "worker_repo: a runner registered to another owner is ignored" worke
 expect_fail "worker_repo: no .runner file -> no repo" worker_repo "$work/actions-runner-unregistered"
 expect_fail "worker_repo: missing directory -> no repo" worker_repo "$work/actions-runner-gone"
 
+# ── coverage.sh filters the merged report the way it filters each run ────
+check "coverage.sh gives the same filters to every kcov run and to the merge (kcov applies them per report written)" \
+    bash -c 'test "$(grep -cF "$2" "$1")" -eq 2 && grep -qF "$2 --merge" "$1"' _ "$REPO_DIR/tests/coverage.sh" 'kcov "${filters[@]}"'
+
 # ── the runbook describes this layout, not a per-repo one ────────────────
 check "migration runbook: install directory is actions-runner-<runner-name>" \
     grep -q 'actions-runner-<runner-name>' "$MIGRATION"
