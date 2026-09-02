@@ -66,8 +66,8 @@ check "every label is a lane some workflow can select (ci-builder or ci-builder-
 # ── the registration loop consumes all four columns per runner ───────────
 check "loop reads <repo> <runner-name> <labels> <enabled>" \
     grep -qxF 'while read -r repo runner_name labels enabled; do' "$BOOTSTRAP"
-check "install directory is actions-runner-<runner-name>" \
-    grep -qxF '    dir="/home/ubuntu/actions-runner-${runner_name}"' "$BOOTSTRAP"
+check "install directory is actions-runner-<runner-name> under the ubuntu home" \
+    bash -c 'grep -qxF "runner_dir() { printf '"'"'%s/actions-runner-%s\\n'"'"' \"\$RUNNER_HOME\" \"\$1\"; }" "$1" && grep -qxF "RUNNER_HOME=\"\${RUNNER_HOME:-/home/ubuntu}\"" "$1" && grep -qxF "    dir=\$(runner_dir \"\$runner_name\")" "$1"' _ "$BOOTSTRAP"
 check "no per-repo directory with a special-cased -2 suffix remains" \
     bash -c '! grep -q "actions-runner-\${repo}" "$1" && ! grep -q "== \*-2" "$1"' _ "$BOOTSTRAP"
 check "config.sh gets self-hosted plus the row's own labels" \
@@ -120,6 +120,49 @@ expect_out "worker_repo: build-lane runner -> the same repo (no suffix parsing)"
 expect_fail "worker_repo: a runner registered to another owner is ignored" worker_repo "$work/actions-runner-pneuma-portal-contabo-2"
 expect_fail "worker_repo: no .runner file -> no repo" worker_repo "$work/actions-runner-unregistered"
 expect_fail "worker_repo: missing directory -> no repo" worker_repo "$work/actions-runner-gone"
+
+# ── --plan-runners: the inventory against a host, touching nothing ───────
+# The bootstrap runs for real against the fixture home: no root, no token,
+# and it must exit before step 1 (nothing installed).
+mkdir -p "$work/actions-runner-pneuma-proto-contabo/bin"   # a download that never got to config.sh
+plan=$(RUNNER_HOME="$work" bash "$BOOTSTRAP" --plan-runners 2>&1) && plan_rc=0 || plan_rc=$?
+check "--plan-runners exits 0 without root or a token" test "$plan_rc" -eq 0
+expect_out "--plan-runners: one plan line per inventory row, nothing else" \
+    "$(wc -l <<< "$rows")" bash -c 'grep -c "plan: " <<< "$1"; ! grep -vq "plan: " <<< "$1" || echo "and more"' _ "$plan"
+check "--plan-runners: a registered runner is reported as nothing to do" \
+    grep -qxF "[ci-builder-bootstrap] plan: pneuma-engine-contabo is registered in $work/actions-runner-pneuma-engine-contabo — nothing to do" <<< "$plan"
+check "--plan-runners: a missing runner is reported with its repo, labels and enabled flag" \
+    grep -qxF "[ci-builder-bootstrap] plan: pneuma-ops-contabo would be registered for $OWNER/pneuma-ops in $work/actions-runner-pneuma-ops-contabo (labels: self-hosted,ci-builder; enabled: y)" <<< "$plan"
+check "--plan-runners: a directory without a .runner file counts as not registered" \
+    grep -q "plan: pneuma-proto-contabo would be registered for $OWNER/pneuma-proto in $work/actions-runner-pneuma-proto-contabo " <<< "$plan"
+check "--plan-runners: never runs a step (no package install reached)" \
+    bash -c '! grep -q "installing" <<< "$1"' _ "$plan"
+check "an unknown argument is still an error in plan mode" \
+    bash -c '! RUNNER_HOME="$2" bash "$1" --plan-runners --bogus >/dev/null 2>&1' _ "$BOOTSTRAP" "$work"
+# The flag is added to the command the operator is about to run, so the real
+# invocation's arguments must be accepted and left unread (the paths do not
+# exist).
+expect_out "--plan-runners with the real invocation's arguments: the same plan, the token file never read" \
+    "$plan" bash -c 'RUNNER_HOME="$2" bash "$1" --plan-runners --gh-token-file "$2/no-such-token" --state-tarball "$2/no-such-tarball" 2>&1' _ "$BOOTSTRAP" "$work"
+# Without the flag the bootstrap stops at its first precondition — root, then
+# the token file — before anything else runs: one ERROR line, exit 1.
+if [[ $EUID -eq 0 ]]; then precondition="--gh-token-file is required and must exist"; else precondition="run as root"; fi
+expect_out "without --plan-runners the bootstrap stops at its first unmet precondition" \
+    "[ci-builder-bootstrap] ERROR: $precondition"$'\n'"exit=1" \
+    bash -c 'RUNNER_HOME="$2" bash "$1" 2>&1; echo "exit=$?"' _ "$BOOTSTRAP" "$work"
+
+# ── the host-only region is marked where the steps begin, to the end ─────
+# coverage.sh names the markers once; the bootstrap must carry both, the
+# first just before step 1 and the second as its last line, so the report
+# measures exactly the part a test can run.
+region=$(sed -n 's/.*--exclude-region=\([^:]*\):\([^"]*\)".*/\1 \2/p' "$REPO_DIR/tests/coverage.sh")
+check "coverage.sh excludes one begin:end region" test "$(wc -w <<< "$region")" -eq 2
+expect_out "the begin marker heads the comment block that precedes step 1" \
+    "# ── 1. Packages ──────────────────────────────────────────────────────────" \
+    bash -c 'grep -n -F "$2" "$1" | cut -d: -f1 | { read -r n; sed -n "$((n + 6))p" "$1"; }' _ "$BOOTSTRAP" "${region%% *}"
+expect_out "the end marker is the bootstrap's last line" "# ${region##* }" tail -n 1 "$BOOTSTRAP"
+check "each marker appears exactly once" \
+    bash -c 'test "$(grep -cF "$2" "$1")" -eq 1 && test "$(grep -cF "$3" "$1")" -eq 1' _ "$BOOTSTRAP" "${region%% *}" "${region##* }"
 
 # ── coverage.sh filters the merged report the way it filters each run ────
 check "coverage.sh gives the same filters to every kcov run and to the merge (kcov applies them per report written)" \

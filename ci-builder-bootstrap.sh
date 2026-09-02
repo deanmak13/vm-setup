@@ -25,6 +25,10 @@
 #   token if no reaper token was restored from state.
 # --state-tarball is optional; if omitted, the script skips WireGuard/reaper
 #   state restore and just prints what's missing.
+# --plan-runners prints what step 9 would do for every row of the runner
+#   inventory — registered already, or would be registered — and exits before
+#   any step runs: nothing installed, downloaded or registered, no token
+#   needed. The way to check the inventory against a live host.
 #
 # Safe to re-run: every step checks for existing state before acting.
 set -euo pipefail
@@ -33,6 +37,7 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OWNER=deanmak13
 GH_TOKEN_FILE=""
 STATE_TARBALL=""
+PLAN_RUNNERS=0
 
 log() { echo "[ci-builder-bootstrap] $*"; }
 err() { echo "[ci-builder-bootstrap] ERROR: $*" >&2; exit 1; }
@@ -41,13 +46,16 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --gh-token-file) GH_TOKEN_FILE="$2"; shift 2 ;;
         --state-tarball) STATE_TARBALL="$2"; shift 2 ;;
+        --plan-runners) PLAN_RUNNERS=1; shift ;;
         *) err "Unknown argument: $1" ;;
     esac
 done
 
-[[ $EUID -eq 0 ]] || err "run as root"
-[[ -n "$GH_TOKEN_FILE" && -f "$GH_TOKEN_FILE" ]] || err "--gh-token-file is required and must exist"
-GH_TOKEN=$(cat "$GH_TOKEN_FILE")
+if (( ! PLAN_RUNNERS )); then
+    [[ $EUID -eq 0 ]] || err "run as root"
+    [[ -n "$GH_TOKEN_FILE" && -f "$GH_TOKEN_FILE" ]] || err "--gh-token-file is required and must exist"
+    GH_TOKEN=$(cat "$GH_TOKEN_FILE")
+fi
 
 # Runner inventory — one row per runner. Mirrors the live ci-builder as of
 # 2026-09-02 (12 services after the 2026-09-01 drain of engine-3/-4, portal-3
@@ -81,6 +89,29 @@ EOF
 )
 RUNNER_BASE_LABELS="self-hosted"
 RUNNER_VERSION="2.336.0"
+# The runners live in the ubuntu user's home, one directory per RUNNER, never
+# per repo: a repo has up to four runners here, and runner-reaper,
+# ci-disk-janitor and the export manifest all key off actions-runner-<name>.
+RUNNER_HOME="${RUNNER_HOME:-/home/ubuntu}"
+runner_dir() { printf '%s/actions-runner-%s\n' "$RUNNER_HOME" "$1"; }
+
+if (( PLAN_RUNNERS )); then
+    while read -r repo runner_name labels enabled; do
+        [[ -n "$repo" ]] || continue
+        if [[ -f "$(runner_dir "$runner_name")/.runner" ]]; then
+            log "plan: $runner_name is registered in $(runner_dir "$runner_name") — nothing to do"
+        else
+            log "plan: $runner_name would be registered for $OWNER/$repo in $(runner_dir "$runner_name") (labels: $RUNNER_BASE_LABELS,$labels; enabled: $enabled)"
+        fi
+    done <<< "$RUNNERS"
+    exit 0
+fi
+
+# ── Host-only from here [host-only-begin] ────────────────────────────────
+# Every step below mutates the host and runs only as root on it, so no test
+# executes it: tests/coverage.sh leaves this region out of the report and
+# tests/runner-inventory.test.sh checks it by inspection. Everything above —
+# arguments, the inventory, --plan-runners — runs in the tests for real.
 
 # ── 1. Packages ──────────────────────────────────────────────────────────
 log "installing base packages"
@@ -200,10 +231,7 @@ mint_reg_token() {
 
 while read -r repo runner_name labels enabled; do
     [[ -n "$repo" ]] || continue
-    # One directory per RUNNER, never per repo: a repo has up to four runners
-    # here, and runner-reaper, ci-disk-janitor and the export manifest all key
-    # off actions-runner-<runner-name>.
-    dir="/home/ubuntu/actions-runner-${runner_name}"
+    dir=$(runner_dir "$runner_name")
     runner_labels="$RUNNER_BASE_LABELS,$labels"
 
     if [[ -f "$dir/.runner" ]]; then
@@ -268,4 +296,4 @@ log "  kubectl get all -A"
 log "  systemctl list-timers | grep -E 'reaper|janitor'"
 log "  systemctl status cloudflared-access-openbao"
 log "OPEN ITEM: run the WireGuard manifest apply command printed in step 7 (not automated)."
-
+# [host-only-end]
