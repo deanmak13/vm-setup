@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+# runner-refresh — restart the GitHub Actions runner units that still map a
+# library apt has replaced, and only while they are idle.
+#
+# needrestart is told never to restart actions.runner.* (needrestart-actions-
+# runner.conf): its restart lands mid-job and fails the job. But a runner
+# process that keeps the pre-patch libc/ncurses/ssl mapped runs unpatched for
+# as long as nothing restarts it — and nothing else on the host does. This is
+# that something. Every 5 minutes (runner-refresh.timer) each unit is checked:
+#   stale = a process in the unit's cgroup maps a deleted shared object — what
+#           apt leaves behind when it replaces a library, the same evidence
+#           needrestart reads from /proc/<pid>/maps;
+#   idle  = no Runner.Worker alive in the cgroup — no job in progress.
+# A stale, idle unit is restarted; a stale, busy one is left alone and picked
+# up on a later tick. GitHub's own runner updater waits for idle the same way.
+# One restart per unit per hour at most (a marker under /run): a deleted object
+# a restart does not clear would otherwise restart its unit every tick.
+#
+# Installed by vm-setup/runner-refresh.sh as /usr/local/bin/runner-refresh and
+# proven by tests/runner-refresh.test.sh, which sources this file against
+# fixture /proc, cgroup and systemctl roots (the variables below).
+#
+# Usage: runner-refresh [--dry-run]
+set -uo pipefail
+
+PROC_ROOT=${PROC_ROOT:-/proc}
+CGROUP_ROOT=${CGROUP_ROOT:-/sys/fs/cgroup}
+SYSTEMCTL=${SYSTEMCTL:-systemctl}
+LOG=${LOG:-/var/log/runner-refresh.log}
+STATE_DIR=${STATE_DIR:-/run/runner-refresh}  # tmpfs: the markers reset at boot
+MIN_INTERVAL=${MIN_INTERVAL:-3600}           # seconds between restarts of one unit
+# The units needrestart-actions-runner.conf exempts; the test asserts the two
+# name the same prefix.
+UNIT_GLOB='actions.runner.*'
+
+note() {
+    echo "$(date -Is) $*" >> "$LOG"
+    command -v logger >/dev/null && logger -t runner-refresh "$*"
+    return 0
+}
+
+# unit_pids <unit> — every process in the unit's cgroup: runsvc.sh, node, the
+# Runner.Listener and, during a job, Runner.Worker and the step processes.
+unit_pids() {
+    local f="$CGROUP_ROOT/system.slice/$1/cgroup.procs"
+    [[ -r $f ]] && cat "$f"
+    return 0
+}
+
+# stale_mappings <pid>... — one "<pid> <path>" line per deleted shared object a
+# process still maps. Only *.so files count: apt replacing a library unlinks
+# the old file under the process, and the kernel appends "(deleted)" to its
+# maps entry. The same suffix decorates pseudo-files that are not libraries —
+# every .NET process maps a /memfd:doublemapper for as long as it lives (the
+# only "(deleted)" mapping a freshly restarted runner has), /dev/shm objects,
+# /dev/zero mappings, shm segments reading /SYSV… — and replaced data files
+# such as locale-archive; none of those is stale code, so none of them counts.
+stale_mappings() {
+    local pid rest path
+    for pid in "$@"; do
+        [[ -r $PROC_ROOT/$pid/maps ]] || continue
+        while read -r _ _ _ _ _ rest; do
+            [[ $rest == *' (deleted)' ]] || continue
+            path=${rest% (deleted)}
+            [[ $path == /* && $path != /memfd:* && $path != /dev/* ]] || continue
+            [[ $path == *.so || $path == *.so.* ]] || continue
+            printf '%s %s\n' "$pid" "$path"
+        done < "$PROC_ROOT/$pid/maps"
+    done
+}
+
+# unit_busy <unit> — a live Runner.Worker in the cgroup is a job in progress.
+unit_busy() {
+    local pid
+    for pid in $(unit_pids "$1"); do
+        [[ -r $PROC_ROOT/$pid/comm && $(<"$PROC_ROOT/$pid/comm") == Runner.Worker ]] && return 0
+    done
+    return 1
+}
+
+# refreshed_recently <unit> — this program restarted the unit under
+# MIN_INTERVAL ago. Guards the loop a "(deleted)" object that survives a
+# restart would cause: the unit is held, and the log names the same library
+# every tick until someone looks.
+refreshed_recently() {
+    local marker="$STATE_DIR/$1"
+    [[ -e $marker ]] && (( $(date +%s) - $(stat -c %Y "$marker") < MIN_INTERVAL ))
+}
+
+mark_refreshed() {
+    install -d "$STATE_DIR" && : > "$STATE_DIR/$1"
+}
+
+# stale_summary <stale-lines> — the distinct library names, for the log.
+stale_summary() {
+    local -A seen=()
+    local pid path
+    while read -r pid path; do
+        [[ -n $path ]] && seen[${path##*/}]=1
+    done <<< "$1"
+    local out
+    out=$(printf '%s\n' "${!seen[@]}" | sort | tr '\n' ' ')
+    printf '%s' "${out% }"
+}
+
+main() {
+    local dry_run=0 rc=0 unit pids stale
+    [[ ${1:-} == --dry-run ]] && dry_run=1
+    for unit in $($SYSTEMCTL list-units "$UNIT_GLOB" --no-legend --plain | awk '{print $1}'); do
+        pids=$(unit_pids "$unit")
+        [[ -n $pids ]] || continue
+        # shellcheck disable=SC2086  # pids is a whitespace-separated list
+        stale=$(stale_mappings $pids)
+        [[ -n $stale ]] || continue
+        if unit_busy "$unit"; then
+            note "busy $unit: job in progress, replaced libraries stay mapped until idle ($(stale_summary "$stale"))"
+        elif refreshed_recently "$unit"; then
+            note "HOLD $unit: restarted under $((MIN_INTERVAL / 60)) min ago and still maps ($(stale_summary "$stale")) — a replaced library, or one a restart does not clear?"
+        elif (( dry_run )); then
+            note "DRY-RUN REFRESH $unit: idle, would restart ($(stale_summary "$stale"))"
+        elif $SYSTEMCTL restart "$unit"; then
+            mark_refreshed "$unit"
+            note "REFRESH $unit: idle, restarted ($(stale_summary "$stale"))"
+        else
+            note "ERROR $unit: idle but restart failed ($(stale_summary "$stale"))"
+            rc=1
+        fi
+    done
+    return "$rc"
+}
+
+# Sourced by the test for its functions; run as a program otherwise.
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+    main "$@"
+fi

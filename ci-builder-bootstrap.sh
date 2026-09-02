@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # ci-builder-bootstrap.sh — Idempotent bootstrap for a replacement ci-builder
 # host (fresh Ubuntu 24.04). Installs everything REPRODUCIBLE: packages,
-# Docker, k3s, the runner-reaper and ci-disk-janitor watchdogs, sysctl/
-# limits, and re-registers all GitHub Actions runners from scratch (runners
+# Docker, k3s, the runner-reaper, runner-refresh and ci-disk-janitor watchdogs,
+# sysctl/limits, and re-registers all GitHub Actions runners from scratch (runners
 # cannot be copied between hosts).
 #
 # The WireGuard/tor-gateway k3s manifest is intentionally NOT auto-applied
@@ -119,6 +119,24 @@ net.ipv4.conf.all.src_valid_mark=1
 SYSCTL
 sysctl --system >/dev/null 2>&1 || true
 
+# ── 4b. needrestart: runner services are never restarted by apt ───────────
+# unattended-upgrades runs daily (~06:55 local). After a library upgrade,
+# needrestart restarts every service whose process maps the old library —
+# and every actions.runner.* unit's main process is `bash runsvc.sh`, so a
+# libtinfo/readline/glibc patch restarts ALL runners at once, mid-job.
+# 2026-09-02 06:56:13 (ncurses 6.4-2ubuntu2.2): twelve runners restarted,
+# both in-flight portal jobs (run 33590215349, 34 min in) died with their
+# step "Canceled" and the job marked failed; 2026-09-01 06:1x (util-linux)
+# did the same. A runner restart must be a deliberate drain, never a side
+# effect of a security patch — GitHub's own runner updates already wait
+# for the listener to go idle. The override's semantics are proven by
+# tests/needrestart-actions-runner.test.sh. The patch still has to reach
+# the runner processes: runner-refresh (§8) restarts a unit that maps a
+# replaced library once it has no job running.
+log "installing needrestart override for the runner units"
+install -D -m 0644 "$REPO_DIR/needrestart-actions-runner.conf" \
+    /etc/needrestart/conf.d/50-actions-runner.conf
+
 # ── 5. k3s (this host's own single-node cluster) ───────────────────────────
 if ! command -v k3s &>/dev/null; then
     log "installing k3s"
@@ -167,7 +185,7 @@ else
     log "SKIPPED WireGuard manifest step: /var/lib/wireguard not restored yet. Restore state first, then see wireguard/README.md."
 fi
 
-# ── 8. Runner-reaper + ci-disk-janitor watchdogs ───────────────────────────
+# ── 8. Runner-reaper, runner-refresh + ci-disk-janitor watchdogs ───────────
 if [[ ! -f /root/.runner-reaper-token ]]; then
     log "no restored reaper token — installing runner-reaper using the gh bootstrap token instead"
     cp "$GH_TOKEN_FILE" /tmp/reaper-token
@@ -176,6 +194,7 @@ if [[ ! -f /root/.runner-reaper-token ]]; then
 else
     bash "$REPO_DIR/runner-reaper.sh" --token-file /root/.runner-reaper-token
 fi
+bash "$REPO_DIR/runner-refresh.sh"
 bash "$REPO_DIR/ci-disk-janitor.sh"
 
 # ── 9. Register GitHub Actions runners ──────────────────────────────────
