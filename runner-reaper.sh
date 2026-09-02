@@ -37,10 +37,15 @@
 # Either signal alone blocks reaping — this is deliberately biased
 # toward leaving a wedged runner alone over killing a live build.
 #
-# Runner-name → repo derivation also had a bug: stripping only "-2"/"-3"
-# suffixes missed "-4" (or any future -N), causing "API check failed"
-# skips for that runner forever. Fixed with a single suffix-agnostic
-# regex.
+# Worker → repo derivation (v4, 2026-09-02): a Runner.Worker's argv[0] is
+# /home/ubuntu/actions-runner-<runner-name>/bin[.<ver>]/Runner.Worker and
+# the directory names the RUNNER, not the repo — pneuma-engine has four
+# (…-contabo, -contabo-2, -contabo-build-1, -contabo-build-2). The repo is
+# read from that runner's own .runner registration file (gitHubUrl); the
+# earlier regex that stripped a -contabo[-N] suffix produced a repo GitHub
+# has never heard of for every build-lane runner ("API check failed",
+# skipped forever) and any process whose command line merely mentioned
+# "actions-runner-" was scanned as a worker.
 #
 # Requires: a GitHub token with repo read scope at /root/.runner-reaper-token
 # (mode 600). The installer copies it from --token-file.
@@ -138,6 +143,20 @@ print(sum(1 for j in jobs if j.get('status')=='in_progress'))
     return 1
 }
 
+# ---- the runner install directory behind a Runner.Worker command line, or nothing
+worker_dir() {
+    [[ "$1" =~ ^(/[^[:space:]]*/actions-runner-[^/[:space:]]+)/bin[^/[:space:]]*/Runner\.Worker([[:space:]]|$) ]] || return 1
+    echo "${BASH_REMATCH[1]}"
+}
+
+# ---- the repo a runner install directory is registered against (its .runner file)
+worker_repo() {
+    local url
+    url=$(jq -r '.gitHubUrl // empty' "$1/.runner" 2>/dev/null) || return 1
+    [[ "$url" == "https://github.com/$OWNER/"* ]] || return 1
+    echo "${url##*/}"
+}
+
 # ---- load prior-tick state
 declare -A PREV_CPU
 if [[ -f "$CPU_STATE_FILE" ]]; then
@@ -154,14 +173,8 @@ declare -A WORKER_PIDS
 declare -A CUR_CPU
 
 while read -r pid etimes args; do
-    # /home/ubuntu/actions-runner-<repo>-contabo[-N]/bin.../Runner.Worker
-    dir=${args#*actions-runner-}
-    repo=${dir%%/*}
-    # Runner dirs carry the RUNNER name suffix (-contabo, -contabo-2, ...,
-    # -contabo-N); strip it regardless of N (2026-08-19 fix — the old
-    # code only stripped -2/-3 and silently broke on -4).
-    repo=$(echo "$repo" | sed -E 's/(-contabo)(-[0-9]+)?$//')
-    [[ -n "$repo" ]] || continue
+    dir=$(worker_dir "$args") || continue
+    repo=$(worker_repo "$dir") || continue
 
     cur=${OLDEST[$repo]:-0}
     (( etimes > cur )) && OLDEST[$repo]=$etimes

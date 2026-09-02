@@ -25,6 +25,10 @@
 #   token if no reaper token was restored from state.
 # --state-tarball is optional; if omitted, the script skips WireGuard/reaper
 #   state restore and just prints what's missing.
+# --plan-runners prints what step 9 would do for every row of the runner
+#   inventory — registered already, or would be registered — and exits before
+#   any step runs: nothing installed, downloaded or registered, no token
+#   needed. The way to check the inventory against a live host.
 #
 # Safe to re-run: every step checks for existing state before acting.
 set -euo pipefail
@@ -33,6 +37,7 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OWNER=deanmak13
 GH_TOKEN_FILE=""
 STATE_TARBALL=""
+PLAN_RUNNERS=0
 
 log() { echo "[ci-builder-bootstrap] $*"; }
 err() { echo "[ci-builder-bootstrap] ERROR: $*" >&2; exit 1; }
@@ -41,38 +46,72 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --gh-token-file) GH_TOKEN_FILE="$2"; shift 2 ;;
         --state-tarball) STATE_TARBALL="$2"; shift 2 ;;
+        --plan-runners) PLAN_RUNNERS=1; shift ;;
         *) err "Unknown argument: $1" ;;
     esac
 done
 
-[[ $EUID -eq 0 ]] || err "run as root"
-[[ -n "$GH_TOKEN_FILE" && -f "$GH_TOKEN_FILE" ]] || err "--gh-token-file is required and must exist"
-GH_TOKEN=$(cat "$GH_TOKEN_FILE")
+if (( ! PLAN_RUNNERS )); then
+    [[ $EUID -eq 0 ]] || err "run as root"
+    [[ -n "$GH_TOKEN_FILE" && -f "$GH_TOKEN_FILE" ]] || err "--gh-token-file is required and must exist"
+    GH_TOKEN=$(cat "$GH_TOKEN_FILE")
+fi
 
-# Repo → runner-name list, mirroring the live host inventoried 2026-08-15.
-# Format: "<repo> <runner-name> <enabled-on-old-host: y/n>"
+# Runner inventory — one row per runner. Mirrors the live ci-builder as of
+# 2026-09-02 (12 services after the 2026-09-01 drain of engine-3/-4, portal-3
+# and deployments-3: >5 concurrent jobs made every job slower on the shared
+# host), plus pneuma-ops, whose scheduled [self-hosted, ci-builder] workflows
+# had queued unrun since the migration because no runner was ever registered
+# for that repo. pneuma-branding/-docs/-mem0 run on ubuntu-latest only, so
+# they have no row.
+#
+# GitHub adds self-hosted/Linux/X64 itself. The labels column is the lane the
+# workflows' runs-on: selects: `ci-builder` for gate jobs, `ci-builder-build`
+# for image builds (engine and portal keep the lanes apart so a build never
+# queues behind gates and vice versa). enabled=n installs the service but
+# leaves it stopped.
+# Format: "<repo> <runner-name> <labels> <enabled: y/n>"
 RUNNERS=$(cat <<'EOF'
-pneuma pneuma-contabo y
-pneuma-engine pneuma-engine-contabo y
-pneuma-engine pneuma-engine-contabo-2 y
-pneuma-engine pneuma-engine-contabo-3 y
-pneuma-engine pneuma-engine-contabo-4 y
-pneuma-portal pneuma-portal-contabo y
-pneuma-portal pneuma-portal-contabo-2 y
-pneuma-portal pneuma-portal-contabo-3 y
-pneuma-proto pneuma-proto-contabo y
-pneuma-helm-charts pneuma-helm-charts-contabo y
-pneuma-deployments pneuma-deployments-contabo y
-pneuma-deployments pneuma-deployments-contabo-2 y
-pneuma-deployments pneuma-deployments-contabo-3 y
-pneuma-branding pneuma-branding-contabo n
-pneuma-docs pneuma-docs-contabo n
-pneuma-mem0 pneuma-mem0-contabo n
-pneuma-ops pneuma-ops-contabo n
+pneuma pneuma-contabo ci-builder y
+pneuma-engine pneuma-engine-contabo ci-builder y
+pneuma-engine pneuma-engine-contabo-2 ci-builder y
+pneuma-engine pneuma-engine-contabo-build-1 ci-builder-build y
+pneuma-engine pneuma-engine-contabo-build-2 ci-builder-build y
+pneuma-portal pneuma-portal-contabo ci-builder y
+pneuma-portal pneuma-portal-contabo-2 ci-builder y
+pneuma-portal pneuma-portal-contabo-build-1 ci-builder-build y
+pneuma-proto pneuma-proto-contabo ci-builder y
+pneuma-helm-charts pneuma-helm-charts-contabo ci-builder y
+pneuma-deployments pneuma-deployments-contabo ci-builder y
+pneuma-deployments pneuma-deployments-contabo-2 ci-builder y
+pneuma-ops pneuma-ops-contabo ci-builder y
 EOF
 )
-RUNNER_LABELS="self-hosted,ci-builder"
+RUNNER_BASE_LABELS="self-hosted"
 RUNNER_VERSION="2.336.0"
+# The runners live in the ubuntu user's home, one directory per RUNNER, never
+# per repo: a repo has up to four runners here, and runner-reaper,
+# ci-disk-janitor and the export manifest all key off actions-runner-<name>.
+RUNNER_HOME="${RUNNER_HOME:-/home/ubuntu}"
+runner_dir() { printf '%s/actions-runner-%s\n' "$RUNNER_HOME" "$1"; }
+
+if (( PLAN_RUNNERS )); then
+    while read -r repo runner_name labels enabled; do
+        [[ -n "$repo" ]] || continue
+        if [[ -f "$(runner_dir "$runner_name")/.runner" ]]; then
+            log "plan: $runner_name is registered in $(runner_dir "$runner_name") — nothing to do"
+        else
+            log "plan: $runner_name would be registered for $OWNER/$repo in $(runner_dir "$runner_name") (labels: $RUNNER_BASE_LABELS,$labels; enabled: $enabled)"
+        fi
+    done <<< "$RUNNERS"
+    exit 0
+fi
+
+# ── Host-only from here [host-only-begin] ────────────────────────────────
+# Every step below mutates the host and runs only as root on it, so no test
+# executes it: tests/coverage.sh leaves this region out of the report and
+# tests/runner-inventory.test.sh checks it by inspection. Everything above —
+# arguments, the inventory, --plan-runners — runs in the tests for real.
 
 # ── 1. Packages ──────────────────────────────────────────────────────────
 log "installing base packages"
@@ -209,17 +248,17 @@ mint_reg_token() {
         | jq -r .token
 }
 
-while read -r repo runner_name was_enabled; do
+while read -r repo runner_name labels enabled; do
     [[ -n "$repo" ]] || continue
-    dir="/home/ubuntu/actions-runner-${repo}"
-    [[ "$runner_name" == *-2 ]] && dir="${dir}-2"
+    dir=$(runner_dir "$runner_name")
+    runner_labels="$RUNNER_BASE_LABELS,$labels"
 
     if [[ -f "$dir/.runner" ]]; then
         log "runner $runner_name already registered in $dir — skipping"
         continue
     fi
 
-    log "registering $runner_name for $OWNER/$repo (labels: $RUNNER_LABELS)"
+    log "registering $runner_name for $OWNER/$repo (labels: $runner_labels)"
     su - ubuntu -c "mkdir -p '$dir'"
     su - ubuntu -c "
         cd '$dir' &&
@@ -235,14 +274,14 @@ while read -r repo runner_name was_enabled; do
           --url https://github.com/$OWNER/$repo \
           --token '$REG_TOKEN' \
           --name '$runner_name' \
-          --labels '$RUNNER_LABELS' \
+          --labels '$runner_labels' \
           --work _work
     "
     ( cd "$dir" && ./svc.sh install ubuntu )
-    if [[ "$was_enabled" == "y" ]]; then
+    if [[ "$enabled" == "y" ]]; then
         ( cd "$dir" && ./svc.sh start )
     else
-        log "  $runner_name was disabled on old host — service installed but left stopped/disabled"
+        log "  $runner_name is disabled in the inventory — service installed but left stopped"
         systemctl disable "actions.runner.$OWNER-$repo.$runner_name.service" 2>/dev/null || true
         systemctl stop "actions.runner.$OWNER-$repo.$runner_name.service" 2>/dev/null || true
     fi
@@ -276,4 +315,4 @@ log "  kubectl get all -A"
 log "  systemctl list-timers | grep -E 'reaper|janitor'"
 log "  systemctl status cloudflared-access-openbao"
 log "OPEN ITEM: run the WireGuard manifest apply command printed in step 7 (not automated)."
-
+# [host-only-end]

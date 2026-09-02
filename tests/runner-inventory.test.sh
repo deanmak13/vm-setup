@@ -1,0 +1,221 @@
+#!/usr/bin/env bash
+# tests/runner-inventory.test.sh — the runner inventory in ci-builder-bootstrap.sh
+# (§ RUNNERS) is one row per RUNNER with its own labels and directory, and the
+# scripts that key off those directories agree with it:
+#   - the bootstrap registers each row into /home/ubuntu/actions-runner-<runner-name>
+#     with `self-hosted,<labels>`;
+#   - runner-reaper's worker_dir/worker_repo (extracted from the installed
+#     script's own source, not copied here) resolve a Runner.Worker command
+#     line to that directory and to the repo its .runner file registers —
+#     no name parsing, so a build-lane runner is attributed correctly;
+#   - ci-builder-migration.md describes the same layout.
+#
+# Run: bash tests/runner-inventory.test.sh
+set -euo pipefail
+
+TESTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(dirname "$TESTS_DIR")"
+BOOTSTRAP="$REPO_DIR/ci-builder-bootstrap.sh"
+REAPER="$REPO_DIR/runner-reaper.sh"
+MIGRATION="$REPO_DIR/ci-builder-migration.md"
+OWNER=$(sed -n 's/^OWNER=\([A-Za-z0-9-]*\)$/\1/p' "$BOOTSTRAP")
+[[ -n "$OWNER" ]] || { echo "FAIL OWNER not found in $BOOTSTRAP"; exit 1; }
+
+fail=0
+# check <description> <command...> — records a FAIL when the command exits non-zero.
+check() {
+    local label=$1 verdict=ok
+    shift
+    "$@" >/dev/null 2>&1 || { verdict=FAIL; fail=1; }
+    printf '%-4s %s\n' "$verdict" "$label"
+}
+# expect_out <description> <expected> <command...> — the command's stdout must equal <expected>.
+expect_out() {
+    local label=$1 want=$2 got verdict=ok
+    shift 2
+    got=$("$@" 2>/dev/null || true)
+    [[ "$got" == "$want" ]] || { verdict=FAIL; fail=1; }
+    printf '%-4s %s -> %q (expected: %q)\n' "$verdict" "$label" "$got" "$want"
+}
+# expect_fail <description> <command...> — the command must exit non-zero and print nothing.
+expect_fail() {
+    local label=$1 got verdict=ok
+    shift
+    got=$("$@" 2>/dev/null) && verdict=FAIL
+    [[ -z "$got" && "$verdict" == ok ]] || { verdict=FAIL; fail=1; }
+    printf '%-4s %s\n' "$verdict" "$label"
+}
+
+# ── the inventory table ──────────────────────────────────────────────────
+# Range anchors stop short of the heredoc openers on the bootstrap's lines on
+# purpose: a literal opener in this file is one kcov's parser would wait to see
+# terminated (see the scan at the end).
+rows=$(sed -n '/^RUNNERS=/,/^EOF$/p' "$BOOTSTRAP" | sed '1d;$d')
+check "RUNNERS table is present and non-empty" test -n "$rows"
+check "every row is exactly '<repo> <runner-name> <labels> <y|n>'" \
+    bash -c '! grep -Ev "^[a-z0-9-]+ [a-z0-9-]+ [a-z0-9-]+(,[a-z0-9-]+)* [yn]$" <<< "$1"' _ "$rows"
+check "runner names are unique (one directory and one systemd unit each)" \
+    bash -c 'test "$(awk "{print \$2}" <<< "$1" | sort | uniq -d | wc -l)" -eq 0' _ "$rows"
+check "the labels column never repeats self-hosted (the loop adds it)" \
+    bash -c '! awk "{print \$3}" <<< "$1" | grep -q self-hosted' _ "$rows"
+check "every runner name is prefixed with its repo (unit names stay readable)" \
+    bash -c '! awk "index(\$2, \$1 \"-\") != 1" <<< "$1" | grep -q .' _ "$rows"
+check "every label is a lane some workflow can select (ci-builder or ci-builder-build)" \
+    bash -c '! awk "{print \$3}" <<< "$1" | tr , "\n" | grep -Evx "ci-builder|ci-builder-build" | grep -q .' _ "$rows"
+
+# ── the registration loop consumes all four columns per runner ───────────
+check "loop reads <repo> <runner-name> <labels> <enabled>" \
+    grep -qxF 'while read -r repo runner_name labels enabled; do' "$BOOTSTRAP"
+check "install directory is actions-runner-<runner-name> under the ubuntu home" \
+    bash -c 'grep -qxF "runner_dir() { printf '"'"'%s/actions-runner-%s\\n'"'"' \"\$RUNNER_HOME\" \"\$1\"; }" "$1" && grep -qxF "RUNNER_HOME=\"\${RUNNER_HOME:-/home/ubuntu}\"" "$1" && grep -qxF "    dir=\$(runner_dir \"\$runner_name\")" "$1"' _ "$BOOTSTRAP"
+check "no per-repo directory with a special-cased -2 suffix remains" \
+    bash -c '! grep -q "actions-runner-\${repo}" "$1" && ! grep -q "== \*-2" "$1"' _ "$BOOTSTRAP"
+check "config.sh gets self-hosted plus the row's own labels" \
+    bash -c 'grep -qx "    runner_labels=\"\$RUNNER_BASE_LABELS,\$labels\"" "$1" && grep -q "^          --labels .\$runner_labels. " "$1" && grep -qx "RUNNER_BASE_LABELS=\"self-hosted\"" "$1"' _ "$BOOTSTRAP"
+check "the enabled column decides whether the service is started" \
+    grep -qxF '    if [[ "$enabled" == "y" ]]; then' "$BOOTSTRAP"
+
+# ── runner-reaper: worker command line → install dir → repo ──────────────
+installed=$(sed -n '\|^cat > /usr/local/bin/runner-reaper |,/^SCRIPT$/p' "$REAPER" | sed '1d;$d')
+check "installed reaper defines worker_dir and worker_repo and uses them in the scan loop" \
+    bash -c 'grep -qx "worker_dir() {" <<< "$1" && grep -qx "worker_repo() {" <<< "$1" && grep -qx "    dir=\$(worker_dir \"\$args\") || continue" <<< "$1" && grep -qx "    repo=\$(worker_repo \"\$dir\") || continue" <<< "$1"' _ "$installed"
+check "installed reaper no longer parses the repo out of the directory name" \
+    bash -c '! grep -q "sed -E .s/(-contabo)" <<< "$1" && ! grep -q "dir=\${args#\*actions-runner-}" <<< "$1"' _ "$installed"
+# worker_repo reads $OWNER from the reaper's OWN assignment, not the
+# bootstrap's: the two files each hardcode it, so the eval'd function runs
+# with the value the installed script would use, and the two must agree —
+# a reaper whose OWNER drifts rejects every real runner and goes blind.
+reaper_owner=$(sed -n 's/^OWNER=\([A-Za-z0-9-]*\)$/\1/p' <<< "$installed")
+check "installed reaper hardcodes the same OWNER as the bootstrap" \
+    test "$reaper_owner" = "$OWNER"
+eval "$(sed -n '/^worker_dir() {$/,/^}$/p' <<< "$installed")"
+eval "$(sed -n '/^worker_repo() {$/,/^}$/p' <<< "$installed")"
+OWNER=$reaper_owner
+
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+for r in pneuma-engine-contabo pneuma-engine-contabo-build-1 pneuma-portal-contabo-2; do
+    mkdir -p "$work/actions-runner-$r/bin.2.337.0"
+done
+printf '{"agentName":"pneuma-engine-contabo","gitHubUrl":"https://github.com/%s/pneuma-engine"}\n' "$OWNER" > "$work/actions-runner-pneuma-engine-contabo/.runner"
+printf '{"agentName":"pneuma-engine-contabo-build-1","gitHubUrl":"https://github.com/%s/pneuma-engine"}\n' "$OWNER" > "$work/actions-runner-pneuma-engine-contabo-build-1/.runner"
+printf '{"agentName":"pneuma-portal-contabo-2","gitHubUrl":"https://github.com/someone-else/pneuma-portal"}\n' > "$work/actions-runner-pneuma-portal-contabo-2/.runner"
+mkdir -p "$work/actions-runner-unregistered/bin"
+
+expect_out "worker_dir: versioned bin dir + spawnclient args" "$work/actions-runner-pneuma-engine-contabo-build-1" \
+    worker_dir "$work/actions-runner-pneuma-engine-contabo-build-1/bin.2.337.0/Runner.Worker spawnclient 105 108"
+expect_out "worker_dir: plain bin dir, no args" "$work/actions-runner-pneuma-engine-contabo" \
+    worker_dir "$work/actions-runner-pneuma-engine-contabo/bin/Runner.Worker"
+expect_fail "worker_dir: Runner.Listener is not a worker" \
+    worker_dir "$work/actions-runner-pneuma-engine-contabo/bin/Runner.Listener run"
+expect_fail "worker_dir: a shell whose command line mentions Runner.Worker is not a worker" \
+    worker_dir "bash -c 'pgrep -f Runner.Worker; ls $work/actions-runner-pneuma-engine-contabo/bin/Runner.Worker'"
+expect_fail "worker_dir: Runner.Worker outside an actions-runner-* directory" \
+    worker_dir "/opt/other/bin/Runner.Worker spawnclient 1 2"
+expect_fail "worker_dir: a binary merely prefixed Runner.Worker is not the worker" \
+    worker_dir "$work/actions-runner-pneuma-engine-contabo/bin/Runner.Worker.orig spawnclient 1 2"
+
+expect_out "worker_repo: gate runner -> its repo" "pneuma-engine" worker_repo "$work/actions-runner-pneuma-engine-contabo"
+expect_out "worker_repo: build-lane runner -> the same repo (no suffix parsing)" "pneuma-engine" worker_repo "$work/actions-runner-pneuma-engine-contabo-build-1"
+expect_fail "worker_repo: a runner registered to another owner is ignored" worker_repo "$work/actions-runner-pneuma-portal-contabo-2"
+expect_fail "worker_repo: no .runner file -> no repo" worker_repo "$work/actions-runner-unregistered"
+expect_fail "worker_repo: missing directory -> no repo" worker_repo "$work/actions-runner-gone"
+
+# ── --plan-runners: the inventory against a host, touching nothing ───────
+# The bootstrap runs for real against the fixture home: no root, no token,
+# and it must exit before step 1 (nothing installed).
+mkdir -p "$work/actions-runner-pneuma-proto-contabo/bin"   # a download that never got to config.sh
+plan=$(RUNNER_HOME="$work" bash "$BOOTSTRAP" --plan-runners 2>&1) && plan_rc=0 || plan_rc=$?
+check "--plan-runners exits 0 without root or a token" test "$plan_rc" -eq 0
+expect_out "--plan-runners: one plan line per inventory row, nothing else" \
+    "$(wc -l <<< "$rows")" bash -c 'grep -c "plan: " <<< "$1"; ! grep -vq "plan: " <<< "$1" || echo "and more"' _ "$plan"
+check "--plan-runners: a registered runner is reported as nothing to do" \
+    grep -qxF "[ci-builder-bootstrap] plan: pneuma-engine-contabo is registered in $work/actions-runner-pneuma-engine-contabo — nothing to do" <<< "$plan"
+check "--plan-runners: a missing runner is reported with its repo, labels and enabled flag" \
+    grep -qxF "[ci-builder-bootstrap] plan: pneuma-ops-contabo would be registered for $OWNER/pneuma-ops in $work/actions-runner-pneuma-ops-contabo (labels: self-hosted,ci-builder; enabled: y)" <<< "$plan"
+check "--plan-runners: a directory without a .runner file counts as not registered" \
+    grep -q "plan: pneuma-proto-contabo would be registered for $OWNER/pneuma-proto in $work/actions-runner-pneuma-proto-contabo " <<< "$plan"
+check "--plan-runners: never runs a step (no package install reached)" \
+    bash -c '! grep -q "installing" <<< "$1"' _ "$plan"
+check "an unknown argument is still an error in plan mode" \
+    bash -c '! RUNNER_HOME="$2" bash "$1" --plan-runners --bogus >/dev/null 2>&1' _ "$BOOTSTRAP" "$work"
+# The flag is added to the command the operator is about to run, so the real
+# invocation's arguments must be accepted and left unread (the paths do not
+# exist).
+expect_out "--plan-runners with the real invocation's arguments: the same plan, the token file never read" \
+    "$plan" bash -c 'RUNNER_HOME="$2" bash "$1" --plan-runners --gh-token-file "$2/no-such-token" --state-tarball "$2/no-such-tarball" 2>&1' _ "$BOOTSTRAP" "$work"
+# Without the flag the bootstrap stops at its first precondition — root, then
+# the token file — before anything else runs: one ERROR line, exit 1.
+if [[ $EUID -eq 0 ]]; then precondition="--gh-token-file is required and must exist"; else precondition="run as root"; fi
+expect_out "without --plan-runners the bootstrap stops at its first unmet precondition" \
+    "[ci-builder-bootstrap] ERROR: $precondition"$'\n'"exit=1" \
+    bash -c 'RUNNER_HOME="$2" bash "$1" 2>&1; echo "exit=$?"' _ "$BOOTSTRAP" "$work"
+
+# ── the host-only region is marked where the steps begin, to the end ─────
+# coverage.sh names the markers once; the bootstrap must carry both, the
+# first just before step 1 and the second as its last line, so the report
+# measures exactly the part a test can run.
+region=$(sed -n 's/.*--exclude-region=\([^:]*\):\([^"]*\)".*/\1 \2/p' "$REPO_DIR/tests/coverage.sh")
+check "coverage.sh excludes one begin:end region" test "$(wc -w <<< "$region")" -eq 2
+expect_out "the begin marker heads the comment block that precedes step 1" \
+    "# ── 1. Packages ──────────────────────────────────────────────────────────" \
+    bash -c 'grep -n -F "$2" "$1" | cut -d: -f1 | { read -r n; sed -n "$((n + 6))p" "$1"; }' _ "$BOOTSTRAP" "${region%% *}"
+expect_out "the end marker is the bootstrap's last line" "# ${region##* }" tail -n 1 "$BOOTSTRAP"
+check "each marker appears exactly once" \
+    bash -c 'test "$(grep -cF "$2" "$1")" -eq 1 && test "$(grep -cF "$3" "$1")" -eq 1' _ "$BOOTSTRAP" "${region%% *}" "${region##* }"
+
+# ── coverage.sh filters the merged report the way it filters each run ────
+check "coverage.sh gives the same filters to every kcov run and to the merge (kcov applies them per report written)" \
+    bash -c 'test "$(grep -cF "$2" "$1")" -eq 2 && grep -qF "$2 --merge" "$1"' _ "$REPO_DIR/tests/coverage.sh" 'kcov "${filters[@]}"'
+
+# ── the runbook describes this layout, not a per-repo one ────────────────
+check "migration runbook: install directory is actions-runner-<runner-name>" \
+    grep -q 'actions-runner-<runner-name>' "$MIGRATION"
+check "migration runbook: no stale actions-runner-<repo>[-2] path" \
+    bash -c '! grep -q "actions-runner-<repo>" "$1"' _ "$MIGRATION"
+check "migration runbook: the inventory table lives in the bootstrap only" \
+    bash -c '! grep -q "^| pneuma-engine | pneuma-engine-contabo |" "$1"' _ "$MIGRATION"
+
+
+# ── the test files themselves stay measurable ────────────────────────────
+# kcov's bash parser (bash-engine.cc) treats the first literal heredoc opener
+# on a line — here-strings excepted — as the start of a here-document and
+# skips every line until one equals the marker; an opener whose marker never
+# recurs (a sed range anchored on a heredoc line, say) leaves the rest of the
+# file uninstrumented, and a report that "covers 100%" of what came before.
+# unterminated_heredocs <file>... — prints file:line for every such opener,
+# mirroring kcov's marker rule: optional '-', trimmed, cut at whitespace,
+# enclosing quotes dropped; arithmetic lines and comments never open one.
+unterminated_heredocs() {
+    local f line t m q n lines
+    for f in "$@"; do
+        local -A open=()
+        mapfile -t lines < "$f"
+        n=0
+        for line in "${lines[@]}"; do
+            n=$((n + 1))
+            t=${line#"${line%%[![:space:]]*}"}; t=${t%"${t##*[![:space:]]}"}
+            [[ -n "$t" ]] || continue
+            [[ -n "${open[$t]+x}" ]] && { unset 'open[$t]'; continue; }
+            [[ $t == \#* || $t == let\ * || $line == *'$(('* || $line == *'))'* ]] && continue
+            [[ $line =~ \<\<-?[[:space:]]*([^[:space:]]+) ]] || continue
+            m=${BASH_REMATCH[1]}
+            [[ $m == \<* ]] && continue
+            q=${m:0:1}
+            (( ${#m} > 2 )) && [[ $q == \" || $q == \' ]] && [[ ${m: -1} == "$q" ]] && m=${m:1:${#m}-2}
+            open[$m]=$n
+        done
+        for m in "${!open[@]}"; do printf '%s:%s unterminated heredoc opener %s\n' "$f" "${open[$m]}" "$m"; done
+    done
+}
+printf 'x=$(cat <%s\ny=1\n' '<EOF' > "$work/heredoc-open.sh"
+printf 'x=$(cat <%s\n\trow\n\tEOF\nz=$(grep -c q <%s%s "q")\n' "<-'EOF'" '<' '<' > "$work/heredoc-closed.sh"
+expect_out "heredoc scan: an opener whose marker never recurs is reported with its line" \
+    "$work/heredoc-open.sh:1 unterminated heredoc opener EOF" unterminated_heredocs "$work/heredoc-open.sh"
+expect_out "heredoc scan: a quoted tab-indented opener with its terminator, and a here-string, are clean" "" \
+    unterminated_heredocs "$work/heredoc-closed.sh"
+stray=$(unterminated_heredocs "$TESTS_DIR"/*.sh)
+check "every heredoc opener in tests/ has its terminator line (kcov stops instrumenting at one that does not)${stray:+ — $stray}" \
+    test -z "$stray"
+
+exit "$fail"

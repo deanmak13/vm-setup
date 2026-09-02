@@ -8,9 +8,10 @@ Inventory taken 2026-08-15 from the live Contabo host.
 ## 1. What's on the old host
 
 **Systemd, beyond stock Ubuntu:**
-- 13 `actions.runner.*` services (10 repos, 3 repos double-runnered) — see
-  table below. 9 enabled/running, 4 disabled (branding, docs, mem0, ops —
-  kept installed but stopped).
+- `actions.runner.*` services, one per runner — the current inventory is the
+  `RUNNERS` table in `ci-builder-bootstrap.sh` (the only copy; see §3). At
+  migration time the old host had 13 (9 running, 4 disabled: branding, docs,
+  mem0, ops).
 - `runner-reaper.timer` (every 5min) + `runner-reaper.service` — installed
   2026-08-14 by `runner-reaper.sh`, reads `/root/.runner-reaper-token`.
 - `ci-disk-janitor.timer` (hourly) + `ci-disk-janitor.service` — installed
@@ -42,7 +43,7 @@ Inventory taken 2026-08-15 from the live Contabo host.
   polls with.
 
 **REPRODUCIBLE, not state (do not copy):**
-- All 13 runners' `.runner`/`.credentials` files — **GitHub Actions runners
+- Every runner's `.runner`/`.credentials` files — **GitHub Actions runners
   cannot be migrated between hosts.** Every runner must re-register fresh
   (registration tokens are one-time-use and tied to the host). See §3.
 - Docker images, buildx builder containers/volumes (11 `moby/buildkit`
@@ -54,24 +55,14 @@ Inventory taken 2026-08-15 from the live Contabo host.
   runner-managed (each job's setup steps install what they need), not
   host state.
 
-**Repo → runner-name table (labels: `self-hosted, ci-builder` — must match
-existing workflow `runs-on:` values or jobs stop being picked up):**
-
-| repo | runner name | old-host state |
-|---|---|---|
-| pneuma | pneuma-contabo | enabled |
-| pneuma-engine | pneuma-engine-contabo | enabled |
-| pneuma-engine | pneuma-engine-contabo-2 | enabled |
-| pneuma-portal | pneuma-portal-contabo | enabled |
-| pneuma-portal | pneuma-portal-contabo-2 | enabled |
-| pneuma-proto | pneuma-proto-contabo | enabled |
-| pneuma-helm-charts | pneuma-helm-charts-contabo | enabled |
-| pneuma-deployments | pneuma-deployments-contabo | enabled |
-| pneuma-deployments | pneuma-deployments-contabo-2 | enabled |
-| pneuma-branding | pneuma-branding-contabo | disabled |
-| pneuma-docs | pneuma-docs-contabo | disabled |
-| pneuma-mem0 | pneuma-mem0-contabo | disabled |
-| pneuma-ops | pneuma-ops-contabo | disabled |
+**Runner inventory:** the `RUNNERS` table in `ci-builder-bootstrap.sh` — one
+row per runner: `<repo> <runner-name> <labels> <enabled: y/n>`. It is the only
+copy (this file used to carry a second one, which drifted: the build-lane
+runners were never added to it and three drained runners stayed listed). The
+labels column is the lane a workflow's `runs-on:` selects — `ci-builder` for
+gate jobs, `ci-builder-build` for image builds — and must match the workflows
+or jobs queue forever with no runner match. `enabled=n` installs the service
+and leaves it stopped.
 
 ## 2. Order of operations
 
@@ -101,12 +92,12 @@ existing workflow `runs-on:` values or jobs stop being picked up):**
    ```
    This installs Docker, gh, k3s, sysctl tuning, restores `/var/lib/wireguard`
    and the reaper token, installs the reaper + janitor watchdogs, and
-   re-registers all 13 runners (loop mints a fresh registration token per
-   repo via `POST /repos/{owner}/{repo}/actions/runners/registration-token`,
-   downloads runner v2.336.0, configures with `--labels self-hosted,ci-builder`,
-   installs the systemd service, and starts it — unless the repo was
-   disabled on the old host, in which case the service is installed but left
-   stopped/disabled to match).
+   re-registers every runner in the `RUNNERS` table (loop mints a fresh
+   registration token per row via
+   `POST /repos/{owner}/{repo}/actions/runners/registration-token`, downloads
+   runner v2.336.0, configures with `--labels self-hosted,<row labels>`,
+   installs the systemd service, and starts it — unless the row is
+   `enabled=n`, in which case the service is installed but left stopped).
 
 5. **Apply the WireGuard k3s manifest manually** (deliberately not
    automated — a one-time, operator-confirmed step):
@@ -130,39 +121,44 @@ existing workflow `runs-on:` values or jobs stop being picked up):**
 8. **Decommission the old host** only after §4 passes and at least one real
    CI run has succeeded per repo on the new host.
 
-## 3. Runner re-registration — what the loop does per repo
+## 3. Runner re-registration — what the loop does per runner
 
-For each `(repo, runner_name)` pair in the table above, `ci-builder-bootstrap.sh`:
-1. Skips if `/home/ubuntu/actions-runner-<repo>[-2]/.runner` already exists
-   (idempotent — safe to re-run after a partial failure).
+For each `<repo> <runner-name> <labels> <enabled>` row of `RUNNERS`,
+`ci-builder-bootstrap.sh`:
+1. Skips if `/home/ubuntu/actions-runner-<runner-name>/.runner` already exists
+   (idempotent — safe to re-run after a partial failure, and the way a newly
+   added row is registered on a live host).
 2. Mints a registration token: `gh api -X POST repos/deanmak13/<repo>/actions/runners/registration-token`
    (script uses raw `curl` with the PAT; equivalent to this `gh api` call).
 3. Downloads `actions-runner-linux-x64-2.336.0.tar.gz`, extracts into
-   `/home/ubuntu/actions-runner-<repo>[-2]`.
-4. `./config.sh --unattended --url https://github.com/deanmak13/<repo> --token <TOKEN> --name <runner_name> --labels self-hosted,ci-builder --work _work`
-5. `./svc.sh install ubuntu`, then `./svc.sh start` (unless the repo was
-   disabled on the old host).
+   `/home/ubuntu/actions-runner-<runner-name>` — one directory per runner,
+   never per repo: `runner-reaper`, `ci-disk-janitor` and the export
+   manifest all key off that name, and a repo has up to four runners here.
+4. `./config.sh --unattended --url https://github.com/deanmak13/<repo> --token <TOKEN> --name <runner-name> --labels self-hosted,<labels> --work _work`
+5. `./svc.sh install ubuntu`, then `./svc.sh start` (unless `enabled=n`).
 
 **Manual equivalent for a single repo** (if the loop needs to be redone for
 one repo only):
 ```sh
 TOKEN=$(gh api -X POST repos/deanmak13/pneuma-engine/actions/runners/registration-token --jq .token)
-cd /home/ubuntu/actions-runner-pneuma-engine
+cd /home/ubuntu/actions-runner-pneuma-engine-contabo
 ./config.sh --unattended --url https://github.com/deanmak13/pneuma-engine \
   --token "$TOKEN" --name pneuma-engine-contabo --labels self-hosted,ci-builder --work _work
 sudo ./svc.sh install ubuntu && sudo ./svc.sh start
 ```
 
 **Labels matter**: every Pneuma workflow's `runs-on:` targets
-`[self-hosted, ci-builder]` (or a subset). If the new runners register with
-different/missing labels, GitHub Actions jobs queue forever with no runner
-match — verify with `gh api repos/deanmak13/<repo>/actions/runners --jq '.runners[] | {name,labels}'`
-per repo after registration.
+`[self-hosted, ci-builder]` or `[self-hosted, ci-builder-build]`. If a runner
+registers with different/missing labels, GitHub Actions jobs queue forever
+with no runner match — verify with
+`gh api repos/deanmak13/<repo>/actions/runners --jq '.runners[] | {name,labels}'`
+per repo after registration. `tests/runner-inventory.test.sh` proves the
+table, the loop and the reaper's directory → repo resolution agree.
 
 ## 4. Verification checklist
 
 ```sh
-# All 13 runner services present, 9 running / 4 stopped-as-before:
+# One runner service per RUNNERS row, enabled=y rows running:
 systemctl list-units 'actions.runner.*' --no-legend
 
 # k3s healthy, wireguard + tor-gateway pods Running:
@@ -178,9 +174,10 @@ ls -la /root/.runner-reaper-token   # -rw------- root root
 # profile (proves /var/lib/wireguard restored correctly — no regeneration
 # needed).
 
-# Trigger one real workflow run per repo (or at minimum: pneuma, pneuma-engine,
-# pneuma-portal, pneuma-deployments — the actively-enabled ones) and confirm
-# it picks up on the new runner and completes green.
+# Trigger one real workflow run per repo in the RUNNERS table (every row is
+# enabled=y today — including pneuma-ops, whose scheduled security-parity gate
+# had been queued and cancelled unrun since the migration) and confirm each
+# picks up on its runner and completes green.
 ```
 
 ## 5. Open items for Dean
@@ -202,7 +199,10 @@ ls -la /root/.runner-reaper-token   # -rw------- root root
 - Old-host IP `109.199.96.150` may be referenced elsewhere (Cloudflare DNS,
   GitHub webhook IP allow-lists, firewall rules) — not exhaustively swept
   here; grep infra config before decommissioning.
-- 4 disabled runners (branding, docs, mem0, ops) were left stopped-but-
-  installed on the assumption they're intentionally idle, not abandoned —
-  confirm with Dean whether to re-register them at all on the new host or
-  drop them from the repo list.
+- The 4 runners that were disabled on the old host (branding, docs, mem0,
+  ops) were never re-registered here. branding/docs/mem0 run every workflow
+  on `ubuntu-latest`, so they have no row. pneuma-ops targets
+  `[self-hosted, ci-builder]` in five workflows (a scheduled
+  `validate-security-deploy-parity` among them) and had queued a run a day
+  that GitHub cancelled unrun since the migration — it is back in the table
+  as `enabled=y`.
