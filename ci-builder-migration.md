@@ -174,9 +174,10 @@ ls -la /root/.runner-reaper-token   # -rw------- root root
 # profile (proves /var/lib/wireguard restored correctly — no regeneration
 # needed).
 
-# Trigger one real workflow run per repo (or at minimum: pneuma, pneuma-engine,
-# pneuma-portal, pneuma-deployments — the actively-enabled ones) and confirm
-# it picks up on the new runner and completes green.
+# Trigger one real workflow run per repo in the RUNNERS table (every row is
+# enabled=y today — including pneuma-ops, whose scheduled security-parity gate
+# had been queued and cancelled unrun since the migration) and confirm each
+# picks up on its runner and completes green.
 ```
 
 ## 5. Open items for Dean

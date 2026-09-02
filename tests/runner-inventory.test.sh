@@ -78,8 +78,16 @@ check "installed reaper defines worker_dir and worker_repo and uses them in the 
     bash -c 'grep -qx "worker_dir() {" <<< "$1" && grep -qx "worker_repo() {" <<< "$1" && grep -qx "    dir=\$(worker_dir \"\$args\") || continue" <<< "$1" && grep -qx "    repo=\$(worker_repo \"\$dir\") || continue" <<< "$1"' _ "$installed"
 check "installed reaper no longer parses the repo out of the directory name" \
     bash -c '! grep -q "sed -E .s/(-contabo)" <<< "$1" && ! grep -q "dir=\${args#\*actions-runner-}" <<< "$1"' _ "$installed"
+# worker_repo reads $OWNER from the reaper's OWN assignment, not the
+# bootstrap's: the two files each hardcode it, so the eval'd function runs
+# with the value the installed script would use, and the two must agree —
+# a reaper whose OWNER drifts rejects every real runner and goes blind.
+reaper_owner=$(sed -n 's/^OWNER=\([A-Za-z0-9-]*\)$/\1/p' <<< "$installed")
+check "installed reaper hardcodes the same OWNER as the bootstrap" \
+    test "$reaper_owner" = "$OWNER"
 eval "$(sed -n '/^worker_dir() {$/,/^}$/p' <<< "$installed")"
 eval "$(sed -n '/^worker_repo() {$/,/^}$/p' <<< "$installed")"
+OWNER=$reaper_owner
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
