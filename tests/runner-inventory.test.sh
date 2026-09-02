@@ -47,7 +47,10 @@ expect_fail() {
 }
 
 # ── the inventory table ──────────────────────────────────────────────────
-rows=$(sed -n "/^RUNNERS=\$(cat <<'EOF'\$/,/^EOF\$/p" "$BOOTSTRAP" | sed '1d;$d')
+# Range anchors stop short of the heredoc openers on the bootstrap's lines on
+# purpose: a literal opener in this file is one kcov's parser would wait to see
+# terminated (see the scan at the end).
+rows=$(sed -n '/^RUNNERS=/,/^EOF$/p' "$BOOTSTRAP" | sed '1d;$d')
 check "RUNNERS table is present and non-empty" test -n "$rows"
 check "every row is exactly '<repo> <runner-name> <labels> <y|n>'" \
     bash -c '! grep -Ev "^[a-z0-9-]+ [a-z0-9-]+ [a-z0-9-]+(,[a-z0-9-]+)* [yn]$" <<< "$1"' _ "$rows"
@@ -73,7 +76,7 @@ check "the enabled column decides whether the service is started" \
     grep -qxF '    if [[ "$enabled" == "y" ]]; then' "$BOOTSTRAP"
 
 # ── runner-reaper: worker command line → install dir → repo ──────────────
-installed=$(sed -n "/^cat > \/usr\/local\/bin\/runner-reaper <<'SCRIPT'\$/,/^SCRIPT\$/p" "$REAPER" | sed '1d;$d')
+installed=$(sed -n '\|^cat > /usr/local/bin/runner-reaper |,/^SCRIPT$/p' "$REAPER" | sed '1d;$d')
 check "installed reaper defines worker_dir and worker_repo and uses them in the scan loop" \
     bash -c 'grep -qx "worker_dir() {" <<< "$1" && grep -qx "worker_repo() {" <<< "$1" && grep -qx "    dir=\$(worker_dir \"\$args\") || continue" <<< "$1" && grep -qx "    repo=\$(worker_repo \"\$dir\") || continue" <<< "$1"' _ "$installed"
 check "installed reaper no longer parses the repo out of the directory name" \
@@ -125,5 +128,47 @@ check "migration runbook: no stale actions-runner-<repo>[-2] path" \
     bash -c '! grep -q "actions-runner-<repo>" "$1"' _ "$MIGRATION"
 check "migration runbook: the inventory table lives in the bootstrap only" \
     bash -c '! grep -q "^| pneuma-engine | pneuma-engine-contabo |" "$1"' _ "$MIGRATION"
+
+
+# ── the test files themselves stay measurable ────────────────────────────
+# kcov's bash parser (bash-engine.cc) treats the first literal heredoc opener
+# on a line — here-strings excepted — as the start of a here-document and
+# skips every line until one equals the marker; an opener whose marker never
+# recurs (a sed range anchored on a heredoc line, say) leaves the rest of the
+# file uninstrumented, and a report that "covers 100%" of what came before.
+# unterminated_heredocs <file>... — prints file:line for every such opener,
+# mirroring kcov's marker rule: optional '-', trimmed, cut at whitespace,
+# enclosing quotes dropped; arithmetic lines and comments never open one.
+unterminated_heredocs() {
+    local f line t m q n lines
+    for f in "$@"; do
+        local -A open=()
+        mapfile -t lines < "$f"
+        n=0
+        for line in "${lines[@]}"; do
+            n=$((n + 1))
+            t=${line#"${line%%[![:space:]]*}"}; t=${t%"${t##*[![:space:]]}"}
+            [[ -n "$t" ]] || continue
+            [[ -n "${open[$t]+x}" ]] && { unset 'open[$t]'; continue; }
+            [[ $t == \#* || $t == let\ * || $line == *'$(('* || $line == *'))'* ]] && continue
+            [[ $line =~ \<\<-?[[:space:]]*([^[:space:]]+) ]] || continue
+            m=${BASH_REMATCH[1]}
+            [[ $m == \<* ]] && continue
+            q=${m:0:1}
+            (( ${#m} > 2 )) && [[ $q == \" || $q == \' ]] && [[ ${m: -1} == "$q" ]] && m=${m:1:${#m}-2}
+            open[$m]=$n
+        done
+        for m in "${!open[@]}"; do printf '%s:%s unterminated heredoc opener %s\n' "$f" "${open[$m]}" "$m"; done
+    done
+}
+printf 'x=$(cat <%s\ny=1\n' '<EOF' > "$work/heredoc-open.sh"
+printf 'x=$(cat <%s\n\trow\n\tEOF\nz=$(grep -c q <%s%s "q")\n' "<-'EOF'" '<' '<' > "$work/heredoc-closed.sh"
+expect_out "heredoc scan: an opener whose marker never recurs is reported with its line" \
+    "$work/heredoc-open.sh:1 unterminated heredoc opener EOF" unterminated_heredocs "$work/heredoc-open.sh"
+expect_out "heredoc scan: a quoted tab-indented opener with its terminator, and a here-string, are clean" "" \
+    unterminated_heredocs "$work/heredoc-closed.sh"
+stray=$(unterminated_heredocs "$TESTS_DIR"/*.sh)
+check "every heredoc opener in tests/ has its terminator line (kcov stops instrumenting at one that does not)${stray:+ — $stray}" \
+    test -z "$stray"
 
 exit "$fail"
