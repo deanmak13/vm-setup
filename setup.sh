@@ -104,12 +104,57 @@ fi
 echo "kernel.apparmor_restrict_unprivileged_userns=0" | sudo tee /etc/sysctl.d/99-playwright.conf
 sudo sysctl -p /etc/sysctl.d/99-playwright.conf
 
-# --- Pneuma: disable dead IPv6 egress (2026-06-11) ---
-# The Contabo node's IPv6 path to ghcr.io is broken (connection reset),
-# but containerd resolves AAAA + tries IPv6 first → ImagePullBackOff that
-# never self-heals. Disable IPv6 so all registry pulls use the working IPv4.
-sudo tee /etc/sysctl.d/99-pneuma-disable-dead-ipv6.conf >/dev/null <<'SYSCTL'
+# --- Pneuma: disable dead IPv6 egress (2026-06-11; made durable 2026-09-21) ---
+# The Contabo node's IPv6 path to ghcr.io is broken (connection reset), but
+# containerd resolves AAAA and tries IPv6 FIRST -> ImagePullBackOff that never
+# self-heals, because every backoff retry re-tries the same dead path.
+#
+# WHY SYSCTL ALONE WAS NOT ENOUGH (three recurrences: 2026-06-11, 09-07, 09-21).
+# sysctl.d sets `all` and `default`, which apply to interfaces that appear
+# AFTER systemd-sysctl runs. eth0 is brought up by systemd-networkd LATER and
+# comes back with disable_ipv6=0 plus the static IPv6 address cloud-init wrote
+# for it. The kernel then prefers IPv6, and pulls break again. Per-interface
+# sysctl is a race we lose on every boot, so this is now fixed at the source:
+# eth0 is declared IPv4-only in netplan, and cloud-init is stopped from
+# regenerating an IPv6 address for it.
+#
+# The netplan file is DERIVED from the live interface, never hardcoded, so this
+# stays correct on a rebuilt or re-addressed instance.
+
+# 1. Stop cloud-init regenerating eth0 with an IPv6 address on every boot.
+sudo tee /etc/cloud/cloud.cfg.d/99-pneuma-disable-network-config.cfg >/dev/null <<'CLOUDINIT'
+# Pneuma: netplan below is the source of truth for eth0. cloud-init must not
+# re-add the IPv6 address/route whose egress is dead. See setup.sh.
+network: {config: disabled}
+CLOUDINIT
+
+# 2. Declare the primary interface IPv4-only. The netplan body is DERIVED from
+#    the live system by derive-ipv4-netplan.sh (tested in tests/), never
+#    hardcoded, so it stays correct on a rebuilt or re-addressed instance.
+PNEUMA_IFACE="$(ip -4 route show default | awk '{print $5; exit}')"
+if PNEUMA_NETPLAN="$(./derive-ipv4-netplan.sh 2>/dev/null)"; then
+  printf '%s\n' "$PNEUMA_NETPLAN" | sudo tee /etc/netplan/99-pneuma-ipv4-only.yaml >/dev/null
+  sudo chmod 600 /etc/netplan/99-pneuma-ipv4-only.yaml
+  # generate, NOT apply: generate validates and fails at the safe moment.
+  # Applying a network change to a live remote host is an operator action with
+  # a console fallback, not something a setup script does unattended.
+  sudo netplan generate
+else
+  echo "WARN: could not derive IPv4 netplan; leaving existing netplan in place" >&2
+fi
+
+# 3. Belt and braces: sysctl still covers the window before netplan applies,
+#    and any interface that is not eth0. `all`/`default` alone do NOT cover an
+#    already-created interface, so the live interface is named explicitly.
+sudo tee /etc/sysctl.d/99-pneuma-disable-dead-ipv6.conf >/dev/null <<SYSCTL
 net.ipv6.conf.all.disable_ipv6 = 1
 net.ipv6.conf.default.disable_ipv6 = 1
+net.ipv6.conf.${PNEUMA_IFACE:-eth0}.disable_ipv6 = 1
 SYSCTL
 sudo sysctl --system >/dev/null 2>&1 || true
+
+# 4. Verify, and say so loudly if it did not take -- a silent failure here
+#    resurfaces days later as an unexplained ImagePullBackOff.
+if [ "$(cat /proc/sys/net/ipv6/conf/${PNEUMA_IFACE:-eth0}/disable_ipv6 2>/dev/null)" != "1" ]; then
+  echo "WARN: IPv6 still enabled on ${PNEUMA_IFACE:-eth0} -- registry pulls may fail" >&2
+fi
