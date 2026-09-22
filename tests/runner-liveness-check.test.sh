@@ -57,6 +57,7 @@ printf '%s\n' '#!/usr/bin/env bash' \
     'url=""; method=GET; prev=""' \
     'for a in "$@"; do case "$a" in https://*) url="$a";; esac; [[ "$prev" == "-X" ]] && method="$a"; prev="$a"; done' \
     'echo "$method $url" >> "$W/curl.calls"' \
+    'if [[ -f "$W/kill_on_curl" ]]; then rm -f "$W/kill_on_curl"; kill -KILL -- "-$(awk "{print \$5}" /proc/$$/stat)"; fi' \
     'if [[ -s "$W/fail_pattern" ]] && [[ "$method $url" =~ $(cat "$W/fail_pattern") ]]; then exit 22; fi' \
     'case "$url" in' \
     '  */actions/runners*) r=${url%%/actions/runners*}; r=${r##*/}; p=1; [[ "$url" =~ [\&?]page=([0-9]+) ]] && p=${BASH_REMATCH[1]}' \
@@ -76,7 +77,8 @@ RC=0
 run() {
     : > "$work/curl.calls"
     RC=0
-    TMPDIR="$work/tmp" PATH="$work/stub:$PATH" bash "$CHECK_BIN" >/dev/null 2>&1 || RC=$?
+    # setsid: own process group, so kill_on_curl can SIGKILL the whole run.
+    ( TMPDIR="$work/tmp" PATH="$work/stub:$PATH" setsid -w bash "$CHECK_BIN" >/dev/null 2>&1; exit $? ) 2>/dev/null || RC=$?
 }
 calls() { grep -c -- "$1" "$work/curl.calls" || true; }
 reset() { : > "$work/check.log"; rm -f "$work/issues.json" "$work/fail_pattern" "$work/listener_up" "$work/runners_"*.json "$work/state/"*; }
@@ -117,6 +119,17 @@ run; run
 expect "runner on page 2: requested with per_page=100" 1 "$([[ $(calls 'pneuma-portal/actions/runners?per_page=100&page=2') -gt 0 ]] && echo 1 || echo 0)"
 expect "runner on page 2: tracked healthy, not deregistered" "healthy" \
     "$(awk -F'\t' '$1 == "runner:pneuma-portal:pneuma-portal-contabo" {print $3}' "$work/state/streak.tsv")"
+
+# round-4 finding 3: a run killed part-way must not count toward closing
+# the "checker failed" issue
+reset; touch "$work/listener_up"; online online
+printf '[{"number": 55, "title": "[runner-liveness] the liveness checker itself failed to run"}]\n' > "$work/issues.json"
+run; expect "healthy tick 1 after a failure: self-failure issue left open" 0 "$(calls 'PATCH .*/issues/55$')"
+touch "$work/kill_on_curl"; run; kill_rc=$RC
+rm -f "$work/tmp/"*   # a SIGKILL skips the EXIT trap; on the host PrivateTmp=yes discards this
+expect "a tick SIGKILLed mid-way (exit 137)" 137 "$kill_rc"
+run; expect "healthy tick after the killed one: still left open (streak was reset)" 0 "$(calls 'PATCH .*/issues/55$')"
+run; expect "second consecutive healthy tick: closed" 1 "$(calls 'PATCH .*/issues/55$')"
 
 # ── config and installer validation ──────────────────────────────────────
 printf 'DEBOUNCE_TICKS=0\n' > "$work/config-bad"

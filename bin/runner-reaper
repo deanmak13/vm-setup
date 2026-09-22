@@ -34,6 +34,16 @@ DRY_RUN=0
 
 mkdir -p "$STATE_DIR"
 
+# Healthy-run streak for the debounced close of this reaper's own
+# OnFailure issue (see the end of this file). Reset to 0 on disk at the
+# START of every run and written for real only at the end (round-4
+# review): a run killed part-way counts as a failure, never as a healthy
+# run that could close the issue early.
+REAPER_HEALTHY_STREAK_FILE="$STATE_DIR/healthy-streak"
+PREV_HEALTHY_STREAK=$(cat "$REAPER_HEALTHY_STREAK_FILE" 2>/dev/null || echo 0)
+[[ "$PREV_HEALTHY_STREAK" =~ ^[0-9]+$ ]] || PREV_HEALTHY_STREAK=0
+echo 0 > "$REAPER_HEALTHY_STREAK_FILE"
+
 # The token goes to curl through a mode-600 header file, never on its
 # command line (visible to every local user in ps) and never in the log.
 AUTH_HEADER_FILE=$(mktemp)
@@ -235,7 +245,6 @@ LIVENESS_LAST_COMMENT_FILE="$STATE_DIR/liveness-alert-last-comment"
 # closed here once DEBOUNCE_HEALTHY_RUNS consecutive runs delivered
 # everything, so a flapping reaper doesn't create/close it every tick.
 REAPER_FAILURE_TITLE="[runner-reaper] runner-reaper failed (crash or undelivered alert)"   # must match REAPER_FAILURE_TITLE in runner-reaper
-REAPER_HEALTHY_STREAK_FILE="$STATE_DIR/healthy-streak"
 DEBOUNCE_HEALTHY_RUNS=2
 DELIVERY_FAILED=0
 
@@ -340,8 +349,7 @@ elif [[ -n "$LIVENESS_EXISTING" ]]; then
 fi
 
 # ---- debounced auto-close of this reaper's own OnFailure issue
-healthy_streak=$(cat "$REAPER_HEALTHY_STREAK_FILE" 2>/dev/null || echo 0)
-[[ "$healthy_streak" =~ ^[0-9]+$ ]] || healthy_streak=0
+healthy_streak=$PREV_HEALTHY_STREAK
 if (( DELIVERY_FAILED > 0 )); then
     healthy_streak=0
 else
