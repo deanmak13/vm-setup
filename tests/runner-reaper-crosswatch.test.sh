@@ -185,7 +185,7 @@ expect "a non-numeric GRACE in the config file stops the reaper (exit 2)" 2 "$RC
 expect "token never on curl's command line" 0 "$(grep -c -- "$TOKEN_VALUE" "$work/curl.argv" || true)"
 expect "the token header file is removed on exit (nothing left in TMPDIR)" "" "$(ls -A "$work/tmp")"
 expect "runner-reaper.service runs with a private /tmp" 1 \
-    "$(sed -n '/runner-reaper.service <</,/^UNIT$/p' "$INSTALLER" | grep -c '^PrivateTmp=yes$' || true)"
+    "$(sed -n '/runner-reaper\.service [<]/,/^UNIT$/p' "$INSTALLER" | grep -c '^PrivateTmp=yes$' || true)"
 expect "token never in the reaper log" 0 "$(grep -c -- "$TOKEN_VALUE" "$work/reaper.log" || true)"
 
 exit "$fail"

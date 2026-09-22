@@ -139,7 +139,7 @@ if [[ $EUID -ne 0 ]]; then
     expect "installer refuses to run as non-root after validating" 1 "$(( rc != 0 && $(grep -c 'must be run as root' <<< "$out") ))"
 fi
 expect "runner-liveness-check.service runs with a private /tmp" 1 \
-    "$(sed -n '/runner-liveness-check.service <</,/^UNIT$/p' "$INSTALLER" | grep -c '^PrivateTmp=yes$' || true)"
+    "$(sed -n '/runner-liveness-check\.service [<]/,/^UNIT$/p' "$INSTALLER" | grep -c '^PrivateTmp=yes$' || true)"
 expect "runner-liveness-check.service declares its OnFailure unit" 1 \
     "$(grep -c '^OnFailure=runner-failure-alert@runner-liveness-check.service$' "$INSTALLER" || true)"
 
