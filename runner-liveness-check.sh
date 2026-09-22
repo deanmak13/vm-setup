@@ -1485,25 +1485,32 @@ self_test() {
     echo "== scenario 19 (N5/M8 + finding 4): a failed open-issue SEARCH on the REAL live path skips filing and counts as a delivery failure =="
     m8_search_fail_test() {
         MODE="live"
+        LOG=/dev/null
+        logger() { :; }
         api() {
             case "$1" in
                 *"/issues?labels="*) return 1 ;;   # search itself fails
                 *) echo '{"number":123}' ;;
             esac
         }
+        # Every write goes through curl; stub it (never the network) and
+        # record each call in a file — curl runs inside $(...), so a
+        # counter variable would be lost with the subshell.
+        local writes; writes=$(mktemp)
+        curl() { echo "$*" >> "$writes"; echo '{"number":123}'; }
         ISSUE_NUM=(); STATE=(); STREAK=(); LAST_COMMENT=(); HOLD_COUNT=()
         NEW_ISSUE=(); NEW_STATE=(); NEW_STREAK=(); NEW_LAST_COMMENT=(); NEW_HOLD_COUNT=(); TICK_ACTIONS=()
         TICK_DELIVERY_FAILED=0
         file_or_update_issue "runner:m8:test" "[runner-liveness] m8 test" "body"
-        local escalated=0
-        [[ "$TICK_DELIVERY_FAILED" -gt 0 ]] && escalated=1
-        echo "${NEW_ISSUE[runner:m8:test]:-MISSING} $TICK_DELIVERY_FAILED $escalated"
+        local nwrites; nwrites=$(grep -c . "$writes" || true)
+        rm -f "$writes"
+        echo "${NEW_ISSUE[runner:m8:test]:-MISSING} $TICK_DELIVERY_FAILED $nwrites"
     }
-    m8_issue="X"; m8_delivfail="X"; m8_escalated="X"
-    read -r m8_issue m8_delivfail m8_escalated < <(m8_search_fail_test)
-    assert_eq "$m8_issue" "0" "M8/N5 live path: a failed search skips filing — no duplicate created (NEW_ISSUE stays 0)"
+    m8_issue="X"; m8_delivfail="X"; m8_writes="X"
+    read -r m8_issue m8_delivfail m8_writes < <(m8_search_fail_test)
+    assert_eq "$m8_writes" "0" "M8/N5 live path: a failed search makes NO create/comment call (old bug: POSTed a duplicate)"
+    assert_eq "$m8_issue" "0" "M8/N5 live path: a failed search leaves NEW_ISSUE at 0"
     assert_true "$([[ "$m8_delivfail" -gt 0 ]] && echo 1 || echo 0)" "finding 4: a failed search increments TICK_DELIVERY_FAILED (TICK_DELIVERY_FAILED=$m8_delivfail)"
-    assert_eq "$m8_escalated" "1" "finding 4: TICK_DELIVERY_FAILED>0 computes an exit-code escalation"
 
     echo "== scenario 20 (M6): FIND_ISSUE_OK must not stay stale-true from an earlier successful search =="
     m6_stale_global_test() {
@@ -1529,6 +1536,8 @@ self_test() {
     echo "== scenario 21 (finding 7): the OnFailure self-failure issue's close is debounced, not fired on the first healthy tick =="
     watchdog_debounce_test() {
         MODE="live"
+        LOG=/dev/null
+        logger() { :; }
         STATE_DIR=$(mktemp -d)
         api() { echo '[{"number": 55, "title": "[runner-liveness] the liveness checker itself failed to run"}]'; }
         CLOSE_CALLS=0
