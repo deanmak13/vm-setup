@@ -244,15 +244,36 @@ api() {
 # the alerting-side issue create/comment/close calls, which only happen
 # after something is already confirmed dead and whose failure is handled
 # on its own terms (see file_or_update_issue/resolve_issue).
+#
+# MUST be called as a plain statement — `api_call "$url"`, never
+# `x=$(api_call "$url")` or `< <(api_call "$url")`. Round-2 review (N1)
+# found the ORIGINAL version was only ever invoked via command/process
+# substitution: bash forks a subshell to capture that output, so the
+# TICK_API_TOTAL/TICK_API_FAIL increments below happened in a throwaway
+# copy of the variables and never reached run_one_tick's shell — in live
+# mode TICK_API_TOTAL silently stayed 0 forever, so the "every GitHub
+# call failed this tick -> exit 2" check could never fire. The self-test
+# fixture path masked this because its OWN counter increments (for the
+# prefetch_github_runners self-test branch specifically) happen outside
+# any subshell, so scenario 11 passed by coincidence while the real code
+# path was completely broken (see scenario 12 below, which exercises the
+# REAL live path with api() stubbed, and would have caught this).
+#
+# Sets API_CALL_OK (1/0) and API_CALL_BODY (the response body) instead
+# of printing/returning a value, so nothing about this call can be
+# captured into a subshell by a caller reaching for `$(...)`.
+API_CALL_OK=0
+API_CALL_BODY=""
+
 api_call() {
     TICK_API_TOTAL=$((TICK_API_TOTAL + 1))
-    local body
-    if body=$(api "$1"); then
-        printf '%s' "$body"
-        return 0
+    if API_CALL_BODY=$(api "$1"); then
+        API_CALL_OK=1
+    else
+        API_CALL_OK=0
+        API_CALL_BODY=""
+        TICK_API_FAIL=$((TICK_API_FAIL + 1))
     fi
-    TICK_API_FAIL=$((TICK_API_FAIL + 1))
-    return 1
 }
 
 # stdin: one ISO8601 timestamp per line -> prints the OLDEST one's age in
@@ -362,8 +383,11 @@ prefetch_github_runners() {
             done
             continue
         fi
-        local json
-        if ! json=$(api_call "https://api.github.com/repos/$OWNER/$repo/actions/runners"); then
+        # api_call is a plain statement (see its own comment for why) —
+        # its result is read back from API_CALL_OK/API_CALL_BODY, never
+        # from a command-substituted return value.
+        api_call "https://api.github.com/repos/$OWNER/$repo/actions/runners"
+        if [[ "$API_CALL_OK" != "1" ]]; then
             GH_REPO_OK[$repo]=0
             continue
         fi
@@ -371,7 +395,7 @@ prefetch_github_runners() {
         while IFS=$'\t' read -r name status; do
             [[ -n "$name" ]] || continue
             GH_RUNNER_STATUS["$repo/$name"]="$status"
-        done < <(printf '%s' "$json" | python3 -c "
+        done < <(printf '%s' "$API_CALL_BODY" | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
 for r in d.get('runners') or []:
@@ -381,32 +405,51 @@ for r in d.get('runners') or []:
 }
 
 gh_runner_status_of() {
-    # $1=repo $2=agentName -> online|offline|unknown
+    # $1=repo $2=agentName -> online|offline|deregistered|unknown
+    #   unknown       — this repo's runners-list fetch itself failed this
+    #                   tick; no evidence either way.
+    #   deregistered  — the fetch SUCCEEDED and GitHub's list simply does
+    #                   not contain a runner by this name: definitively
+    #                   not registered any more, not merely "can't tell"
+    #                   (round-2 review N3 / mutation M7 — this used to
+    #                   collapse into "unknown" and HOLD forever).
     [[ "${GH_REPO_OK[$1]:-0}" == "1" ]] || { echo "unknown"; return; }
-    echo "${GH_RUNNER_STATUS[$1/$2]:-unknown}"
+    if [[ -z "${GH_RUNNER_STATUS[$1/$2]+set}" ]]; then
+        echo "deregistered"
+        return
+    fi
+    echo "${GH_RUNNER_STATUS[$1/$2]}"
 }
 
+# Globals set by queue_state() instead of printed output — see api_call's
+# comment for why: queue_state is invoked from run_one_tick as a plain
+# statement now (never `< <(queue_state ...)`), because that process
+# substitution was ALSO a subshell that discarded api_call's counter
+# updates one level further up the call stack (round-2 review N1).
+QUEUE_AGE=-1       # -1 = confirmed empty queue (healthy); >=0 = OLDEST queued run's age
+QUEUE_INPROG=-1    # informational only, never gates the decision; -1 = unknown
+QUEUE_OK=0         # 1 = evidence usable this tick; 0 = unknown, caller must HOLD
+
 queue_state() {
-    # $1=repo -> "age<TAB>inprog<TAB>ok"
-    #   age: -1 = confirmed empty queue (healthy); >=0 = OLDEST queued run's age
-    #   inprog: informational only, never gates the decision; -1 = unknown
-    #   ok: 1 = evidence usable this tick; 0 = unknown, caller must HOLD
+    # $1=repo. Sets QUEUE_AGE/QUEUE_INPROG/QUEUE_OK. MUST be called as a
+    # plain statement (see above).
+    QUEUE_AGE=-1; QUEUE_INPROG=-1; QUEUE_OK=0
     if [[ "$MODE" == "self-test" ]]; then
         if [[ "${FIXTURE_QUEUE_FAIL[$1]:-0}" == "1" ]]; then
             TICK_API_TOTAL=$((TICK_API_TOTAL + 1)); TICK_API_FAIL=$((TICK_API_FAIL + 1))
-            printf '%s\t%s\t%s\n' -1 -1 0
         else
             TICK_API_TOTAL=$((TICK_API_TOTAL + 1))
-            printf '%s\t%s\t%s\n' "${FIXTURE_QUEUED_AGE[$1]:--1}" "${FIXTURE_INPROGRESS[$1]:--1}" 1
+            QUEUE_AGE="${FIXTURE_QUEUED_AGE[$1]:--1}"
+            QUEUE_INPROG="${FIXTURE_INPROGRESS[$1]:--1}"
+            QUEUE_OK=1
         fi
         return
     fi
-    local page json times n all_times="" qfail=0
+    local page times n all_times="" qfail=0
     for page in 1 2 3 4 5; do
-        if ! json=$(api_call "https://api.github.com/repos/$OWNER/$1/actions/runs?status=queued&per_page=100&page=$page"); then
-            qfail=1; break
-        fi
-        times=$(printf '%s' "$json" | python3 -c "
+        api_call "https://api.github.com/repos/$OWNER/$1/actions/runs?status=queued&per_page=100&page=$page"
+        if [[ "$API_CALL_OK" != "1" ]]; then qfail=1; break; fi
+        times=$(printf '%s' "$API_CALL_BODY" | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
 for r in d.get('workflow_runs') or []:
@@ -417,18 +460,16 @@ for r in d.get('workflow_runs') or []:
         [[ "$n" -lt 100 ]] && break
     done
     if (( qfail )); then
-        printf '%s\t%s\t%s\n' -1 -1 0
-        return
+        return   # QUEUE_OK stays 0
     fi
-    local age
-    age=$(printf '%s' "$all_times" | oldest_age_from_timestamps) || age=-1
-    local ijson inprog
-    if ijson=$(api_call "https://api.github.com/repos/$OWNER/$1/actions/runs?status=in_progress&per_page=1"); then
-        inprog=$(printf '%s' "$ijson" | python3 -c "import json,sys; print(json.load(sys.stdin).get('total_count',-1))" 2>/dev/null) || inprog=-1
+    QUEUE_AGE=$(printf '%s' "$all_times" | oldest_age_from_timestamps) || QUEUE_AGE=-1
+    api_call "https://api.github.com/repos/$OWNER/$1/actions/runs?status=in_progress&per_page=1"
+    if [[ "$API_CALL_OK" == "1" ]]; then
+        QUEUE_INPROG=$(printf '%s' "$API_CALL_BODY" | python3 -c "import json,sys; print(json.load(sys.stdin).get('total_count',-1))" 2>/dev/null) || QUEUE_INPROG=-1
     else
-        inprog=-1
+        QUEUE_INPROG=-1
     fi
-    printf '%s\t%s\t%s\n' "$age" "$inprog" 1
+    QUEUE_OK=1
 }
 
 # ============================================================
@@ -438,69 +479,134 @@ for r in d.get('workflow_runs') or []:
 # touched this tick just doesn't appear in NEW_* and is dropped).
 # ============================================================
 
-declare -A STREAK STATE ISSUE_NUM LAST_COMMENT
-declare -A NEW_STREAK NEW_STATE NEW_ISSUE NEW_LAST_COMMENT TICK_ACTIONS
+declare -A STREAK STATE ISSUE_NUM LAST_COMMENT HOLD_COUNT
+declare -A NEW_STREAK NEW_STATE NEW_ISSUE NEW_LAST_COMMENT NEW_HOLD_COUNT TICK_ACTIONS TICK_COMMENTED
+
+# How many consecutive HOLD ticks (no usable evidence) a key can survive
+# before this check stops waiting and raises its own "cannot verify"
+# alert instead. Round-2 review N2: an indefinite hold meant a single
+# permanently-unreachable repo (renamed, token lost access, GitHub
+# outage) was silently blind forever, AND a hung-but-running listener
+# whose repo also can't be reached could never raise a NEW alert. ~6
+# ticks at the default 5-minute cadence is ~30 minutes.
+HOLD_THRESHOLD=6
 
 load_state() {
-    STREAK=(); STATE=(); ISSUE_NUM=(); LAST_COMMENT=()
+    STREAK=(); STATE=(); ISSUE_NUM=(); LAST_COMMENT=(); HOLD_COUNT=()
     [[ ! -f "$STATE_FILE" ]] && return
-    local key streak state issue lastc
-    while IFS=$'\t' read -r key streak state issue lastc; do
+    local key streak state issue lastc holdc
+    while IFS=$'\t' read -r key streak state issue lastc holdc; do
         STREAK["$key"]="$streak"; STATE["$key"]="$state"
         ISSUE_NUM["$key"]="$issue"; LAST_COMMENT["$key"]="${lastc:-0}"
+        HOLD_COUNT["$key"]="${holdc:-0}"
     done < "$STATE_FILE"
 }
 
 commit_tick() {
-    STREAK=(); STATE=(); ISSUE_NUM=(); LAST_COMMENT=()
+    STREAK=(); STATE=(); ISSUE_NUM=(); LAST_COMMENT=(); HOLD_COUNT=()
     local key
     for key in "${!NEW_STATE[@]}"; do
         STREAK["$key"]="${NEW_STREAK[$key]}"; STATE["$key"]="${NEW_STATE[$key]}"
         ISSUE_NUM["$key"]="${NEW_ISSUE[$key]:-0}"; LAST_COMMENT["$key"]="${NEW_LAST_COMMENT[$key]:-0}"
+        HOLD_COUNT["$key"]="${NEW_HOLD_COUNT[$key]:-0}"
     done
     [[ "$MODE" == "live" ]] || return 0
     {
         for key in "${!STATE[@]}"; do
-            printf '%s\t%s\t%s\t%s\t%s\n' "$key" "${STREAK[$key]}" "${STATE[$key]}" "${ISSUE_NUM[$key]:-0}" "${LAST_COMMENT[$key]:-0}"
+            printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$key" "${STREAK[$key]}" "${STATE[$key]}" "${ISSUE_NUM[$key]:-0}" "${LAST_COMMENT[$key]:-0}" "${HOLD_COUNT[$key]:-0}"
         done
     } > "$STATE_FILE.tmp" && mv "$STATE_FILE.tmp" "$STATE_FILE"
     return 0
 }
 
-# Carries a key's PREVIOUS tick values forward unchanged — no streak
+# Carries a key's PREVIOUS tick values forward unchanged when this tick
+# has no usable evidence for it (a GitHub call failed) — no streak
 # movement, no action fired, and (critically) the key is NOT dropped by
-# self-pruning. Used whenever this tick has no usable evidence for a key
-# (a GitHub call failed): the debounce state and any open issue survive
-# untouched until real evidence is available again.
+# self-pruning: the debounce state and any open issue survive untouched
+# until real evidence is available again.
+#
+# BUT this cannot go on forever (round-2 review N2): once a key has been
+# held HOLD_THRESHOLD consecutive ticks with zero real evidence, holding
+# any longer means "we genuinely cannot tell" becomes indistinguishable
+# from "everything is fine", which is exactly backwards for a liveness
+# check. At the threshold, file/update a "cannot verify" issue directly
+# (bypassing the normal per-evaluate_key debounce — the hold streak
+# already IS the debounce for this path) instead of holding again.
 hold_key() {
-    local key="$1"
+    local key="$1" context_title="${2:-$1}" context_reason="${3:-no usable evidence for $1}"
+    local cnt=$(( ${HOLD_COUNT[$key]:-0} + 1 ))
+    if (( cnt >= HOLD_THRESHOLD )); then
+        NEW_HOLD_COUNT["$key"]=0
+        NEW_STATE["$key"]="dead"
+        NEW_STREAK["$key"]=1
+        NEW_ISSUE["$key"]="${ISSUE_NUM[$key]:-0}"
+        NEW_LAST_COMMENT["$key"]="${LAST_COMMENT[$key]:-0}"
+        file_or_update_issue "$key" "[runner-liveness] cannot verify: $context_title" \
+            "This check has had no usable evidence for '$key' for $cnt consecutive ticks: $context_reason. Treating this as failed rather than holding forever — check GitHub token scope/expiry and repo access/name for the repo(s) involved."
+        return
+    fi
+    NEW_HOLD_COUNT["$key"]="$cnt"
     NEW_STATE["$key"]="${STATE[$key]:-healthy}"
     NEW_STREAK["$key"]="${STREAK[$key]:-0}"
     NEW_ISSUE["$key"]="${ISSUE_NUM[$key]:-0}"
     NEW_LAST_COMMENT["$key"]="${LAST_COMMENT[$key]:-0}"
 }
 
+# Globals set by gh_find_open_issue() instead of printed output — same
+# subshell-loss reasoning as api_call (round-2 review N1 pattern) AND
+# closes round-2 review N5: a caller can now tell "search failed" (skip
+# filing, avoid a possible duplicate) apart from "search succeeded, no
+# match" (safe to create).
+FIND_ISSUE_OK=0
+FIND_ISSUE_RESULT=""
+
 gh_find_open_issue() {
-    # $1=title (exact match) -> issue number or empty
-    api "https://api.github.com/repos/$OWNER/$ALERT_REPO/issues?labels=runner-liveness&state=open&per_page=100" \
-        | python3 -c "
+    # $1=title (exact match). Sets FIND_ISSUE_OK (1/0) + FIND_ISSUE_RESULT.
+    FIND_ISSUE_OK=0
+    FIND_ISSUE_RESULT=""
+    local body
+    body=$(api "https://api.github.com/repos/$OWNER/$ALERT_REPO/issues?labels=runner-liveness&state=open&per_page=100") || return
+    FIND_ISSUE_OK=1
+    FIND_ISSUE_RESULT=$(printf '%s' "$body" | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
 title = sys.argv[1]
 for i in d:
     if i.get('title') == title:
         print(i['number']); break
-" "$1" 2>/dev/null
+" "$1" 2>/dev/null)
 }
 
 file_or_update_issue() {
     # $1=key $2=title $3=body
-    local key="$1" title="$2" body="$3" existing="${ISSUE_NUM[$key]:-0}"
+    # NOTE: bash expands an ENTIRE `local a=X b=$a` command's right-hand
+    # sides before any assignment in it takes effect, so `$key` used
+    # within the SAME `local` statement that declares it would read a
+    # stale/unset outer-scope `key`, not this function's own $1 — hence
+    # `key`/`title`/`body` are declared first, `existing` on its own
+    # following line. Found as a real (independent of round-2 review)
+    # crash: `resolve_issue` had the identical bug and hit "key: unbound
+    # variable" under `set -u` when called from a caller with no local
+    # variable coincidentally also named `key` already in scope.
+    local key="$1" title="$2" body="$3"
+    local existing="${ISSUE_NUM[$key]:-0}"
     TICK_ACTIONS["$key"]="alert"
+    local now_epoch; now_epoch=$(date +%s)
     if [[ "$MODE" == "self-test" ]]; then
-        note "would file/update issue: $title"
+        # Self-test applies the SAME hour-throttle as live/dry-run (round-2
+        # review M5 test coverage) instead of always claiming a comment —
+        # TICK_COMMENTED[$key] is only set when a comment/create would
+        # actually have been attempted.
+        local last="${LAST_COMMENT[$key]:-0}"
+        if [[ "$existing" == "0" ]] || (( now_epoch - last >= COMMENT_THROTTLE_SECONDS )); then
+            note "would file/update issue: $title"
+            TICK_COMMENTED["$key"]=1
+            NEW_LAST_COMMENT["$key"]="$now_epoch"
+        else
+            note "issue already open, comment throttled (self-test): $title"
+            NEW_LAST_COMMENT["$key"]="$last"
+        fi
         NEW_ISSUE["$key"]=1
-        NEW_LAST_COMMENT["$key"]=1
         return
     fi
     if [[ "$MODE" == "dry-run" ]]; then
@@ -509,9 +615,20 @@ file_or_update_issue() {
         NEW_LAST_COMMENT["$key"]="${LAST_COMMENT[$key]:-0}"
         return
     fi
-    local now_epoch; now_epoch=$(date +%s)
     if [[ "$existing" == "0" ]]; then
-        existing=$(gh_find_open_issue "$title")
+        gh_find_open_issue "$title"
+        if [[ "$FIND_ISSUE_OK" != "1" ]]; then
+            # Round-2 review N5: a failed search used to fall through to
+            # "no existing issue" and create a duplicate. Skip filing
+            # entirely this tick instead — the next tick (this key's
+            # streak already satisfied DEBOUNCE_TICKS, so evaluate_key
+            # will call this again) gets another chance.
+            note "skip filing/updating '$title': open-issue search failed this tick (avoiding a possible duplicate)"
+            NEW_ISSUE["$key"]=0
+            NEW_LAST_COMMENT["$key"]="${LAST_COMMENT[$key]:-0}"
+            return
+        fi
+        existing="$FIND_ISSUE_RESULT"
         [[ -n "$existing" ]] || existing=0
     fi
     if [[ "$existing" != "0" ]]; then
@@ -520,6 +637,7 @@ file_or_update_issue() {
         # on an issue that's just still open.
         local last="${LAST_COMMENT[$key]:-0}"
         if (( now_epoch - last >= COMMENT_THROTTLE_SECONDS )); then
+            TICK_COMMENTED["$key"]=1
             if curl -sf -m 20 -X POST -H @"$AUTH_HEADER_FILE" -H "Accept: application/vnd.github+json" \
                 "https://api.github.com/repos/$OWNER/$ALERT_REPO/issues/$existing/comments" \
                 -d "$(python3 -c "
@@ -538,14 +656,15 @@ print(json.dumps({'body': 'still failing: ' + sys.argv[1]}))
         fi
         NEW_ISSUE["$key"]="$existing"
     else
-        local resp num
+        TICK_COMMENTED["$key"]=1
+        local resp num rc
         resp=$(curl -sf -m 20 -X POST -H @"$AUTH_HEADER_FILE" -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/$OWNER/$ALERT_REPO/issues" \
             -d "$(python3 -c "
 import json, sys
 print(json.dumps({'title': sys.argv[1], 'body': sys.argv[2], 'labels': ['runner-liveness']}))
-" "$title" "$body")")
-        if [[ $? -eq 0 && -n "$resp" ]]; then
+" "$title" "$body")"); rc=$?
+        if [[ "$rc" -eq 0 && -n "$resp" ]]; then
             num=$(printf '%s' "$resp" | python3 -c "import json,sys; print(json.load(sys.stdin).get('number',0))" 2>/dev/null) || num=0
             NEW_ISSUE["$key"]="$num"
             NEW_LAST_COMMENT["$key"]="$now_epoch"
@@ -559,8 +678,10 @@ print(json.dumps({'title': sys.argv[1], 'body': sys.argv[2], 'labels': ['runner-
 }
 
 resolve_issue() {
-    # $1=key $2=title
-    local key="$1" title="$2" existing="${ISSUE_NUM[$key]:-0}"
+    # $1=key $2=title (see file_or_update_issue's NOTE on why $existing
+    # is a separate `local` statement, not appended to the first one)
+    local key="$1" title="$2"
+    local existing="${ISSUE_NUM[$key]:-0}"
     TICK_ACTIONS["$key"]="resolve"
     if [[ "$MODE" == "self-test" ]]; then
         note "would resolve+close issue: $title"
@@ -616,6 +737,7 @@ evaluate_key() {
     NEW_STREAK["$key"]="$streak"
     NEW_ISSUE["$key"]="${ISSUE_NUM[$key]:-0}"
     NEW_LAST_COMMENT["$key"]="${LAST_COMMENT[$key]:-0}"
+    NEW_HOLD_COUNT["$key"]=0   # real evidence this tick — reset the chronic-unknown counter
 
     local already_open="${ISSUE_NUM[$key]:-0}"
     if [[ "$cur_state" == "dead" && "$streak" -ge "$DEBOUNCE_TICKS" ]]; then
@@ -632,7 +754,8 @@ evaluate_key() {
 TICK_EXIT_CODE=0
 
 run_one_tick() {
-    NEW_STATE=(); NEW_STREAK=(); NEW_ISSUE=(); NEW_LAST_COMMENT=(); TICK_ACTIONS=()
+    NEW_STATE=(); NEW_STREAK=(); NEW_ISSUE=(); NEW_LAST_COMMENT=(); NEW_HOLD_COUNT=()
+    TICK_ACTIONS=(); TICK_COMMENTED=()
     TICK_API_TOTAL=0; TICK_API_FAIL=0
 
     declare -A HOST_HAS   # "repo/agent" -> 1, built from host_inventory
@@ -677,16 +800,25 @@ run_one_tick() {
             if listener_alive "$dir"; then listener_note="present"; else listener_note="ABSENT"; fi
             is_dead=1
             evidence="unit=active listener=$listener_note github_status=offline"
+        elif [[ "$gh_status" == "deregistered" ]]; then
+            # The repo's runners-list fetch SUCCEEDED and simply does not
+            # contain this runner name — definitively not registered any
+            # more, not merely "can't tell". Round-2 review N3/mutation
+            # M7: this used to collapse into "unknown" and HOLD forever
+            # even though the fetch was a clean success.
+            is_dead=1
+            evidence="unit=active github_status=deregistered (GitHub's runner list no longer contains this name)"
         else
-            # gh_status == unknown (API call failed / token expired /
-            # rate limited / runner missing from GitHub's list): do NOT
-            # assume healthy. Fall back to the host-only signal — unit
-            # active with no listener process is dead regardless of
+            # gh_status == unknown (this repo's fetch call itself failed:
+            # token expired, rate limited, outage, 404/renamed repo).
+            # Do NOT assume healthy. Fall back to the host-only signal —
+            # unit active with no listener process is dead regardless of
             # whether GitHub could be asked. Otherwise there's no
-            # evidence either way this tick: HOLD, never resolve on it.
+            # evidence either way this tick: HOLD (see hold_key — round-2
+            # review N2 makes this time-limited, not indefinite).
             if listener_alive "$dir"; then
                 [[ "$MODE" == "dry-run" ]] && note "classify $key: HOLD (github status unknown, listener present, unit active)"
-                hold_key "$key"
+                hold_key "$key" "$title" "GitHub could not be asked about '$repo/$agent' (repo fetch failed) and the listener process is present, so the host alone cannot confirm dead or alive."
                 continue
             fi
             is_dead=1
@@ -708,30 +840,81 @@ run_one_tick() {
             "GitHub lists runner '$gname' for $grepo (status=${GH_RUNNER_STATUS[$ghkey]}) but no matching /home/ubuntu/actions-runner-* directory exists on ci-builder. Either the host lost its install or the runner should be deregistered on GitHub."
     done
 
+    # --- ghost keys whose repo's fetch FAILED this tick have no evidence
+    # either way this run — hold them explicitly (round-2 review N4).
+    # Without this, the end-of-tick prune below would silently drop (and
+    # orphan the open issue for) a real ghost runner just because ITS
+    # repo's fetch happened to fail once.
+    local prev_ghost_key
+    for prev_ghost_key in "${!STATE[@]}"; do
+        case "$prev_ghost_key" in ghost:*) : ;; *) continue ;; esac
+        [[ -n "${NEW_STATE[$prev_ghost_key]:-}" ]] && continue   # already handled above (still a live ghost this tick)
+        local pgrepo="${prev_ghost_key#ghost:}"; pgrepo="${pgrepo%%:*}"
+        [[ "${GH_REPO_OK[$pgrepo]:-0}" == "1" ]] && continue   # fetch succeeded — its absence is trustworthy; let the vanished-key pass below resolve it
+        [[ "$MODE" == "dry-run" ]] && note "classify $prev_ghost_key: HOLD (its repo's fetch failed this tick)"
+        hold_key "$prev_ghost_key" "$prev_ghost_key" "the repo's runners-list fetch failed this tick, so this ghost runner's continued existence can't be confirmed either way"
+    done
+
     # --- per-repo queue starvation: OLDEST queued run's age; in_progress
     # is informational only (a single busy runner on a multi-runner repo
-    # must not mask a stale queued job sitting behind it). ---
-    local repo2 qage inprog qok key2 title2 body2 is_dead2
+    # must not mask a stale queued job sitting behind it). queue_state is
+    # called as a plain statement (never $(...) / < <(...) — see its own
+    # comment / round-2 review N1) and read back via QUEUE_AGE/QUEUE_
+    # INPROG/QUEUE_OK. ---
+    local repo2 key2 title2 body2 is_dead2
     for repo2 in $REPOS; do
-        read -r qage inprog qok < <(queue_state "$repo2")
+        queue_state "$repo2"
         key2="queue:$repo2"
         title2="[runner-liveness] $repo2: queued job with no runner picking it up"
-        if [[ "$qok" != "1" ]]; then
+        if [[ "$QUEUE_OK" != "1" ]]; then
             [[ "$MODE" == "dry-run" ]] && note "classify $key2: HOLD (queue API unknown this tick)"
-            hold_key "$key2"
+            hold_key "$key2" "$title2" "the queued/in-progress-runs API call(s) for $repo2 failed this tick"
             continue
         fi
-        if [[ "$qage" == "-1" ]]; then
+        if [[ "$QUEUE_AGE" == "-1" ]]; then
             is_dead2=0   # confirmed empty queue
         else
             is_dead2=0
-            [[ "$qage" -ge "$QUEUED_ALERT_GRACE" ]] && is_dead2=1
+            [[ "$QUEUE_AGE" -ge "$QUEUED_ALERT_GRACE" ]] && is_dead2=1
         fi
-        body2="Repo $repo2: OLDEST queued run is ${qage}s old (in_progress_runs=$inprog, informational only — not required to be zero). "
+        body2="Repo $repo2: OLDEST queued run is ${QUEUE_AGE}s old (in_progress_runs=$QUEUE_INPROG, informational only — not required to be zero). "
         body2+="Alert threshold ${QUEUED_ALERT_GRACE}s. Check: gh run list --repo $OWNER/$repo2 --status queued. "
         body2+="If this repo has zero registered runners on ci-builder, register one (reference_contabo_ci_runner_setup)."
-        [[ "$MODE" == "dry-run" ]] && note "classify $key2: is_dead=$is_dead2 queued_age=${qage}s in_progress=$inprog"
+        [[ "$MODE" == "dry-run" ]] && note "classify $key2: is_dead=$is_dead2 queued_age=${QUEUE_AGE}s in_progress=$QUEUE_INPROG"
         evaluate_key "$key2" "$is_dead2" "$title2" "$body2"
+    done
+
+    # --- close out anything that legitimately vanished this tick and
+    # still has an open issue, instead of silently orphaning it via
+    # self-pruning (round-2 review N4). Only for keys whose disappearance
+    # is TRUSTWORTHY evidence of "really gone", not "we failed to check":
+    #   - runner:<repo>:<agent> — host_inventory() is a direct disk read
+    #     that never "fails" the way a network call does, so a runner
+    #     key's absence here is always trustworthy.
+    #   - ghost:<repo>:<name>   — only trustworthy if that repo's fetch
+    #     succeeded this tick (a failed fetch was already re-held above).
+    #   - queue:<repo> / inventory:host are evaluated unconditionally
+    #     every tick (evaluate_key or hold_key, never silently skipped),
+    #     so they can never reach this path — the case/skip below is
+    #     purely defensive.
+    local prev_key
+    for prev_key in "${!ISSUE_NUM[@]}"; do
+        [[ -n "${NEW_STATE[$prev_key]:-}" ]] && continue          # already handled this tick
+        [[ "${ISSUE_NUM[$prev_key]:-0}" == "0" ]] && continue     # nothing open to close
+        case "$prev_key" in
+            ghost:*)
+                local vgrepo="${prev_key#ghost:}"; vgrepo="${vgrepo%%:*}"
+                [[ "${GH_REPO_OK[$vgrepo]:-0}" == "1" ]] || continue
+                ;;
+            runner:*) : ;;
+            *) continue ;;
+        esac
+        note "auto-resolving vanished key $prev_key (not present this tick; positively confirmed gone, not just unchecked)"
+        resolve_issue "$prev_key" "[runner-liveness] $prev_key (vanished)"
+        NEW_STATE["$prev_key"]="healthy"
+        NEW_STREAK["$prev_key"]=0
+        NEW_HOLD_COUNT["$prev_key"]=0
+        NEW_LAST_COMMENT["$prev_key"]="${NEW_LAST_COMMENT[$prev_key]:-0}"
     done
 
     commit_tick
@@ -751,8 +934,14 @@ run_one_tick() {
 update_heartbeat() {
     [[ "$MODE" == "live" ]] || return 0
     local title="[runner-liveness] heartbeat"
-    local existing
-    existing=$(gh_find_open_issue "$title") || existing=""
+    gh_find_open_issue "$title"
+    if [[ "$FIND_ISSUE_OK" != "1" ]]; then
+        # Round-2 review N5: don't create a duplicate heartbeat issue
+        # just because the search itself failed transiently.
+        note "skip heartbeat: open-issue search failed this tick"
+        return
+    fi
+    local existing="$FIND_ISSUE_RESULT"
     local body
     body="Last liveness-check tick: $(date -Is). If this stops moving, the runner-liveness-check.timer itself may have stopped — check \`systemctl status runner-liveness-check.timer\` on ci-builder."
     if [[ -n "$existing" ]]; then
@@ -769,6 +958,28 @@ print(json.dumps({'title': sys.argv[1], 'body': sys.argv[2], 'labels': ['runner-
 " "$title" "$body")" >/dev/null 2>&1 \
             || note "FAILED to create heartbeat issue"
     fi
+}
+
+# Minor fix requested in round-2 review: the OnFailure= meta-alert
+# ("the liveness checker itself failed to run") never closed itself. A
+# successful, non-exit-2 tick (this function is only called when
+# TICK_EXIT_CODE==0, i.e. the checker just proved it's working again) now
+# closes that issue if it's open, the same way any other alert resolves.
+close_watchdog_failure_issue_if_open() {
+    [[ "$MODE" == "live" ]] || return 0
+    local title="[runner-liveness] the liveness checker itself failed to run"
+    gh_find_open_issue "$title"
+    [[ "$FIND_ISSUE_OK" == "1" ]] || return 0
+    local existing="$FIND_ISSUE_RESULT"
+    [[ -n "$existing" ]] || return 0
+    curl -sf -m 20 -X POST -H @"$AUTH_HEADER_FILE" -H "Accept: application/vnd.github+json" \
+        "https://api.github.com/repos/$OWNER/$ALERT_REPO/issues/$existing/comments" \
+        -d '{"body":"resolved: the checker is running again."}' >/dev/null 2>&1
+    curl -sf -m 20 -X PATCH -H @"$AUTH_HEADER_FILE" -H "Accept: application/vnd.github+json" \
+        "https://api.github.com/repos/$OWNER/$ALERT_REPO/issues/$existing" \
+        -d '{"state":"closed"}' >/dev/null 2>&1 \
+        && note "closed self-failure issue #$existing (checker is healthy again)" \
+        || note "FAILED to close self-failure issue #$existing"
 }
 
 # ============================================================
@@ -1013,6 +1224,149 @@ self_test() {
     [[ "$TICK_EXIT_CODE" -eq 2 ]] && exit_ok=1
     assert_true "$exit_ok" "every GitHub call failing this tick sets TICK_EXIT_CODE=2 (old bug: always exited 0, OnFailure= never fired)"
 
+    # ========================================================
+    # Round-2 review (independent review of the fixes above). Each
+    # scenario below exercises the REAL code path the fixture shortcut
+    # was blind to, or a specific new failure mode the reviewer found.
+    # ========================================================
+
+    echo "== scenario 12 (N1): the REAL live code path (not the fixture shortcut) must count API failures and compute exit 2 =="
+    # Two independent checks, deliberately NOT combined into one: a
+    # regression that breaks ONLY prefetch_github_runners's counting (or
+    # only queue_state's) must be caught on its own — the first version
+    # of this test called both together, and queue_state's correct
+    # counting alone was enough to pass the combined assertion, silently
+    # masking a prefetch_github_runners-only regression. Never combine
+    # coverage like that again.
+    n1_prefetch_test() {
+        MODE="live"
+        api() { return 1; }
+        TICK_API_TOTAL=0; TICK_API_FAIL=0
+        GH_RUNNER_STATUS=(); GH_REPO_OK=()
+        prefetch_github_runners
+        echo "$TICK_API_TOTAL $TICK_API_FAIL"
+    }
+    n1_queue_test() {
+        MODE="live"
+        api() { return 1; }
+        TICK_API_TOTAL=0; TICK_API_FAIL=0
+        queue_state "pneuma"
+        echo "$TICK_API_TOTAL $TICK_API_FAIL"
+    }
+    n1p_total=0; n1p_fail=0
+    read -r n1p_total n1p_fail < <(n1_prefetch_test)
+    n1p_attempted=0; [[ "$n1p_total" -gt 0 ]] && n1p_attempted=1
+    assert_true "$n1p_attempted" "N1: prefetch_github_runners alone attempted API calls (TICK_API_TOTAL=$n1p_total; was silently stuck at 0 before the fix)"
+    assert_eq "$n1p_total" "$n1p_fail" "N1: prefetch_github_runners alone counted every attempted call as failed"
+
+    n1q_total=0; n1q_fail=0
+    read -r n1q_total n1q_fail < <(n1_queue_test)
+    n1q_attempted=0; [[ "$n1q_total" -gt 0 ]] && n1q_attempted=1
+    assert_true "$n1q_attempted" "N1: queue_state alone attempted API calls (TICK_API_TOTAL=$n1q_total; was silently stuck at 0 before the fix)"
+    assert_eq "$n1q_total" "$n1q_fail" "N1: queue_state alone counted every attempted call as failed"
+
+    n1_full_tick_test() {
+        MODE="live"
+        api() { return 1; }
+        TICK_API_TOTAL=0; TICK_API_FAIL=0
+        GH_RUNNER_STATUS=(); GH_REPO_OK=()
+        prefetch_github_runners
+        local r
+        for r in $REPOS; do queue_state "$r"; done
+        local exit_code=0
+        [[ "$TICK_API_TOTAL" -gt 0 && "$TICK_API_TOTAL" -eq "$TICK_API_FAIL" ]] && exit_code=2
+        echo "$exit_code"
+    }
+    n1_exit=0
+    read -r n1_exit < <(n1_full_tick_test)
+    assert_eq "$n1_exit" "2" "N1: a full live tick with every GitHub call stubbed to fail computes exit code 2 (old bug: counters never left the subshell, exit stayed 0)"
+
+    echo "== scenario 13 (M1b): the REAL ps/grep listener_alive() check, not the fixture shortcut =="
+    m1b_listener_test() {
+        MODE="live"
+        ps() { printf '%s\n' "  1234 /home/ubuntu/actions-runner-pneuma-agent-contabo/bin.2.337.0/Runner.Listener run --startuptype service"; }
+        local present=1 absent=1
+        listener_alive "/home/ubuntu/actions-runner-pneuma-agent-contabo" && present=0
+        listener_alive "/home/ubuntu/actions-runner-someone-else-contabo" && absent=0
+        echo "$present $absent"
+    }
+    m1b_present=1; m1b_absent=1
+    read -r m1b_present m1b_absent < <(m1b_listener_test)
+    assert_eq "$m1b_present" "0" "M1b: real listener_alive() reports alive(0) for a dir with a matching Runner.Listener ps line"
+    assert_eq "$m1b_absent" "1" "M1b: real listener_alive() reports absent(1) for a dir with no matching line"
+
+    echo "== scenario 14 (N3 / mutation M7): runner deregistered from GitHub (fetch OK, name absent from list) must alert, not HOLD forever =="
+    deregistered_tick() {
+        clear_fixtures
+        FIXTURE_INVENTORY=$'pneuma-terraformer\tpneuma-terraformer-contabo\t/home/ubuntu/actions-runner-pneuma-terraformer-contabo'
+        FIXTURE_UNIT_STATE["actions.runner.deanmak13-pneuma-terraformer.pneuma-terraformer-contabo.service"]="active"
+        FIXTURE_LISTENER_ALIVE["/home/ubuntu/actions-runner-pneuma-terraformer-contabo"]="1"
+        # Deliberately no FIXTURE_GH_STATUS entry for this repo/name, and
+        # no FIXTURE_GH_REPO_FAIL either: the repo's fetch succeeds, but
+        # the name just isn't in the list -> gh_runner_status_of returns
+        # "deregistered", not "unknown".
+    }
+    deregistered_tick; run_one_tick
+    deregistered_tick; run_one_tick
+    assert_eq "${TICK_ACTIONS[runner:pneuma-terraformer:pneuma-terraformer-contabo]:-}" "alert" "M7/N3: deregistered runner (fetch OK, name absent from list) alerts instead of holding forever"
+
+    echo "== scenario 15 (N2): sustained unknown status past the hold limit raises its own 'cannot verify' alert =="
+    chronic_unknown_tick() {
+        clear_fixtures
+        FIXTURE_INVENTORY=$'pneuma-portal\tpneuma-portal-contabo\t/home/ubuntu/actions-runner-pneuma-portal-contabo'
+        FIXTURE_UNIT_STATE["actions.runner.deanmak13-pneuma-portal.pneuma-portal-contabo.service"]="active"
+        FIXTURE_LISTENER_ALIVE["/home/ubuntu/actions-runner-pneuma-portal-contabo"]="1"
+        FIXTURE_GH_REPO_FAIL["pneuma-portal"]=1
+    }
+    for i in 1 2 3 4 5; do
+        chronic_unknown_tick; run_one_tick
+        assert_eq "${TICK_ACTIONS[runner:pneuma-portal:pneuma-portal-contabo]:-}" "" "N2: chronic-unknown tick $i (< hold threshold $HOLD_THRESHOLD): still just holding, no action"
+    done
+    chronic_unknown_tick; run_one_tick
+    assert_eq "${TICK_ACTIONS[runner:pneuma-portal:pneuma-portal-contabo]:-}" "alert" "N2: chronic-unknown tick $HOLD_THRESHOLD (hold threshold reached): 'cannot verify' alert fires (old bug: held forever, silently blind)"
+
+    echo "== scenario 16 (N4): a vanished key (runner dir removed from host) must close its open issue, not orphan it =="
+    vanish_present_tick() {
+        clear_fixtures
+        FIXTURE_INVENTORY=$'pneuma\tpneuma-contabo\t/home/ubuntu/actions-runner-pneuma-contabo'
+        FIXTURE_UNIT_STATE["actions.runner.deanmak13-pneuma.pneuma-contabo.service"]="active"
+        FIXTURE_LISTENER_ALIVE["/home/ubuntu/actions-runner-pneuma-contabo"]="0"
+        FIXTURE_GH_STATUS["pneuma/pneuma-contabo"]="offline"
+    }
+    vanish_present_tick; run_one_tick
+    vanish_present_tick; run_one_tick
+    assert_eq "${TICK_ACTIONS[runner:pneuma:pneuma-contabo]:-}" "alert" "N4 vanish scenario: alert opens first"
+    vanish_gone_tick() {
+        clear_fixtures
+        # A DIFFERENT, unrelated healthy runner in this tick's inventory —
+        # pneuma-contabo is intentionally absent, as if its directory was
+        # removed from the host (not just an empty inventory overall,
+        # which is a separate, already-covered condition).
+        FIXTURE_INVENTORY=$'pneuma-proto\tpneuma-proto-contabo\t/home/ubuntu/actions-runner-pneuma-proto-contabo'
+        FIXTURE_UNIT_STATE["actions.runner.deanmak13-pneuma-proto.pneuma-proto-contabo.service"]="active"
+        FIXTURE_LISTENER_ALIVE["/home/ubuntu/actions-runner-pneuma-proto-contabo"]="1"
+        FIXTURE_GH_STATUS["pneuma-proto/pneuma-proto-contabo"]="online"
+    }
+    vanish_gone_tick; run_one_tick
+    assert_eq "${TICK_ACTIONS[runner:pneuma:pneuma-contabo]:-}" "resolve" "N4: a runner disappearing from host inventory closes its open issue instead of orphaning it (old bug: silently pruned, issue number lost)"
+
+    echo "== scenario 17 (M5): the comment throttle actually suppresses repeat comments within an hour =="
+    throttle_wedged_tick() {
+        clear_fixtures
+        FIXTURE_INVENTORY=$'pneuma-mem0\tpneuma-mem0-contabo\t/home/ubuntu/actions-runner-pneuma-mem0-contabo'
+        FIXTURE_UNIT_STATE["actions.runner.deanmak13-pneuma-mem0.pneuma-mem0-contabo.service"]="active"
+        FIXTURE_LISTENER_ALIVE["/home/ubuntu/actions-runner-pneuma-mem0-contabo"]="0"
+        FIXTURE_GH_STATUS["pneuma-mem0/pneuma-mem0-contabo"]="offline"
+    }
+    throttle_wedged_tick; run_one_tick
+    throttle_wedged_tick; run_one_tick
+    assert_eq "${TICK_COMMENTED[runner:pneuma-mem0:pneuma-mem0-contabo]:-}" "1" "M5 baseline: the first alert always comments/creates"
+    throttle_wedged_tick; run_one_tick
+    assert_eq "${TICK_COMMENTED[runner:pneuma-mem0:pneuma-mem0-contabo]:-}" "" "M5: an immediate re-tick while still dead does NOT re-comment (throttled) — old bug: commented every 5 minutes, ~288/day"
+    LAST_COMMENT[runner:pneuma-mem0:pneuma-mem0-contabo]=$(( $(date +%s) - COMMENT_THROTTLE_SECONDS - 10 ))
+    throttle_wedged_tick; run_one_tick
+    assert_eq "${TICK_COMMENTED[runner:pneuma-mem0:pneuma-mem0-contabo]:-}" "1" "M5: after the throttle window elapses, it comments again"
+
     echo
     if [[ "$failures" -eq 0 ]]; then
         echo "SELF-TEST PASSED — the wedge signature and every reviewed bug are covered."
@@ -1030,6 +1384,7 @@ fi
 load_state
 run_one_tick
 update_heartbeat
+[[ "$TICK_EXIT_CODE" -eq 0 ]] && close_watchdog_failure_issue_if_open
 exit "$TICK_EXIT_CODE"
 SCRIPT
 sed -i "s|__ALERT_REPO__|$ALERT_REPO|; s|__DEBOUNCE_TICKS__|$DEBOUNCE_TICKS|; s|__QUEUED_ALERT_GRACE__|$QUEUED_ALERT_GRACE|" /usr/local/bin/runner-liveness-check
