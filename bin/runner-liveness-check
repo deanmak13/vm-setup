@@ -873,17 +873,32 @@ print(json.dumps({'title': sys.argv[1], 'body': sys.argv[2], 'labels': ['runner-
 # escalation, tracked in its own small persisted counter (separate from
 # the main STREAK table — this isn't a per-key detection result, it's
 # "is the checker itself currently trustworthy").
+#
+# Round-4 review: the streak on disk is reset to 0 at the START of every
+# live run (watchdog_streak_begin) and only the end of a run that got this
+# far writes the real value — so a run killed part-way (OOM, SIGKILL,
+# timeout) counts as a failure, never as a healthy tick that could close
+# the issue early.
+WATCHDOG_PREV_STREAK=0
+watchdog_streak_begin() {
+    [[ "$MODE" == "live" ]] || return 0
+    local streak_file="$STATE_DIR/watchdog-healthy-streak"
+    WATCHDOG_PREV_STREAK=$(cat "$streak_file" 2>/dev/null || echo 0)
+    [[ "$WATCHDOG_PREV_STREAK" =~ ^[0-9]+$ ]] || WATCHDOG_PREV_STREAK=0
+    echo 0 > "$streak_file" 2>/dev/null || true
+}
+
 close_watchdog_failure_issue_if_open() {
     [[ "$MODE" == "live" ]] || return 0
     local streak_file="$STATE_DIR/watchdog-healthy-streak"
-    local streak=0
-    [[ -f "$streak_file" ]] && streak=$(cat "$streak_file" 2>/dev/null || echo 0)
-    [[ "$streak" =~ ^[0-9]+$ ]] || streak=0
+    local streak="$WATCHDOG_PREV_STREAK"
     if [[ "$TICK_EXIT_CODE" -ne 0 ]]; then
+        WATCHDOG_PREV_STREAK=0
         echo 0 > "$streak_file" 2>/dev/null || true
         return 0
     fi
     streak=$((streak + 1))
+    WATCHDOG_PREV_STREAK="$streak"
     echo "$streak" > "$streak_file" 2>/dev/null || true
     [[ "$streak" -ge "$DEBOUNCE_TICKS" ]] || return 0
 
@@ -1389,17 +1404,23 @@ self_test() {
             return 0
         }
         TICK_EXIT_CODE=0
-        close_watchdog_failure_issue_if_open
+        watchdog_streak_begin; close_watchdog_failure_issue_if_open
         local after1="$CLOSE_CALLS"
-        close_watchdog_failure_issue_if_open
-        local after2="$CLOSE_CALLS"
+        # a run killed part-way: it began (and reset the streak) but never
+        # reached the close step
+        watchdog_streak_begin
+        watchdog_streak_begin; close_watchdog_failure_issue_if_open
+        local after_kill="$CLOSE_CALLS"
+        watchdog_streak_begin; close_watchdog_failure_issue_if_open
+        local after3="$CLOSE_CALLS"
         rm -rf "$STATE_DIR"
-        echo "$after1 $after2"
+        echo "$after1 $after_kill $after3"
     }
-    wd_after1="X"; wd_after2="X"
-    read -r wd_after1 wd_after2 < <(watchdog_debounce_test)
+    wd_after1="X"; wd_after_kill="X"; wd_after3="X"
+    read -r wd_after1 wd_after_kill wd_after3 < <(watchdog_debounce_test)
     assert_eq "$wd_after1" "0" "finding 7: first healthy tick after a failure does NOT close the self-failure issue yet (streak 1 < debounce $DEBOUNCE_TICKS)"
-    assert_eq "$wd_after2" "1" "finding 7: second consecutive healthy tick closes it (streak reaches debounce)"
+    assert_eq "$wd_after_kill" "0" "round-4 finding 3: a run killed part-way resets the streak — the next healthy tick does NOT close the issue"
+    assert_eq "$wd_after3" "1" "finding 7: two consecutive healthy ticks after that close it (streak reaches debounce)"
 
     echo "== scenario 22 (finding 6): runner-list pagination — more than one page of runners must all be seen =="
     m_pagination_test() {
@@ -1481,6 +1502,7 @@ if [[ "$MODE" == "self-test" ]]; then
 fi
 
 TICK_DELIVERY_FAILED=0
+watchdog_streak_begin
 load_state
 run_one_tick
 update_heartbeat

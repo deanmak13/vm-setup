@@ -86,6 +86,15 @@ expect "tick 3: the reap is logged with its evidence" 1 "$(logged "REAP pneuma-e
 expect "tick 3: the quiet streak resets after a reap" "$(printf 'pneuma-engine\t0')" "$(cat "$work/rstate/quiet-streak.tsv")"
 expect "all three ticks exit 0" 0 "$RC"
 
+# ── an undelivered alert fails the run but never loses the reap state ───
+# (the exit 1 comes after the CPU/quiet-streak state is saved: exiting
+# first would reset every tick's evidence and the worker would never be
+# reaped while GitHub issue writes fail)
+reset; echo '/issues' > "$work/fail_pattern"
+run; rc1=$RC; run; run
+expect "issue search failing: each run exits 1" "1 1" "$rc1 $RC"
+expect "issue search failing: the dead worker is still reaped on tick 3" "$UNIT" "$(restarts)"
+
 # ── --dry-run never restarts ─────────────────────────────────────────────
 reset; run --dry-run; run --dry-run; run --dry-run
 expect "--dry-run: nothing restarted" "" "$(restarts)"

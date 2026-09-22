@@ -53,6 +53,7 @@ printf '%s\n' '#!/usr/bin/env bash' \
     'for a in "$@"; do case "$a" in https://*) url="$a";; esac; [[ "$prev" == "-X" ]] && method="$a"; prev="$a"; done' \
     'echo "$method $url" >> "$W/curl.calls"' \
     'echo "$*" >> "$W/curl.argv"' \
+    'if [[ -f "$W/kill_on_curl" ]]; then rm -f "$W/kill_on_curl"; kill -KILL -- "-$(awk "{print \$5}" /proc/$$/stat)"; fi' \
     'if [[ -s "$W/fail_pattern" ]] && [[ "$method $url" =~ $(cat "$W/fail_pattern") ]]; then exit 22; fi' \
     'case "$url" in' \
     '  *"/issues?"*) if [[ -f "$W/issues.json" ]]; then cat "$W/issues.json"; else echo "[]"; fi ;;' \
@@ -71,7 +72,10 @@ RC=0
 run() {  # [config] — one reaper run; sets RC, leaves curl.calls/reaper.log for inspection
     : > "$work/curl.calls"; : > "$work/reaper.log"
     RC=0
-    RUNNER_REAPER_CONFIG="${1:-$work/config}" TMPDIR="$work/tmp" PATH="$work/stub:$PATH" bash "$REAPER_BIN" >/dev/null 2>&1 || RC=$?
+    # setsid: its own process group, so the curl stub's kill_on_curl can
+    # SIGKILL the whole run (a crash mid-run) without touching this test.
+    ( RUNNER_REAPER_CONFIG="${1:-$work/config}" TMPDIR="$work/tmp" PATH="$work/stub:$PATH" \
+        setsid -w bash "$REAPER_BIN" >/dev/null 2>&1; exit $? ) 2>/dev/null || RC=$?
 }
 stale() { touch -d "@$(( $(date +%s) - $1 ))" "$work/lstate/streak.tsv"; }
 calls() { grep -c -- "$1" "$work/curl.calls" || true; }
@@ -156,6 +160,14 @@ expect "second healthy run: OnFailure issue closed" 1 "$(calls 'PATCH .*/issues/
 reset; open_issues 30 "$FAILURE_TITLE"; touch "$work/lstate/streak.tsv"; run
 echo 'GET .*/issues\?' > "$work/fail_pattern"; run; rm -f "$work/fail_pattern"; run
 expect "a failed run in between resets the healthy streak" 0 "$(calls 'PATCH .*/issues/30$')"
+reset; open_issues 30 "$FAILURE_TITLE"; touch "$work/lstate/streak.tsv"; run
+touch "$work/kill_on_curl"; run; kill_rc=$RC
+rm -f "$work/tmp/"*   # a SIGKILL skips the EXIT trap; on the host PrivateTmp=yes discards this
+run
+expect "a run SIGKILLed mid-way (exit 137)" 137 "$kill_rc"
+expect "a run SIGKILLed mid-way resets the healthy streak: next healthy run does not close" 0 "$(calls 'PATCH .*/issues/30$')"
+run
+expect "two healthy runs after the kill: closed" 1 "$(calls 'PATCH .*/issues/30$')"
 
 # ── installer wiring ─────────────────────────────────────────────────────
 expect "runner-reaper.service declares its OnFailure unit" 1 \
