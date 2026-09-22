@@ -16,7 +16,7 @@ set -euo pipefail
 TESTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(dirname "$TESTS_DIR")"
 BOOTSTRAP="$REPO_DIR/ci-builder-bootstrap.sh"
-REAPER="$REPO_DIR/runner-reaper.sh"
+REAPER="$REPO_DIR/bin/runner-reaper"
 MIGRATION="$REPO_DIR/ci-builder-migration.md"
 OWNER=$(sed -n 's/^OWNER=\([A-Za-z0-9-]*\)$/\1/p' "$BOOTSTRAP")
 [[ -n "$OWNER" ]] || { echo "FAIL OWNER not found in $BOOTSTRAP"; exit 1; }
@@ -76,7 +76,7 @@ check "the enabled column decides whether the service is started" \
     grep -qxF '    if [[ "$enabled" == "y" ]]; then' "$BOOTSTRAP"
 
 # ── runner-reaper: worker command line → install dir → repo ──────────────
-installed=$(sed -n '\|^cat > /usr/local/bin/runner-reaper |,/^SCRIPT$/p' "$REAPER" | sed '1d;$d')
+installed=$(cat "$REAPER")
 check "installed reaper defines worker_dir and worker_repo and uses them in the scan loop" \
     bash -c 'grep -qx "worker_dir() {" <<< "$1" && grep -qx "worker_repo() {" <<< "$1" && grep -qx "    dir=\$(worker_dir \"\$args\") || continue" <<< "$1" && grep -qx "    repo=\$(worker_repo \"\$dir\") || continue" <<< "$1"' _ "$installed"
 check "installed reaper no longer parses the repo out of the directory name" \

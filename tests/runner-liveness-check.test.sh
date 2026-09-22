@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# tests/runner-liveness-check.test.sh — runner-liveness-check, the INSTALLED
-# script's own source (extracted from runner-liveness-check.sh), run two ways:
+# tests/runner-liveness-check.test.sh — bin/runner-liveness-check itself (so
+# kcov measures it), run two ways:
 #   1. its built-in --self-test (fixture scenarios through run_one_tick);
 #   2. the LIVE path end to end — real host_inventory/jq/listener checks and
 #      the real top-level dispatch and exit code — with paths pointed at a
-#      temp dir and curl/ps/systemctl/logger stubbed on PATH. No network, no
+#      temp dir through a fixture RUNNER_LIVENESS_CONFIG and
+#      curl/ps/systemctl/logger stubbed on PATH. No network, no
 #      root, no host state.
 # The live scenarios cover what only the dispatch can show (round-3 review of
 # vm-setup#9): a persistently failing issue search must exit non-zero and
@@ -17,7 +18,8 @@ set -euo pipefail
 
 TESTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(dirname "$TESTS_DIR")"
-CHECK_SRC="${CHECK_SRC:-$REPO_DIR/runner-liveness-check.sh}"
+CHECK_BIN="${CHECK_BIN:-$REPO_DIR/bin/runner-liveness-check}"
+INSTALLER="$REPO_DIR/runner-liveness-check.sh"
 
 fail=0
 # expect <description> <expected> <actual>
@@ -32,16 +34,14 @@ trap 'rm -rf "$work"' EXIT
 mkdir -p "$work/stub" "$work/state"
 printf 'tok-test\n' > "$work/token"
 
-sed -n '\|^cat > /usr/local/bin/runner-liveness-check |,/^SCRIPT$/p' "$CHECK_SRC" | sed '1d;$d' \
-    | sed "s|__ALERT_REPO__|vm-setup|; s|__DEBOUNCE_TICKS__|2|; s|__QUEUED_ALERT_GRACE__|1500|
-           s|^TOKEN_FILE_PATH=.*|TOKEN_FILE_PATH=$work/token|
-           s|^LOG=.*|LOG=$work/check.log|
-           s|^STATE_DIR=.*|STATE_DIR=$work/state|
-           s|^RUNNER_DIR_GLOB=.*|RUNNER_DIR_GLOB=\"$work/runners/actions-runner-*\"|" > "$work/check"
+printf '%s\n' "ALERT_REPO=vm-setup" "DEBOUNCE_TICKS=2" "QUEUED_ALERT_GRACE=1500" \
+    "TOKEN_FILE_PATH=$work/token" "LOG=$work/check.log" "STATE_DIR=$work/state" \
+    "RUNNER_DIR_GLOB=\"$work/runners/actions-runner-*\"" > "$work/config"
+export RUNNER_LIVENESS_CONFIG="$work/config"
 
 # ── 1. the built-in self-test ────────────────────────────────────────────
 st_rc=0
-st_out=$(bash "$work/check" --self-test 2>&1) || st_rc=$?
+st_out=$(bash "$CHECK_BIN" --self-test 2>&1) || st_rc=$?
 expect "--self-test exits 0" 0 "$st_rc"
 expect "--self-test reports no failed assertion" 0 "$(grep -c 'FAIL:' <<< "$st_out" || true)"
 
@@ -76,7 +76,7 @@ RC=0
 run() {
     : > "$work/curl.calls"
     RC=0
-    PATH="$work/stub:$PATH" bash "$work/check" >/dev/null 2>&1 || RC=$?
+    PATH="$work/stub:$PATH" bash "$CHECK_BIN" >/dev/null 2>&1 || RC=$?
 }
 calls() { grep -c -- "$1" "$work/curl.calls" || true; }
 reset() { : > "$work/check.log"; rm -f "$work/issues.json" "$work/fail_pattern" "$work/listener_up" "$work/runners_"*.json "$work/state/"*; }
@@ -115,5 +115,28 @@ run; run
 expect "runner on page 2: requested with per_page=100" 1 "$([[ $(calls 'pneuma-portal/actions/runners?per_page=100&page=2') -gt 0 ]] && echo 1 || echo 0)"
 expect "runner on page 2: tracked healthy, not deregistered" "healthy" \
     "$(awk -F'\t' '$1 == "runner:pneuma-portal:pneuma-portal-contabo" {print $3}' "$work/state/streak.tsv")"
+
+# ── config and installer validation ──────────────────────────────────────
+printf 'DEBOUNCE_TICKS=0\n' > "$work/config-bad"
+rc=0; RUNNER_LIVENESS_CONFIG="$work/config-bad" bash "$CHECK_BIN" >/dev/null 2>&1 || rc=$?
+expect "DEBOUNCE_TICKS=0 in the config file stops the checker (exit 2)" 2 "$rc"
+printf 'ALERT_REPO=a/b\n' > "$work/config-bad"
+rc=0; RUNNER_LIVENESS_CONFIG="$work/config-bad" bash "$CHECK_BIN" >/dev/null 2>&1 || rc=$?
+expect "ALERT_REPO with a slash in the config file stops the checker (exit 2)" 2 "$rc"
+printf 'QUEUED_ALERT_GRACE=later\n' > "$work/config-bad"
+rc=0; RUNNER_LIVENESS_CONFIG="$work/config-bad" bash "$CHECK_BIN" >/dev/null 2>&1 || rc=$?
+expect "a non-numeric QUEUED_ALERT_GRACE stops the checker (exit 2)" 2 "$rc"
+rc=0; RUNNER_LIVENESS_CONFIG="$work/config-bad" bash "$CHECK_BIN" --self-test >/dev/null 2>&1 || rc=$?
+expect "--self-test ignores the config file (runs on its own defaults)" 0 "$rc"
+for args in "--alert-repo a/b" "--debounce-ticks 0" "--queued-alert-grace-seconds x" "--bogus"; do
+    rc=0; out=$(bash "$INSTALLER" $args 2>&1) || rc=$?
+    expect "installer rejects '$args' before touching the host" 1 "$(( rc != 0 && $(grep -c 'ERROR' <<< "$out") ))"
+done
+if [[ $EUID -ne 0 ]]; then
+    rc=0; out=$(bash "$INSTALLER" 2>&1) || rc=$?
+    expect "installer refuses to run as non-root after validating" 1 "$(( rc != 0 && $(grep -c 'must be run as root' <<< "$out") ))"
+fi
+expect "runner-liveness-check.service declares its OnFailure unit" 1 \
+    "$(grep -c '^OnFailure=runner-failure-alert@runner-liveness-check.service$' "$INSTALLER" || true)"
 
 exit "$fail"
