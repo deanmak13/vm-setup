@@ -263,6 +263,77 @@ for repo in "${!OLDEST[@]}"; do
     fi
 done
 
+# ---- cross-watch: alert if runner-liveness-check's own timer appears to
+# have stopped firing (finding 11, round-2 review of vm-setup#9).
+# runner-liveness-check watches for wedged RUNNERS; nothing was watching
+# whether the WATCHER ITSELF is still running at all — its own
+# `OnFailure=` unit only fires when a run actually happens and fails, not
+# when the systemd timer that would trigger a run has been stopped,
+# disabled, or uninstalled. reaper runs on its own separate timer with
+# its own repo-scoped GitHub token, so it can notice this independently:
+# if runner-liveness-check's state file hasn't been touched in over
+# LIVENESS_STALE_SECONDS, something is wrong with ITS timer, and reaper
+# files/updates (then, once fresh again, closes) a GitHub issue about it
+# — the same alerting primitive runner-liveness-check itself uses, kept
+# here as a few plain curl calls rather than a shared library, since
+# reaper and runner-liveness-check are deliberately independent scripts
+# (a bug in one must not blind the other).
+LIVENESS_STATE_FILE=/var/lib/runner-liveness/streak.tsv
+LIVENESS_STALE_SECONDS=1200
+LIVENESS_ALERT_REPO=vm-setup
+LIVENESS_ALERT_TITLE="[runner-liveness] the liveness checker's timer appears to have stopped"
+
+if [[ -f "$LIVENESS_STATE_FILE" ]]; then
+    liveness_age=$(( $(date +%s) - $(stat -c %Y "$LIVENESS_STATE_FILE" 2>/dev/null || echo 0) ))
+else
+    liveness_age=99999999   # no state file at all yet (e.g. never installed) counts as maximally stale
+fi
+
+liveness_existing=$(curl -sf -m 20 -H "Authorization: Bearer $TOKEN" \
+    -H "Accept: application/vnd.github+json" \
+    "https://api.github.com/repos/$OWNER/$LIVENESS_ALERT_REPO/issues?labels=runner-liveness&state=open&per_page=100" \
+    | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+title=sys.argv[1]
+for i in d:
+    if i.get('title')==title:
+        print(i['number']); break
+" "$LIVENESS_ALERT_TITLE" 2>/dev/null)
+
+if (( liveness_age > LIVENESS_STALE_SECONDS )); then
+    liveness_body="runner-reaper (a separate timer) found ${LIVENESS_STATE_FILE} unmodified for ${liveness_age}s, threshold ${LIVENESS_STALE_SECONDS}s. Check on ci-builder: systemctl status runner-liveness-check.timer ; journalctl -u runner-liveness-check.timer. The runner-wedge detector cannot currently be trusted."
+    if (( DRY_RUN == 1 )); then
+        note "DRY-RUN: would file/update liveness-timer-stale issue (age=${liveness_age}s)"
+    elif [[ -n "$liveness_existing" ]]; then
+        note "runner-liveness-check state file is ${liveness_age}s old (> ${LIVENESS_STALE_SECONDS}s) — its timer may have stopped"
+        curl -sf -m 20 -X POST -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$OWNER/$LIVENESS_ALERT_REPO/issues/$liveness_existing/comments" \
+            -d "$(python3 -c "import json,sys; print(json.dumps({'body': 'still stale ('+sys.argv[1]+'s): '+sys.argv[2]}))" "$liveness_age" "$liveness_body")" \
+            >/dev/null 2>&1 || note "FAILED to comment on liveness-timer-stale issue #$liveness_existing"
+    else
+        note "runner-liveness-check state file is ${liveness_age}s old (> ${LIVENESS_STALE_SECONDS}s) — its timer may have stopped"
+        curl -sf -m 20 -X POST -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$OWNER/$LIVENESS_ALERT_REPO/issues" \
+            -d "$(python3 -c "
+import json,sys
+print(json.dumps({'title': sys.argv[1], 'body': sys.argv[2], 'labels': ['runner-liveness']}))
+" "$LIVENESS_ALERT_TITLE" "$liveness_body")" >/dev/null 2>&1 || note "FAILED to file liveness-timer-stale issue"
+    fi
+elif [[ -n "$liveness_existing" ]]; then
+    if (( DRY_RUN == 1 )); then
+        note "DRY-RUN: would close liveness-timer-stale issue #$liveness_existing (fresh again)"
+    else
+        note "runner-liveness-check state file is fresh again (${liveness_age}s) — closing issue #$liveness_existing"
+        curl -sf -m 20 -X POST -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$OWNER/$LIVENESS_ALERT_REPO/issues/$liveness_existing/comments" \
+            -d '{"body":"resolved: runner-liveness-check'"'"'s state file is fresh again."}' >/dev/null 2>&1
+        curl -sf -m 20 -X PATCH -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$OWNER/$LIVENESS_ALERT_REPO/issues/$liveness_existing" \
+            -d '{"state":"closed"}' >/dev/null 2>&1 || note "FAILED to close liveness-timer-stale issue #$liveness_existing"
+    fi
+fi
+
 # ---- persist state for next tick (self-prunes: only currently-seen pids/repos survive)
 {
     for pid in "${!CUR_CPU[@]}"; do printf '%s\t%s\n' "$pid" "${CUR_CPU[$pid]}"; done
