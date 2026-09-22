@@ -48,18 +48,28 @@
 # "actions-runner-" was scanned as a worker.
 #
 # Requires: a GitHub token at /root/.runner-reaper-token (mode 600); the
-# installer copies it from --token-file. Two uses, two scopes:
-#   - reaping reads Actions runs/jobs on every runner repo (repo read);
-#   - the runner-liveness cross-watch below WRITES issues (search, create,
-#     comment, close) in --alert-repo (default vm-setup).
-# So the token needs issues WRITE on the alert repo, not just repo read:
-# classic `repo` scope, or a fine-grained token with Actions:read on the
-# runner repos plus Issues:read-and-write on the alert repo. Verified on
-# ci-builder 2026-09-23: the installed token is a classic OAuth token
-# whose scopes include `repo` (and considerably more than this needs), so
-# it can write vm-setup issues today. A token that can't write issues
-# makes every cross-watch alert a delivery failure — the run exits 1 and
-# runner-reaper.service's OnFailure= unit reports it (see below).
+# installer copies it from --token-file. Two uses: reaping reads Actions
+# runs/jobs on every runner repo, and the runner-liveness cross-watch
+# WRITES issues (search, create, comment, close) in --alert-repo.
+# Token (least privilege): a fine-grained personal access token scoped to
+# owner deanmak13 with exactly:
+#   - Metadata: read (implied by any repo grant);
+#   - Actions: read and Administration: read on the 10 Pneuma repos
+#     (pneuma, pneuma-engine, pneuma-portal, pneuma-deployments,
+#     pneuma-helm-charts, pneuma-proto, pneuma-ops, pneuma-mem0,
+#     pneuma-terraformer, pneuma-agent) — workflow runs/jobs, and the
+#     self-hosted runner list (/actions/runners needs Administration);
+#   - Issues: read and write on vm-setup (the alert repo) — searching,
+#     filing, commenting on and closing alerts, and creating the
+#     `runner-liveness` label the installers ensure;
+#   - nothing else.
+# (runner-liveness-check.sh copies this same token when given none, so
+# one token meets both.) As installed on ci-builder (checked 2026-09-23)
+# it is instead a classic OAuth token whose scopes include `repo` and far
+# more (admin:org, delete_repo, ...): it works, but should be replaced by
+# the token above. One that can't write issues makes every cross-watch
+# alert a delivery failure — the run exits 1 and the OnFailure= unit
+# reports it (see below).
 #
 # Usage:
 #   sudo bash runner-reaper.sh --token-file /path/to/token [--grace-seconds 600] \

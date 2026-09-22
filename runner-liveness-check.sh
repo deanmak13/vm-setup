@@ -98,30 +98,40 @@
 # Also fixed: the GitHub token no longer appears in curl argv (visible
 # via `ps`/`/proc`) — it's passed via `-H @<headerfile>`; every value
 # interpolated into an inline `python3 -c` string now goes through
-# sys.argv instead; the installer's sed substitutions use a delimiter
-# that can't collide with a `/` in a repo name and validate numeric
+# sys.argv instead; the installer validates its repo-name and numeric
 # args; an empty host inventory and a GitHub-registered runner with no
 # matching host directory are now their own alert conditions.
 #
-# KNOWN REMAINING GAP: there is no fully independent dead-man's switch —
-# if the systemd TIMER itself is stopped/disabled/uninstalled (as
-# opposed to the check running and failing, which `OnFailure=` covers),
-# nothing currently notices, because the only thing that would notice is
-# this same host. A true fix needs an external heartbeat watched from
-# somewhere that isn't ci-builder (e.g. a GitHub Actions scheduled
-# workflow on a hosted runner polling a heartbeat issue's timestamp) —
-# not built here because GitHub-hosted runners are billing-blocked on
-# this personal account (see reference_ci_builder_is_four_machines_in_
-# one.md). Every live tick DOES update a pinned heartbeat issue's body
-# with a fresh timestamp (`[runner-liveness] heartbeat`) so a human can
-# glance and see "last seen: N minutes ago" — that half is real, the
-# automated staleness alert on top of it is not.
+# WHO WATCHES THE WATCHER: a run that fails is covered by `OnFailure=`
+# (runner-failure-alert@runner-liveness-check). A timer that stops
+# firing altogether (stopped, disabled, uninstalled) is covered by
+# runner-reaper's cross-watch: on its own timer it alerts once this
+# check's state file is more than 1200s old (bin/runner-reaper).
+# REMAINING GAP: the reaper's OWN timer, and the host itself. If
+# runner-reaper.timer stops too, or ci-builder is down, off the network
+# or out of disk, nothing on the host can report it. Closing that needs a
+# watcher that isn't ci-builder (e.g. a scheduled workflow on a hosted
+# runner reading the heartbeat issue's timestamp) — not built, because
+# GitHub-hosted runners are billing-blocked on this personal account.
+# Every live tick updates the `[runner-liveness] heartbeat` issue's body
+# with a timestamp, so a human can still see "last seen N minutes ago".
 #
-# Requires: a GitHub token with `repo` scope. The installer copies it
-# from --token-file (falls back to the already-installed reaper token at
-# /root/.runner-reaper-token if --token-file is omitted) to its own copy
-# at /root/.runner-liveness-token, so this check's credential lifecycle
-# is independent of runner-reaper's.
+# Token (least privilege): a fine-grained personal access token scoped to
+# owner deanmak13 with exactly:
+#   - Metadata: read (implied by any repo grant);
+#   - Actions: read and Administration: read on the 10 Pneuma repos
+#     (pneuma, pneuma-engine, pneuma-portal, pneuma-deployments,
+#     pneuma-helm-charts, pneuma-proto, pneuma-ops, pneuma-mem0,
+#     pneuma-terraformer, pneuma-agent) — workflow runs/jobs, and the
+#     self-hosted runner list (/actions/runners needs Administration);
+#   - Issues: read and write on vm-setup (the alert repo) — searching,
+#     filing, commenting on and closing alerts, and creating the
+#     `runner-liveness` label the installer ensures;
+#   - nothing else.
+# The installer copies the token from --token-file (falling back to the
+# already-installed reaper token at /root/.runner-reaper-token if
+# --token-file is omitted) to its own /root/.runner-liveness-token, so
+# this check's credential lifecycle is independent of runner-reaper's.
 #
 # Usage:
 #   sudo bash runner-liveness-check.sh [--token-file /path/to/token] \
@@ -173,7 +183,7 @@ if [[ -n "$TOKEN_FILE" ]]; then
     install -m 600 "$TOKEN_FILE" /root/.runner-liveness-token
 elif [[ -f /root/.runner-reaper-token ]]; then
     install -m 600 /root/.runner-reaper-token /root/.runner-liveness-token
-    log "no --token-file given — copied the existing runner-reaper token (same repo scope covers issues:write)"
+    log "no --token-file given — copied the existing runner-reaper token (it needs the same grants; see this file's header)"
 else
     err "--token-file is required (no existing /root/.runner-reaper-token to copy)"
 fi
