@@ -13,6 +13,7 @@ TOKEN_FILE_PATH=/root/.runner-reaper-token
 LOG=/var/log/runner-reaper.log
 STATE_DIR=/var/lib/runner-reaper
 LIVENESS_STATE_FILE=/var/lib/runner-liveness/streak.tsv
+PROC_ROOT=/proc
 CONFIG_FILE=${RUNNER_REAPER_CONFIG:-/etc/default/runner-reaper}
 # shellcheck source=/dev/null
 [[ -r "$CONFIG_FILE" ]] && . "$CONFIG_FILE"
@@ -114,7 +115,7 @@ while read -r pid etimes args; do
     (( etimes > cur )) && OLDEST[$repo]=$etimes
     WORKER_PIDS[$repo]="${WORKER_PIDS[$repo]:-} $pid"
 
-    stat_line=$(cat "/proc/$pid/stat" 2>/dev/null)
+    stat_line=$(cat "$PROC_ROOT/$pid/stat" 2>/dev/null)
     if [[ -n "$stat_line" ]]; then
         # comm can contain spaces/parens; split after the LAST ') ' so the
         # remaining fields line up regardless of comm content.
