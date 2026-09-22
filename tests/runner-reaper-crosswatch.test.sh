@@ -31,7 +31,7 @@ expect() {
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
-mkdir -p "$work/stub" "$work/rstate" "$work/lstate"
+mkdir -p "$work/stub" "$work/rstate" "$work/lstate" "$work/tmp"
 TOKEN_VALUE="tok-SECRET-$$"
 printf '%s\n' "$TOKEN_VALUE" > "$work/token"
 
@@ -71,7 +71,7 @@ RC=0
 run() {  # [config] — one reaper run; sets RC, leaves curl.calls/reaper.log for inspection
     : > "$work/curl.calls"; : > "$work/reaper.log"
     RC=0
-    RUNNER_REAPER_CONFIG="${1:-$work/config}" PATH="$work/stub:$PATH" bash "$REAPER_BIN" >/dev/null 2>&1 || RC=$?
+    RUNNER_REAPER_CONFIG="${1:-$work/config}" TMPDIR="$work/tmp" PATH="$work/stub:$PATH" bash "$REAPER_BIN" >/dev/null 2>&1 || RC=$?
 }
 stale() { touch -d "@$(( $(date +%s) - $1 ))" "$work/lstate/streak.tsv"; }
 calls() { grep -c -- "$1" "$work/curl.calls" || true; }
@@ -183,6 +183,9 @@ expect "a non-numeric GRACE in the config file stops the reaper (exit 2)" 2 "$RC
 
 # ── the token never leaks ────────────────────────────────────────────────
 expect "token never on curl's command line" 0 "$(grep -c -- "$TOKEN_VALUE" "$work/curl.argv" || true)"
+expect "the token header file is removed on exit (nothing left in TMPDIR)" "" "$(ls -A "$work/tmp")"
+expect "runner-reaper.service runs with a private /tmp" 1 \
+    "$(sed -n '/runner-reaper.service <</,/^UNIT$/p' "$INSTALLER" | grep -c '^PrivateTmp=yes$' || true)"
 expect "token never in the reaper log" 0 "$(grep -c -- "$TOKEN_VALUE" "$work/reaper.log" || true)"
 
 exit "$fail"

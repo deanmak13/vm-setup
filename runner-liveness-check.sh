@@ -193,6 +193,9 @@ OnFailure=runner-failure-alert@runner-liveness-check.service
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/runner-liveness-check
+# The token header file lives in /tmp only for the run; a private /tmp
+# means a SIGKILLed run (whose EXIT trap never fires) cannot leave it behind.
+PrivateTmp=yes
 UNIT
 
 cat > /etc/systemd/system/runner-liveness-check.timer <<'UNIT'

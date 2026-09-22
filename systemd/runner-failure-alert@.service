@@ -4,3 +4,4 @@ Description=File a GitHub issue because %i.service itself failed
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/runner-failure-alert %i
+PrivateTmp=yes
