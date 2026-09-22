@@ -62,6 +62,9 @@ printf '%s\n' '#!/usr/bin/env bash' \
     'case "$url" in' \
     '  */actions/runners*) r=${url%%/actions/runners*}; r=${r##*/}; p=1; [[ "$url" =~ [\&?]page=([0-9]+) ]] && p=${BASH_REMATCH[1]}' \
     '                      if [[ -f "$W/runners_${r}_p$p.json" ]]; then cat "$W/runners_${r}_p$p.json"; else echo "{\"runners\":[]}"; fi ;;' \
+    '  *"/actions/runs?status=queued"*) r=${url%%/actions/runs*}; r=${r##*/}; p=1; [[ "$url" =~ [\&?]page=([0-9]+) ]] && p=${BASH_REMATCH[1]}' \
+    '        f="$W/queued_${r}_p$p.json"; [[ -f "$f" ]] || { echo "{\"workflow_runs\":[],\"total_count\":0}"; exit 0; }' \
+    '        if [[ "$url" == *per_page=100* ]]; then cat "$f"; else python3 -c "import json,sys; d=json.load(open(sys.argv[1])); d[\"workflow_runs\"]=d[\"workflow_runs\"][:30]; print(json.dumps(d))" "$f"; fi ;;' \
     '  */actions/runs*) echo "{\"workflow_runs\":[],\"total_count\":0}" ;;' \
     '  *"/issues?"*) if [[ -f "$W/issues.json" ]]; then cat "$W/issues.json"; else echo "[]"; fi ;;' \
     '  */issues) echo "{\"number\": 99}" ;;' \
@@ -81,7 +84,23 @@ run() {
     ( TMPDIR="$work/tmp" PATH="$work/stub:$PATH" setsid -w bash "$CHECK_BIN" >/dev/null 2>&1; exit $? ) 2>/dev/null || RC=$?
 }
 calls() { grep -c -- "$1" "$work/curl.calls" || true; }
-reset() { : > "$work/check.log"; rm -f "$work/issues.json" "$work/fail_pattern" "$work/listener_up" "$work/runners_"*.json "$work/state/"*; }
+reset() { : > "$work/check.log"; rm -f "$work/issues.json" "$work/fail_pattern" "$work/listener_up" "$work/runners_"*.json "$work/queued_"*.json "$work/state/"*; }
+# queued_page <repo> <page> <count> <age-seconds> [<count> <age-seconds>...] — newest first, like GitHub
+queued_page() {
+    local repo=$1 page=$2; shift 2
+    python3 -c '
+import json, sys
+from datetime import datetime, timezone, timedelta
+args = sys.argv[1:]; runs = []
+for n, age in zip(args[0::2], args[1::2]):
+    t = (datetime.now(timezone.utc) - timedelta(seconds=int(age))).strftime("%Y-%m-%dT%H:%M:%SZ")
+    runs += [{"created_at": t}] * int(n)
+print(json.dumps({"workflow_runs": runs, "total_count": len(runs)}))' "$@" > "$work/queued_${repo}_p$page.json"
+}
+full_runner_page() {  # <repo> <page> — 100 runners the host has no directory for
+    python3 -c 'import json, sys; print(json.dumps({"runners": [{"name": "other-%s-%d" % (sys.argv[1], i), "status": "online"} for i in range(100)]}))' "$2" \
+        > "$work/runners_$1_p$2.json"
+}
 online() { printf '{"runners":[{"name":"pneuma-portal-contabo","status":"%s"}]}\n' "$1" > "$work/runners_pneuma-portal_p1.json"; }
 
 # healthy baseline
@@ -119,6 +138,26 @@ run; run
 expect "runner on page 2: requested with per_page=100" 1 "$([[ $(calls 'pneuma-portal/actions/runners?per_page=100&page=2') -gt 0 ]] && echo 1 || echo 0)"
 expect "runner on page 2: tracked healthy, not deregistered" "healthy" \
     "$(awk -F'\t' '$1 == "runner:pneuma-portal:pneuma-portal-contabo" {print $3}' "$work/state/streak.tsv")"
+
+# round-4 finding 5: a list that fills every page is "don't know", not an answer
+reset; touch "$work/listener_up"
+for p in 1 2 3 4 5; do full_runner_page pneuma-portal "$p"; done
+run; run
+expect "runner list fills all 5 pages: logged as possibly truncated" 1 "$([[ $(grep -c 'runner list for pneuma-portal fills all 5 pages' "$work/check.log") -gt 0 ]] && echo 1 || echo 0)"
+expect "runner list fills all 5 pages: no ghost keys for the 500 listed names" 0 "$(grep -c '^ghost:pneuma-portal:' "$work/state/streak.tsv" || true)"
+expect "runner list fills all 5 pages: the host's runner is held, not declared dead" 0 "$(grep -c 'filed issue.*pneuma-portal-contabo' "$work/check.log" || true)"
+
+reset; touch "$work/listener_up"; online online
+for p in 1 2 3 4 5; do queued_page pneuma-portal "$p" 100 7200; done
+run; run
+expect "queued runs fill all 5 pages: logged, held" 1 "$([[ $(grep -c 'queued runs for pneuma-portal fill all 5 pages' "$work/check.log") -gt 0 ]] && echo 1 || echo 0)"
+expect "queued runs fill all 5 pages: no starvation alert from a truncated list" 0 "$(grep -c 'filed issue.*pneuma-portal: queued job' "$work/check.log" || true)"
+
+# the oldest queued run sits past item 30 of page 1: found only with per_page=100
+reset; touch "$work/listener_up"; online online
+queued_page pneuma-portal 1 30 60 70 7200
+run; run
+expect "oldest queued run beyond GitHub's default page size is seen: starvation alert filed" 1 "$(grep -c 'filed issue.*pneuma-portal: queued job' "$work/check.log" || true)"
 
 # round-4 finding 3: a run killed part-way must not count toward closing
 # the "checker failed" issue

@@ -26,6 +26,7 @@ fi
 [[ "$DEBOUNCE_TICKS" =~ ^[0-9]+$ && "$DEBOUNCE_TICKS" -ge 1 ]] || { echo "runner-liveness-check: DEBOUNCE_TICKS must be a positive integer: $DEBOUNCE_TICKS" >&2; exit 2; }
 [[ "$QUEUED_ALERT_GRACE" =~ ^[0-9]+$ ]] || { echo "runner-liveness-check: QUEUED_ALERT_GRACE must be a non-negative integer: $QUEUED_ALERT_GRACE" >&2; exit 2; }
 COMMENT_THROTTLE_SECONDS=3600
+MAX_LIST_PAGES=5   # x per_page=100: list ceiling for runners and queued runs
 STATE_FILE="$STATE_DIR/streak.tsv"
 AUTH_HEADER_FILE=""   # set per live run below: a mktemp file removed on exit
 
@@ -250,22 +251,34 @@ prefetch_github_runners() {
         # first page. Bounded at 5 pages (500 runners) the same way
         # queue_state bounds its own pagination — nowhere near this
         # fleet's real size, just a sane ceiling.
-        local rpage rn pfail=0
-        for rpage in 1 2 3 4 5; do
+        #
+        # Round-4 review: a full LAST page means the list may go on past
+        # the ceiling, and every runner beyond it would read as
+        # "deregistered" (and each GitHub-only name as a ghost). That is
+        # "don't know", not an answer: logged and treated as a failed fetch
+        # (HOLD), never silently truncated. A body that doesn't parse is a
+        # failed fetch too, not an empty runner list.
+        local rpage rn parsed pfail=0
+        for rpage in $(seq 1 "$MAX_LIST_PAGES"); do
             api_call "https://api.github.com/repos/$OWNER/$repo/actions/runners?per_page=100&page=$rpage"
             if [[ "$API_CALL_OK" != "1" ]]; then pfail=1; break; fi
+            parsed=$(printf '%s' "$API_CALL_BODY" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+for r in d['runners']:
+    print(f\"{r.get('name','')}\t{r.get('status') or 'unknown'}\")
+" 2>/dev/null) || { pfail=1; note "runner list for $repo page $rpage did not parse — holding this repo's runners"; break; }
             rn=0
             while IFS=$'\t' read -r name status; do
                 [[ -n "$name" ]] || continue
                 GH_RUNNER_STATUS["$repo/$name"]="$status"
                 rn=$((rn + 1))
-            done < <(printf '%s' "$API_CALL_BODY" | python3 -c "
-import json, sys
-d = json.load(sys.stdin)
-for r in d.get('runners') or []:
-    print(f\"{r.get('name','')}\t{r.get('status') or 'unknown'}\")
-" 2>/dev/null)
+            done <<< "$parsed"
             [[ "$rn" -lt 100 ]] && break
+            if (( rpage == MAX_LIST_PAGES )); then
+                pfail=1
+                note "runner list for $repo fills all $MAX_LIST_PAGES pages ($((MAX_LIST_PAGES * 100))+ runners) — may be truncated, holding this repo's runners"
+            fi
         done
         if (( pfail )); then
             GH_REPO_OK[$repo]=0
@@ -317,7 +330,7 @@ queue_state() {
         return
     fi
     local page times n all_times="" qfail=0
-    for page in 1 2 3 4 5; do
+    for page in $(seq 1 "$MAX_LIST_PAGES"); do
         api_call "https://api.github.com/repos/$OWNER/$1/actions/runs?status=queued&per_page=100&page=$page"
         if [[ "$API_CALL_OK" != "1" ]]; then qfail=1; break; fi
         times=$(printf '%s' "$API_CALL_BODY" | python3 -c "
@@ -329,6 +342,12 @@ for r in d.get('workflow_runs') or []:
         n=$(printf '%s\n' "$times" | grep -c . || true)
         [[ -n "$times" ]] && all_times+="$times"$'\n'
         [[ "$n" -lt 100 ]] && break
+        if (( page == MAX_LIST_PAGES )); then
+            # Runs come newest first, so the OLDEST queued run — the one
+            # this check is about — is exactly what a truncated list drops.
+            qfail=1
+            note "queued runs for $1 fill all $MAX_LIST_PAGES pages — oldest may be past the last page, holding"
+        fi
     done
     if (( qfail )); then
         return   # QUEUE_OK stays 0
@@ -728,6 +747,10 @@ run_one_tick() {
     for ghkey in "${!GH_RUNNER_STATUS[@]}"; do
         [[ -n "${HOST_HAS[$ghkey]:-}" ]] && continue
         local grepo="${ghkey%%/*}" gname="${ghkey#*/}"
+        # A partial list (a later page failed, or the list hit the page
+        # ceiling) is no evidence that a name is a ghost: only a repo whose
+        # whole list was fetched counts. Its tracked ghosts are held below.
+        [[ "${GH_REPO_OK[$grepo]:-0}" == "1" ]] || continue
         evaluate_key "ghost:$grepo:$gname" 1 \
             "[runner-liveness] $grepo/$gname: registered on GitHub, no host directory" \
             "GitHub lists runner '$gname' for $grepo (status=${GH_RUNNER_STATUS[$ghkey]}) but no matching /home/ubuntu/actions-runner-* directory exists on ci-builder. Either the host lost its install or the runner should be deregistered on GitHub."
