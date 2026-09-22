@@ -46,17 +46,31 @@ AUTH_HEADER_FILE=$(mktemp)
 trap 'rm -f "$AUTH_HEADER_FILE"' EXIT
 ( umask 077; printf 'Authorization: Bearer %s\n' "$TOKEN" > "$AUTH_HEADER_FILE" )
 
-existing=$(curl -sf -m 20 -H @"$AUTH_HEADER_FILE" -H "Accept: application/vnd.github+json" \
+# At most one "still failing" comment per COMMENT_THROTTLE_SECONDS: this
+# runs on EVERY failed tick of a 5-minute timer, so a persistent cause (a
+# token missing a permission, say) used to add up to 288 comments a day
+# per watchdog. The issue's own updated_at is the throttle clock — no
+# local state that a crash or a fresh host could lose.
+COMMENT_THROTTLE_SECONDS=3600
+found=$(curl -sf -m 20 -H @"$AUTH_HEADER_FILE" -H "Accept: application/vnd.github+json" \
     "https://api.github.com/repos/$OWNER/$ALERT_REPO/issues?labels=runner-liveness&state=open&per_page=100" \
     | python3 -c "
 import json, sys
+from datetime import datetime, timezone
 d = json.load(sys.stdin)
+if not isinstance(d, list):
+    sys.exit(1)
 for i in d:
     if i.get('title') == sys.argv[1]:
-        print(i['number']); break
+        updated = datetime.strptime(i['updated_at'], '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=timezone.utc)
+        print(i['number'], int((datetime.now(timezone.utc) - updated).total_seconds()))
+        break
 " "$TITLE") || { echo "failed to list open issues" >&2; exit 1; }
+read -r existing updated_age <<< "$found"
 
-if [[ -n "$existing" ]]; then
+if [[ -n "$existing" ]] && (( updated_age < COMMENT_THROTTLE_SECONDS )); then
+    echo "issue #$existing already updated ${updated_age}s ago — not commenting again within ${COMMENT_THROTTLE_SECONDS}s"
+elif [[ -n "$existing" ]]; then
     curl -sf -m 20 -X POST -H @"$AUTH_HEADER_FILE" -H "Accept: application/vnd.github+json" \
         "https://api.github.com/repos/$OWNER/$ALERT_REPO/issues/$existing/comments" \
         -d "$(python3 -c "import json, sys; print(json.dumps({'body': 'still failing: ' + sys.argv[1]}))" "$BODY")" \
