@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# runner-failure-alert <program> — the OnFailure= meta-alert for the CI host's
+# watchdogs: files (or updates) one deduplicated GitHub issue saying that
+# <program>'s own service failed, so a broken watchdog is not silent.
+#
+# Installed by runner-reaper.sh and runner-liveness-check.sh as
+# /usr/local/bin/runner-failure-alert and started by the template unit
+# systemd/runner-failure-alert@.service (OnFailure=runner-failure-alert@<program>.service).
+# Reads the same /etc/default/<program> as the program it reports on (for
+# ALERT_REPO and TOKEN_FILE_PATH); tests point RUNNER_FAILURE_ALERT_CONFIG at a
+# fixture. Exits non-zero if it cannot deliver, so that failure stays visible in
+# `systemctl --failed` and the journal instead of being swallowed.
+#
+# Each program closes its own issue (debounced) once it is healthy again, so the
+# titles below must match the ones those programs search for — the tests assert
+# that they do.
+set -uo pipefail
+
+PROGRAM="${1:-}"
+OWNER=deanmak13
+ALERT_REPO=vm-setup
+case "$PROGRAM" in
+    runner-reaper)
+        TOKEN_FILE_PATH=/root/.runner-reaper-token
+        TITLE="[runner-reaper] runner-reaper failed (crash or undelivered alert)"
+        BODY="runner-reaper.service failed on ci-builder — see 'journalctl -u runner-reaper' and /var/log/runner-reaper.log (look for FAILED lines). Its runner-liveness cross-watch alert may not have been delivered."
+        ;;
+    runner-liveness-check)
+        TOKEN_FILE_PATH=/root/.runner-liveness-token
+        TITLE="[runner-liveness] the liveness checker itself failed to run"
+        BODY="runner-liveness-check.service failed on ci-builder — see 'journalctl -u runner-liveness-check' for the crash. The watchdog cannot currently detect wedged runners."
+        ;;
+    *)
+        echo "usage: runner-failure-alert runner-reaper|runner-liveness-check" >&2
+        exit 2
+        ;;
+esac
+CONFIG_FILE=${RUNNER_FAILURE_ALERT_CONFIG:-/etc/default/$PROGRAM}
+# shellcheck source=/dev/null
+[[ -r "$CONFIG_FILE" ]] && . "$CONFIG_FILE"
+
+TOKEN=$(cat "$TOKEN_FILE_PATH" 2>/dev/null) || { echo "no token file" >&2; exit 1; }
+[[ -n "$TOKEN" ]] || { echo "empty token" >&2; exit 1; }
+
+AUTH_HEADER_FILE=$(mktemp)
+trap 'rm -f "$AUTH_HEADER_FILE"' EXIT
+( umask 077; printf 'Authorization: Bearer %s\n' "$TOKEN" > "$AUTH_HEADER_FILE" )
+
+existing=$(curl -sf -m 20 -H @"$AUTH_HEADER_FILE" -H "Accept: application/vnd.github+json" \
+    "https://api.github.com/repos/$OWNER/$ALERT_REPO/issues?labels=runner-liveness&state=open&per_page=100" \
+    | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+for i in d:
+    if i.get('title') == sys.argv[1]:
+        print(i['number']); break
+" "$TITLE") || { echo "failed to list open issues" >&2; exit 1; }
+
+if [[ -n "$existing" ]]; then
+    curl -sf -m 20 -X POST -H @"$AUTH_HEADER_FILE" -H "Accept: application/vnd.github+json" \
+        "https://api.github.com/repos/$OWNER/$ALERT_REPO/issues/$existing/comments" \
+        -d "$(python3 -c "import json, sys; print(json.dumps({'body': 'still failing: ' + sys.argv[1]}))" "$BODY")" \
+        >/dev/null || { echo "failed to comment on issue #$existing" >&2; exit 1; }
+else
+    curl -sf -m 20 -X POST -H @"$AUTH_HEADER_FILE" -H "Accept: application/vnd.github+json" \
+        "https://api.github.com/repos/$OWNER/$ALERT_REPO/issues" \
+        -d "$(python3 -c "
+import json, sys
+print(json.dumps({'title': sys.argv[1], 'body': sys.argv[2], 'labels': ['runner-liveness']}))
+" "$TITLE" "$BODY")" >/dev/null || { echo "failed to create issue" >&2; exit 1; }
+fi

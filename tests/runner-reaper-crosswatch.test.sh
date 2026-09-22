@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # tests/runner-reaper-crosswatch.test.sh — runner-reaper's cross-watch on
-# runner-liveness-check's state file, run end to end: the INSTALLED script's
-# own source (extracted from runner-reaper.sh, not copied here) with its
-# paths pointed at a temp dir and curl/ps/logger/systemctl stubbed on PATH.
+# runner-liveness-check's state file, run end to end: bin/runner-reaper itself
+# (so kcov measures it), its paths pointed at a temp dir through a fixture
+# RUNNER_REAPER_CONFIG and curl/ps/logger/systemctl stubbed on PATH.
 # No network, no root, no host state. Covers round-3 review of vm-setup#9:
 #   - both sides of the LIVENESS_STALE_SECONDS (1200s) threshold;
 #   - a failed issue search never files a duplicate and fails the run;
@@ -17,7 +17,9 @@ set -euo pipefail
 
 TESTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(dirname "$TESTS_DIR")"
-REAPER_SRC="${REAPER_SRC:-$REPO_DIR/runner-reaper.sh}"
+REAPER_BIN="${REAPER_BIN:-$REPO_DIR/bin/runner-reaper}"
+INSTALLER="$REPO_DIR/runner-reaper.sh"
+FAILURE_ALERT="$REPO_DIR/bin/runner-failure-alert"
 
 fail=0
 # expect <description> <expected> <actual>
@@ -33,17 +35,13 @@ mkdir -p "$work/stub" "$work/rstate" "$work/lstate"
 TOKEN_VALUE="tok-SECRET-$$"
 printf '%s\n' "$TOKEN_VALUE" > "$work/token"
 
-# ── the installed reaper, paths redirected into $work ────────────────────
-build_reaper() {  # <alert-repo> <out>
-    sed -n '\|^cat > /usr/local/bin/runner-reaper |,/^SCRIPT$/p' "$REAPER_SRC" | sed '1d;$d' \
-        | sed "s|__GRACE__|600|; s|__ALERT_REPO__|$1|
-               s|^TOKEN_FILE_PATH=.*|TOKEN_FILE_PATH=$work/token|
-               s|^LOG=.*|LOG=$work/reaper.log|
-               s|^STATE_DIR=.*|STATE_DIR=$work/rstate|
-               s|^LIVENESS_STATE_FILE=.*|LIVENESS_STATE_FILE=$work/lstate/streak.tsv|" > "$2"
+# ── fixture configs: every path redirected into $work ─────────────────────
+write_config() {  # <alert-repo> <out>
+    printf '%s\n' "GRACE=600" "ALERT_REPO=$1" "TOKEN_FILE_PATH=$work/token" "LOG=$work/reaper.log" \
+        "STATE_DIR=$work/rstate" "LIVENESS_STATE_FILE=$work/lstate/streak.tsv" > "$2"
 }
-build_reaper vm-setup "$work/reaper"
-build_reaper my-alerts "$work/reaper-alt"
+write_config vm-setup "$work/config"
+write_config my-alerts "$work/config-alt"
 
 # ── stubs ────────────────────────────────────────────────────────────────
 # curl: records "METHOD URL" (and the full argv, for the token check),
@@ -70,10 +68,10 @@ STALE_TITLE="[runner-liveness] the liveness checker's timer appears to have stop
 FAILURE_TITLE="[runner-reaper] runner-reaper failed (crash or undelivered alert)"
 
 RC=0
-run() {  # [script] — one reaper run; sets RC, leaves curl.calls/reaper.log for inspection
+run() {  # [config] — one reaper run; sets RC, leaves curl.calls/reaper.log for inspection
     : > "$work/curl.calls"; : > "$work/reaper.log"
     RC=0
-    PATH="$work/stub:$PATH" bash "${1:-$work/reaper}" >/dev/null 2>&1 || RC=$?
+    RUNNER_REAPER_CONFIG="${1:-$work/config}" PATH="$work/stub:$PATH" bash "$REAPER_BIN" >/dev/null 2>&1 || RC=$?
 }
 stale() { touch -d "@$(( $(date +%s) - $1 ))" "$work/lstate/streak.tsv"; }
 calls() { grep -c -- "$1" "$work/curl.calls" || true; }
@@ -146,7 +144,7 @@ reset; open_issues 21 "$STALE_TITLE"; touch "$work/lstate/streak.tsv"; echo 'PAT
 expect "close fails: run exits non-zero" 1 "$RC"
 
 # ── --alert-repo is honoured ─────────────────────────────────────────────
-reset; stale 1300; run "$work/reaper-alt"
+reset; stale 1300; run "$work/config-alt"
 expect "--alert-repo my-alerts: issue filed there" 1 "$(calls 'POST .*/repos/deanmak13/my-alerts/issues$')"
 expect "--alert-repo my-alerts: nothing sent to vm-setup" 0 "$(calls '/repos/deanmak13/vm-setup/')"
 
@@ -161,12 +159,27 @@ expect "a failed run in between resets the healthy streak" 0 "$(calls 'PATCH .*/
 
 # ── installer wiring ─────────────────────────────────────────────────────
 expect "runner-reaper.service declares its OnFailure unit" 1 \
-    "$(grep -c '^OnFailure=runner-reaper-failure-alert.service$' "$REAPER_SRC" || true)"
-expect "the failure-alert unit's ExecStart is installed" 1 \
-    "$(grep -c '^ExecStart=/usr/local/bin/runner-reaper-failure-alert$' "$REAPER_SRC" || true)"
-expect "the failure-alert script files the title the reaper later closes" 2 \
-    "$(grep -cF "\"$FAILURE_TITLE\"" "$REAPER_SRC" || true)"
-expect "the installer accepts --alert-repo" 1 "$(grep -c -- '--alert-repo) ALERT_REPO=' "$REAPER_SRC" || true)"
+    "$(grep -c '^OnFailure=runner-failure-alert@runner-reaper.service$' "$INSTALLER" || true)"
+expect "the installer installs bin/runner-reaper and the failure-alert program + template unit" 3 \
+    "$(grep -cE '^install -m [0-9]+ "\$REPO_DIR/(bin/runner-reaper|bin/runner-failure-alert|systemd/runner-failure-alert@.service)"' "$INSTALLER" || true)"
+expect "the failure-alert program files the title the reaper later closes" 1 \
+    "$(grep -cF "TITLE=\"$FAILURE_TITLE\"" "$FAILURE_ALERT" || true)"
+expect "the reaper closes that same title" 1 "$(grep -cF "REAPER_FAILURE_TITLE=\"$FAILURE_TITLE\"" "$REAPER_BIN" || true)"
+inst_rc=0; inst_out=$(bash "$INSTALLER" --token-file "$work/token" --alert-repo 'a/b' 2>&1) || inst_rc=$?
+expect "installer rejects an --alert-repo with a slash" 1 "$(( inst_rc != 0 && $(grep -c 'bare repo name' <<< "$inst_out") ))"
+inst_rc=0; inst_out=$(bash "$INSTALLER" --token-file "$work/token" --grace-seconds x 2>&1) || inst_rc=$?
+expect "installer rejects a non-numeric --grace-seconds" 1 "$(( inst_rc != 0 && $(grep -c 'non-negative integer' <<< "$inst_out") ))"
+inst_rc=0; inst_out=$(bash "$INSTALLER" --bogus 2>&1) || inst_rc=$?
+expect "installer rejects an unknown argument" 1 "$(( inst_rc != 0 && $(grep -c 'Unknown argument' <<< "$inst_out") ))"
+inst_rc=0; inst_out=$(bash "$INSTALLER" 2>&1) || inst_rc=$?
+expect "installer requires --token-file" 1 "$(( inst_rc != 0 && $(grep -c 'token-file is required' <<< "$inst_out") ))"
+if [[ $EUID -ne 0 ]]; then
+    inst_rc=0; inst_out=$(bash "$INSTALLER" --token-file "$work/token" 2>&1) || inst_rc=$?
+    expect "installer refuses to run as non-root after validating" 1 "$(( inst_rc != 0 && $(grep -c 'must be run as root' <<< "$inst_out") ))"
+fi
+printf 'GRACE=soon\n' > "$work/config-bad"
+run "$work/config-bad"
+expect "a non-numeric GRACE in the config file stops the reaper (exit 2)" 2 "$RC"
 
 # ── the token never leaks ────────────────────────────────────────────────
 expect "token never on curl's command line" 0 "$(grep -c -- "$TOKEN_VALUE" "$work/curl.argv" || true)"
