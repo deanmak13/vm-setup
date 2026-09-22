@@ -27,7 +27,7 @@ fi
 [[ "$QUEUED_ALERT_GRACE" =~ ^[0-9]+$ ]] || { echo "runner-liveness-check: QUEUED_ALERT_GRACE must be a non-negative integer: $QUEUED_ALERT_GRACE" >&2; exit 2; }
 COMMENT_THROTTLE_SECONDS=3600
 STATE_FILE="$STATE_DIR/streak.tsv"
-AUTH_HEADER_FILE="$STATE_DIR/.authheader"
+AUTH_HEADER_FILE=""   # set per live run below: a mktemp file removed on exit
 
 # The fixed repo roster this checker watches for queued-job starvation —
 # every self-hosted-runner-capable Pneuma repo, whether or not it
@@ -52,6 +52,12 @@ if [[ "$MODE" != "self-test" ]]; then
     fi
     # Token goes in a header file, not curl argv, so it never shows up in
     # `ps`/`/proc/<pid>/cmdline` for any other user on the box to read.
+    # Round-4 review: a per-run mktemp file removed on exit, not a
+    # persistent file in STATE_DIR that outlived every run; the unit's
+    # PrivateTmp=yes means even a SIGKILL (no trap) leaves nothing behind
+    # outside the unit's own throwaway /tmp.
+    AUTH_HEADER_FILE=$(mktemp)
+    trap 'rm -f "$AUTH_HEADER_FILE"' EXIT
     ( umask 077; printf 'Authorization: Bearer %s\n' "$TOKEN" > "$AUTH_HEADER_FILE" )
 fi
 

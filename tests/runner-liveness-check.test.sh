@@ -31,7 +31,7 @@ expect() {
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
-mkdir -p "$work/stub" "$work/state"
+mkdir -p "$work/stub" "$work/state" "$work/tmp"
 printf 'tok-test\n' > "$work/token"
 
 printf '%s\n' "ALERT_REPO=vm-setup" "DEBOUNCE_TICKS=2" "QUEUED_ALERT_GRACE=1500" \
@@ -76,7 +76,7 @@ RC=0
 run() {
     : > "$work/curl.calls"
     RC=0
-    PATH="$work/stub:$PATH" bash "$CHECK_BIN" >/dev/null 2>&1 || RC=$?
+    TMPDIR="$work/tmp" PATH="$work/stub:$PATH" bash "$CHECK_BIN" >/dev/null 2>&1 || RC=$?
 }
 calls() { grep -c -- "$1" "$work/curl.calls" || true; }
 reset() { : > "$work/check.log"; rm -f "$work/issues.json" "$work/fail_pattern" "$work/listener_up" "$work/runners_"*.json "$work/state/"*; }
@@ -85,6 +85,8 @@ online() { printf '{"runners":[{"name":"pneuma-portal-contabo","status":"%s"}]}\
 # healthy baseline
 reset; touch "$work/listener_up"; online online; run
 expect "healthy tick: exits 0" 0 "$RC"
+expect "the token header file is removed on exit (nothing left in TMPDIR)" "" "$(ls -A "$work/tmp")"
+expect "the token is never written under STATE_DIR" 0 "$(grep -rlF tok-test "$work/state" | wc -l)"
 expect "healthy tick: files only the heartbeat issue" 1 "$(calls 'POST .*/issues$')"
 
 # N5 + finding 4: a search that fails every tick
@@ -136,6 +138,8 @@ if [[ $EUID -ne 0 ]]; then
     rc=0; out=$(bash "$INSTALLER" 2>&1) || rc=$?
     expect "installer refuses to run as non-root after validating" 1 "$(( rc != 0 && $(grep -c 'must be run as root' <<< "$out") ))"
 fi
+expect "runner-liveness-check.service runs with a private /tmp" 1 \
+    "$(sed -n '/runner-liveness-check.service <</,/^UNIT$/p' "$INSTALLER" | grep -c '^PrivateTmp=yes$' || true)"
 expect "runner-liveness-check.service declares its OnFailure unit" 1 \
     "$(grep -c '^OnFailure=runner-failure-alert@runner-liveness-check.service$' "$INSTALLER" || true)"
 
