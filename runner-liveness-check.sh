@@ -235,6 +235,21 @@ note() {
 TICK_API_TOTAL=0
 TICK_API_FAIL=0
 
+# Separate from the above: DETECTION can succeed completely (we know
+# exactly who's dead) while DELIVERY still fails (the issue-search/
+# create/comment/close calls to ALERT_REPO fail — wrong token scope,
+# repo renamed, rate limited on writes specifically, etc). Round-3
+# review finding 4: that used to exit 0 unconditionally — a due alert
+# or the heartbeat got silently skipped, the state file still updated
+# (so the reaper's mtime-staleness cross-watch sees nothing wrong
+# either), and OnFailure= never fired. Reset once per live/dry-run
+# process (NOT inside run_one_tick — update_heartbeat and
+# close_watchdog_failure_issue_if_open run after it in the same tick
+# and must accumulate into the same counter); self-test resets it at
+# the top of run_one_tick instead, once per simulated tick, since
+# those two functions are no-ops outside MODE=="live".
+TICK_DELIVERY_FAILED=0
+
 api() {
     curl -sf -m 20 -H @"$AUTH_HEADER_FILE" -H "Accept: application/vnd.github+json" "$1"
 }
@@ -386,21 +401,36 @@ prefetch_github_runners() {
         # api_call is a plain statement (see its own comment for why) —
         # its result is read back from API_CALL_OK/API_CALL_BODY, never
         # from a command-substituted return value.
-        api_call "https://api.github.com/repos/$OWNER/$repo/actions/runners"
-        if [[ "$API_CALL_OK" != "1" ]]; then
-            GH_REPO_OK[$repo]=0
-            continue
-        fi
-        GH_REPO_OK[$repo]=1
-        while IFS=$'\t' read -r name status; do
-            [[ -n "$name" ]] || continue
-            GH_RUNNER_STATUS["$repo/$name"]="$status"
-        done < <(printf '%s' "$API_CALL_BODY" | python3 -c "
+        #
+        # Paged (round-3 review finding 6): /actions/runners with no
+        # per_page defaults to 30. Since "absent from the list" now
+        # means "deregistered" (round-2 review N3), a repo with more
+        # than 30 runners would false-alert on everything past the
+        # first page. Bounded at 5 pages (500 runners) the same way
+        # queue_state bounds its own pagination — nowhere near this
+        # fleet's real size, just a sane ceiling.
+        local rpage rn pfail=0
+        for rpage in 1 2 3 4 5; do
+            api_call "https://api.github.com/repos/$OWNER/$repo/actions/runners?per_page=100&page=$rpage"
+            if [[ "$API_CALL_OK" != "1" ]]; then pfail=1; break; fi
+            rn=0
+            while IFS=$'\t' read -r name status; do
+                [[ -n "$name" ]] || continue
+                GH_RUNNER_STATUS["$repo/$name"]="$status"
+                rn=$((rn + 1))
+            done < <(printf '%s' "$API_CALL_BODY" | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
 for r in d.get('runners') or []:
     print(f\"{r.get('name','')}\t{r.get('status') or 'unknown'}\")
 " 2>/dev/null)
+            [[ "$rn" -lt 100 ]] && break
+        done
+        if (( pfail )); then
+            GH_REPO_OK[$repo]=0
+            continue
+        fi
+        GH_REPO_OK[$repo]=1
     done
 }
 
@@ -541,7 +571,13 @@ hold_key() {
         NEW_STREAK["$key"]=1
         NEW_ISSUE["$key"]="${ISSUE_NUM[$key]:-0}"
         NEW_LAST_COMMENT["$key"]="${LAST_COMMENT[$key]:-0}"
-        file_or_update_issue "$key" "[runner-liveness] cannot verify: $context_title" \
+        # context_title is usually a caller's already-"[runner-liveness]
+        # ..."-prefixed title (round-3 review finding 7 caught the result
+        # double-prefixing to "[runner-liveness] cannot verify:
+        # [runner-liveness] ..."). Strip a leading prefix before adding
+        # our own, once.
+        local bare_title="${context_title#"[runner-liveness] "}"
+        file_or_update_issue "$key" "[runner-liveness] cannot verify: $bare_title" \
             "This check has had no usable evidence for '$key' for $cnt consecutive ticks: $context_reason. Treating this as failed rather than holding forever — check GitHub token scope/expiry and repo access/name for the repo(s) involved."
         return
     fi
@@ -624,6 +660,7 @@ file_or_update_issue() {
             # streak already satisfied DEBOUNCE_TICKS, so evaluate_key
             # will call this again) gets another chance.
             note "skip filing/updating '$title': open-issue search failed this tick (avoiding a possible duplicate)"
+            TICK_DELIVERY_FAILED=$((TICK_DELIVERY_FAILED + 1))
             NEW_ISSUE["$key"]=0
             NEW_LAST_COMMENT["$key"]="${LAST_COMMENT[$key]:-0}"
             return
@@ -648,6 +685,7 @@ print(json.dumps({'body': 'still failing: ' + sys.argv[1]}))
                 NEW_LAST_COMMENT["$key"]="$now_epoch"
             else
                 note "FAILED to comment on issue #$existing: $title"
+                TICK_DELIVERY_FAILED=$((TICK_DELIVERY_FAILED + 1))
                 NEW_LAST_COMMENT["$key"]="$last"
             fi
         else
@@ -673,6 +711,7 @@ print(json.dumps({'title': sys.argv[1], 'body': sys.argv[2], 'labels': ['runner-
             NEW_ISSUE["$key"]=0
             NEW_LAST_COMMENT["$key"]=0
             note "FAILED to file issue: $title"
+            TICK_DELIVERY_FAILED=$((TICK_DELIVERY_FAILED + 1))
         fi
     fi
 }
@@ -713,6 +752,7 @@ resolve_issue() {
             # NEXT alert would search-or-create a duplicate instead of
             # finding this one. Keep it and retry closing next healthy tick.
             note "FAILED to close issue #$existing (comment_ok=$comment_ok): $title — will retry next healthy tick"
+            TICK_DELIVERY_FAILED=$((TICK_DELIVERY_FAILED + 1))
             NEW_ISSUE["$key"]="$existing"
             NEW_LAST_COMMENT["$key"]="${LAST_COMMENT[$key]:-0}"
         fi
@@ -757,6 +797,12 @@ run_one_tick() {
     NEW_STATE=(); NEW_STREAK=(); NEW_ISSUE=(); NEW_LAST_COMMENT=(); NEW_HOLD_COUNT=()
     TICK_ACTIONS=(); TICK_COMMENTED=()
     TICK_API_TOTAL=0; TICK_API_FAIL=0
+    # Reset here (not just once in the top-level dispatch) so --self-test,
+    # which calls run_one_tick many times in one process without ever
+    # going through that dispatch, gets a clean per-simulated-tick count;
+    # the live dispatch's own pre-load_state reset is redundant with this
+    # but harmless (nothing runs between the two).
+    TICK_DELIVERY_FAILED=0
 
     declare -A HOST_HAS   # "repo/agent" -> 1, built from host_inventory
     HOST_HAS=()
@@ -923,6 +969,12 @@ run_one_tick() {
     if [[ "$TICK_API_TOTAL" -gt 0 && "$TICK_API_TOTAL" -eq "$TICK_API_FAIL" ]]; then
         TICK_EXIT_CODE=2
     fi
+    # Round-3 review finding 4: also computed here (not only in the
+    # top-level live dispatch) so --self-test, which never reaches that
+    # dispatch, can assert on it per simulated tick.
+    if [[ "$TICK_EXIT_CODE" -eq 0 && "$TICK_DELIVERY_FAILED" -gt 0 ]]; then
+        TICK_EXIT_CODE=2
+    fi
 }
 
 # Best-effort dead-man's-switch heartbeat: update a single pinned issue's
@@ -937,8 +989,12 @@ update_heartbeat() {
     gh_find_open_issue "$title"
     if [[ "$FIND_ISSUE_OK" != "1" ]]; then
         # Round-2 review N5: don't create a duplicate heartbeat issue
-        # just because the search itself failed transiently.
+        # just because the search itself failed transiently. Round-3
+        # review finding 4: this is a DELIVERY failure too — count it so
+        # a chronically-failing ALERT_REPO can't hide behind a detection
+        # tick that otherwise looked perfectly healthy.
         note "skip heartbeat: open-issue search failed this tick"
+        TICK_DELIVERY_FAILED=$((TICK_DELIVERY_FAILED + 1))
         return
     fi
     local existing="$FIND_ISSUE_RESULT"
@@ -948,7 +1004,7 @@ update_heartbeat() {
         curl -sf -m 20 -X PATCH -H @"$AUTH_HEADER_FILE" -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/$OWNER/$ALERT_REPO/issues/$existing" \
             -d "$(python3 -c "import json,sys; print(json.dumps({'body': sys.argv[1]}))" "$body")" >/dev/null 2>&1 \
-            || note "FAILED to update heartbeat issue #$existing"
+            || { note "FAILED to update heartbeat issue #$existing"; TICK_DELIVERY_FAILED=$((TICK_DELIVERY_FAILED + 1)); }
     else
         curl -sf -m 20 -X POST -H @"$AUTH_HEADER_FILE" -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/$OWNER/$ALERT_REPO/issues" \
@@ -956,17 +1012,34 @@ update_heartbeat() {
 import json, sys
 print(json.dumps({'title': sys.argv[1], 'body': sys.argv[2], 'labels': ['runner-liveness']}))
 " "$title" "$body")" >/dev/null 2>&1 \
-            || note "FAILED to create heartbeat issue"
+            || { note "FAILED to create heartbeat issue"; TICK_DELIVERY_FAILED=$((TICK_DELIVERY_FAILED + 1)); }
     fi
 }
 
-# Minor fix requested in round-2 review: the OnFailure= meta-alert
-# ("the liveness checker itself failed to run") never closed itself. A
-# successful, non-exit-2 tick (this function is only called when
-# TICK_EXIT_CODE==0, i.e. the checker just proved it's working again) now
-# closes that issue if it's open, the same way any other alert resolves.
+# Round-2 review minor fix: the OnFailure= meta-alert ("the liveness
+# checker itself failed to run") never closed itself. Round-3 review
+# finding 7: the first version closed it on the very FIRST healthy tick
+# after a failure, so a flapping checker (fail, recover, fail, recover)
+# would create-then-close-then-recreate the same issue every cycle.
+# Debounced the same way every other alert is: DEBOUNCE_TICKS
+# consecutive ticks that reached this point without a TICK_EXIT_CODE
+# escalation, tracked in its own small persisted counter (separate from
+# the main STREAK table — this isn't a per-key detection result, it's
+# "is the checker itself currently trustworthy").
 close_watchdog_failure_issue_if_open() {
     [[ "$MODE" == "live" ]] || return 0
+    local streak_file="$STATE_DIR/watchdog-healthy-streak"
+    local streak=0
+    [[ -f "$streak_file" ]] && streak=$(cat "$streak_file" 2>/dev/null || echo 0)
+    [[ "$streak" =~ ^[0-9]+$ ]] || streak=0
+    if [[ "$TICK_EXIT_CODE" -ne 0 ]]; then
+        echo 0 > "$streak_file" 2>/dev/null || true
+        return 0
+    fi
+    streak=$((streak + 1))
+    echo "$streak" > "$streak_file" 2>/dev/null || true
+    [[ "$streak" -ge "$DEBOUNCE_TICKS" ]] || return 0
+
     local title="[runner-liveness] the liveness checker itself failed to run"
     gh_find_open_issue "$title"
     [[ "$FIND_ISSUE_OK" == "1" ]] || return 0
@@ -978,7 +1051,7 @@ close_watchdog_failure_issue_if_open() {
     curl -sf -m 20 -X PATCH -H @"$AUTH_HEADER_FILE" -H "Accept: application/vnd.github+json" \
         "https://api.github.com/repos/$OWNER/$ALERT_REPO/issues/$existing" \
         -d '{"state":"closed"}' >/dev/null 2>&1 \
-        && note "closed self-failure issue #$existing (checker is healthy again)" \
+        && note "closed self-failure issue #$existing (checker healthy for $streak consecutive ticks)" \
         || note "FAILED to close self-failure issue #$existing"
 }
 
@@ -1367,6 +1440,137 @@ self_test() {
     throttle_wedged_tick; run_one_tick
     assert_eq "${TICK_COMMENTED[runner:pneuma-mem0:pneuma-mem0-contabo]:-}" "1" "M5: after the throttle window elapses, it comments again"
 
+    # ========================================================
+    # Round-3 review (independent re-review of the round-2 fixes above).
+    # Confirmed N1-N5/minor/bonus closed; found these specific test gaps
+    # and one new live-path regression class (delivery failures exiting
+    # 0). Scenarios below use STATE (not TICK_ACTIONS) assertions where
+    # the bug is specifically about silent self-pruning — TICK_ACTIONS
+    # can be equally empty in both the correct-hold and the buggy-drop
+    # case, since neither calls evaluate_key/file_or_update_issue/
+    # resolve_issue that tick; only the persisted STATE/ISSUE_NUM tables
+    # tell the two apart.
+    # ========================================================
+
+    echo "== scenario 18 (N4 ghost-hold): a ghost runner's tracking must survive a tick where its repo's fetch fails =="
+    ghost_hold_baseline_tick() {
+        clear_fixtures
+        FIXTURE_INVENTORY=$'pneuma-ops\tpneuma-ops-contabo\t/home/ubuntu/actions-runner-pneuma-ops-contabo'
+        FIXTURE_UNIT_STATE["actions.runner.deanmak13-pneuma-ops.pneuma-ops-contabo.service"]="active"
+        FIXTURE_LISTENER_ALIVE["/home/ubuntu/actions-runner-pneuma-ops-contabo"]="1"
+        FIXTURE_GH_STATUS["pneuma-ops/pneuma-ops-contabo"]="online"
+        FIXTURE_GH_STATUS["pneuma-ops/pneuma-ops-contabo-ghost2"]="offline"   # no matching host dir -> ghost
+    }
+    ghost_hold_baseline_tick; run_one_tick
+    ghost_hold_baseline_tick; run_one_tick
+    assert_eq "${TICK_ACTIONS[ghost:pneuma-ops:pneuma-ops-contabo-ghost2]:-}" "alert" "N4 ghost-hold baseline: ghost alert opens"
+    ghost_hold_fail_tick() {
+        clear_fixtures
+        FIXTURE_INVENTORY=$'pneuma-ops\tpneuma-ops-contabo\t/home/ubuntu/actions-runner-pneuma-ops-contabo'
+        FIXTURE_UNIT_STATE["actions.runner.deanmak13-pneuma-ops.pneuma-ops-contabo.service"]="active"
+        FIXTURE_LISTENER_ALIVE["/home/ubuntu/actions-runner-pneuma-ops-contabo"]="1"
+        FIXTURE_GH_REPO_FAIL["pneuma-ops"]=1   # whole repo's fetch fails this tick
+    }
+    ghost_hold_fail_tick; run_one_tick
+    assert_eq "${TICK_ACTIONS[ghost:pneuma-ops:pneuma-ops-contabo-ghost2]:-}" "" "N4 ghost-hold: no action during the failed-fetch tick"
+    assert_eq "${STATE[ghost:pneuma-ops:pneuma-ops-contabo-ghost2]:-MISSING}" "dead" "N4 ghost-hold: key survives the failed-fetch tick (still tracked, not silently dropped)"
+    assert_eq "${ISSUE_NUM[ghost:pneuma-ops:pneuma-ops-contabo-ghost2]:-0}" "1" "N4 ghost-hold: issue number preserved across the held tick (not orphaned into a future duplicate)"
+
+    echo "== scenario 19 (N5/M8 + finding 4): a failed open-issue SEARCH on the REAL live path skips filing and counts as a delivery failure =="
+    m8_search_fail_test() {
+        MODE="live"
+        api() {
+            case "$1" in
+                *"/issues?labels="*) return 1 ;;   # search itself fails
+                *) echo '{"number":123}' ;;
+            esac
+        }
+        ISSUE_NUM=(); STATE=(); STREAK=(); LAST_COMMENT=(); HOLD_COUNT=()
+        NEW_ISSUE=(); NEW_STATE=(); NEW_STREAK=(); NEW_LAST_COMMENT=(); NEW_HOLD_COUNT=(); TICK_ACTIONS=()
+        TICK_DELIVERY_FAILED=0
+        file_or_update_issue "runner:m8:test" "[runner-liveness] m8 test" "body"
+        local escalated=0
+        [[ "$TICK_DELIVERY_FAILED" -gt 0 ]] && escalated=1
+        echo "${NEW_ISSUE[runner:m8:test]:-MISSING} $TICK_DELIVERY_FAILED $escalated"
+    }
+    m8_issue="X"; m8_delivfail="X"; m8_escalated="X"
+    read -r m8_issue m8_delivfail m8_escalated < <(m8_search_fail_test)
+    assert_eq "$m8_issue" "0" "M8/N5 live path: a failed search skips filing — no duplicate created (NEW_ISSUE stays 0)"
+    assert_true "$([[ "$m8_delivfail" -gt 0 ]] && echo 1 || echo 0)" "finding 4: a failed search increments TICK_DELIVERY_FAILED (TICK_DELIVERY_FAILED=$m8_delivfail)"
+    assert_eq "$m8_escalated" "1" "finding 4: TICK_DELIVERY_FAILED>0 computes an exit-code escalation"
+
+    echo "== scenario 20 (M6): FIND_ISSUE_OK must not stay stale-true from an earlier successful search =="
+    m6_stale_global_test() {
+        MODE="live"
+        # NOTE: redefine api() between calls rather than tracking a call
+        # counter inside it — api() is always invoked via `$(api ...)`,
+        # which forks a subshell, so a variable it mutates never
+        # propagates back out (the exact class of bug N1 was about).
+        # Redefining the function itself has no such problem.
+        api() { echo '[]'; return 0; }
+        gh_find_open_issue "[runner-liveness] m6 test"
+        local first_ok="$FIND_ISSUE_OK"
+        api() { return 1; }
+        gh_find_open_issue "[runner-liveness] m6 test"
+        local second_ok="$FIND_ISSUE_OK"
+        echo "$first_ok $second_ok"
+    }
+    m6_first="X"; m6_second="X"
+    read -r m6_first m6_second < <(m6_stale_global_test)
+    assert_eq "$m6_first" "1" "M6: the first (successful) search sets FIND_ISSUE_OK=1"
+    assert_eq "$m6_second" "0" "M6: a SUBSEQUENT failed search resets FIND_ISSUE_OK to 0 — not left stuck at the previous call's stale 1"
+
+    echo "== scenario 21 (finding 7): the OnFailure self-failure issue's close is debounced, not fired on the first healthy tick =="
+    watchdog_debounce_test() {
+        MODE="live"
+        STATE_DIR=$(mktemp -d)
+        api() { echo '[{"number": 55, "title": "[runner-liveness] the liveness checker itself failed to run"}]'; }
+        CLOSE_CALLS=0
+        curl() {
+            for a in "$@"; do
+                [[ "$a" == *'"state":"closed"'* ]] && CLOSE_CALLS=$((CLOSE_CALLS + 1))
+            done
+            return 0
+        }
+        TICK_EXIT_CODE=0
+        close_watchdog_failure_issue_if_open
+        local after1="$CLOSE_CALLS"
+        close_watchdog_failure_issue_if_open
+        local after2="$CLOSE_CALLS"
+        rm -rf "$STATE_DIR"
+        echo "$after1 $after2"
+    }
+    wd_after1="X"; wd_after2="X"
+    read -r wd_after1 wd_after2 < <(watchdog_debounce_test)
+    assert_eq "$wd_after1" "0" "finding 7: first healthy tick after a failure does NOT close the self-failure issue yet (streak 1 < debounce $DEBOUNCE_TICKS)"
+    assert_eq "$wd_after2" "1" "finding 7: second consecutive healthy tick closes it (streak reaches debounce)"
+
+    echo "== scenario 22 (finding 6): runner-list pagination — more than one page of runners must all be seen =="
+    m_pagination_test() {
+        MODE="live"
+        api() {
+            # NOTE: match on "&page=N" (leading &), not "page=N" — the
+            # URL also carries "per_page=100", which itself contains the
+            # bare substring "page=1" ("per_PAGE=1" + "00"). Matching
+            # without the "&" made every page number's request hit the
+            # page-1 branch and masked this test entirely.
+            case "$1" in
+                *"&page=1"*) echo "{\"runners\":[$(python3 -c "print(','.join('{\"name\":\"r%d\",\"status\":\"online\"}' % i for i in range(100)))")]}" ;;
+                *"&page=2"*) echo '{"runners":[{"name":"r100","status":"online"}]}' ;;
+                *) echo '{"runners":[]}' ;;
+            esac
+        }
+        TICK_API_TOTAL=0; TICK_API_FAIL=0
+        GH_RUNNER_STATUS=(); GH_REPO_OK=()
+        REPOS="pneuma"
+        prefetch_github_runners
+        echo "${#GH_RUNNER_STATUS[@]} ${GH_RUNNER_STATUS[pneuma/r100]:-MISSING}"
+    }
+    pg_count="X"; pg_r100="X"
+    read -r pg_count pg_r100 < <(m_pagination_test)
+    assert_eq "$pg_count" "101" "finding 6: prefetch sees all 101 runners across two pages (not just the first page's 100)"
+    assert_eq "$pg_r100" "online" "finding 6: the runner on page 2 (r100) is present in GH_RUNNER_STATUS"
+
     echo
     if [[ "$failures" -eq 0 ]]; then
         echo "SELF-TEST PASSED — the wedge signature and every reviewed bug are covered."
@@ -1381,10 +1585,19 @@ if [[ "$MODE" == "self-test" ]]; then
     exit $?
 fi
 
+TICK_DELIVERY_FAILED=0
 load_state
 run_one_tick
 update_heartbeat
-[[ "$TICK_EXIT_CODE" -eq 0 ]] && close_watchdog_failure_issue_if_open
+close_watchdog_failure_issue_if_open
+# Round-3 review finding 4: detection succeeding is not enough — if a due
+# alert (or the heartbeat) could not actually be DELIVERED this tick,
+# that's a failure of the whole check's purpose even though TICK_EXIT_CODE
+# from run_one_tick alone (which only reflects DETECTION evidence) may
+# still be 0. Escalate, never de-escalate an already-2 exit code.
+if [[ "$TICK_EXIT_CODE" -eq 0 && "$TICK_DELIVERY_FAILED" -gt 0 ]]; then
+    TICK_EXIT_CODE=2
+fi
 exit "$TICK_EXIT_CODE"
 SCRIPT
 sed -i "s|__ALERT_REPO__|$ALERT_REPO|; s|__DEBOUNCE_TICKS__|$DEBOUNCE_TICKS|; s|__QUEUED_ALERT_GRACE__|$QUEUED_ALERT_GRACE|" /usr/local/bin/runner-liveness-check
