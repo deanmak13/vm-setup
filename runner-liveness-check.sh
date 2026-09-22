@@ -602,15 +602,21 @@ gh_find_open_issue() {
     FIND_ISSUE_RESULT=""
     local body
     body=$(api "https://api.github.com/repos/$OWNER/$ALERT_REPO/issues?labels=runner-liveness&state=open&per_page=100") || return
-    FIND_ISSUE_OK=1
-    FIND_ISSUE_RESULT=$(printf '%s' "$body" | python3 -c "
+    # A 2xx whose body isn't the expected JSON list is a failed search
+    # too, not "no match" — only a parsed list sets FIND_ISSUE_OK.
+    local parsed
+    parsed=$(printf '%s' "$body" | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
+if not isinstance(d, list):
+    sys.exit(1)
 title = sys.argv[1]
 for i in d:
     if i.get('title') == title:
         print(i['number']); break
-" "$1" 2>/dev/null)
+" "$1" 2>/dev/null) || return
+    FIND_ISSUE_OK=1
+    FIND_ISSUE_RESULT="$parsed"
 }
 
 file_or_update_issue() {
@@ -1571,6 +1577,45 @@ self_test() {
     assert_eq "$pg_count" "101" "finding 6: prefetch sees all 101 runners across two pages (not just the first page's 100)"
     assert_eq "$pg_r100" "online" "finding 6: the runner on page 2 (r100) is present in GH_RUNNER_STATUS"
 
+    echo "== scenario 23 (finding 7): a 'cannot verify' escalation title carries the [runner-liveness] prefix exactly once =="
+    cv_title_test() {
+        HOLD_COUNT=(); ISSUE_NUM=(); LAST_COMMENT=(); STATE=(); STREAK=()
+        HOLD_COUNT["runner:cv:test"]=$((HOLD_THRESHOLD - 1))
+        hold_key "runner:cv:test" "[runner-liveness] cv/test: wedged self-hosted runner" "test reason" \
+            | sed -n 's/^  would file\/update issue: //p'
+    }
+    cv_title=$(cv_title_test)
+    assert_eq "$cv_title" "[runner-liveness] cannot verify: cv/test: wedged self-hosted runner" "finding 7: escalation title is prefixed once, not '[runner-liveness] cannot verify: [runner-liveness] ...'"
+
+    echo "== scenario 24 (finding 4): heartbeat and comment delivery failures on the REAL live path are counted =="
+    hb_fail_test() {
+        MODE="live"
+        LOG=/dev/null
+        logger() { :; }
+        api() { echo '[{"number": 7, "title": "[runner-liveness] heartbeat"}, {"number": 8, "title": "[runner-liveness] hb/test: x"}]'; }
+        curl() { return 22; }   # every write (PATCH/POST) fails
+        TICK_DELIVERY_FAILED=0
+        update_heartbeat
+        local after_hb="$TICK_DELIVERY_FAILED"
+        ISSUE_NUM=(); LAST_COMMENT=(); NEW_ISSUE=(); NEW_LAST_COMMENT=(); TICK_ACTIONS=()
+        ISSUE_NUM["runner:hb:test"]=8; LAST_COMMENT["runner:hb:test"]=0
+        file_or_update_issue "runner:hb:test" "[runner-liveness] hb/test: x" "body"
+        echo "$after_hb $TICK_DELIVERY_FAILED"
+    }
+    hb_after="X"; hb_total="X"
+    read -r hb_after hb_total < <(hb_fail_test)
+    assert_eq "$hb_after" "1" "finding 4: a failed heartbeat PATCH counts as a delivery failure"
+    assert_eq "$hb_total" "2" "finding 4: a failed comment on an open alert counts as a delivery failure"
+
+    echo "== scenario 25 (finding 4): a 2xx search with a non-list body is a FAILED search, not 'no match' =="
+    bad_body_test() {
+        MODE="live"
+        api() { echo '{"message": "Not Found"}'; }
+        gh_find_open_issue "[runner-liveness] anything"
+        echo "$FIND_ISSUE_OK"
+    }
+    assert_eq "$(bad_body_test)" "0" "finding 4: an error-object body leaves FIND_ISSUE_OK=0 (no duplicate filing)"
+
     echo
     if [[ "$failures" -eq 0 ]]; then
         echo "SELF-TEST PASSED — the wedge signature and every reviewed bug are covered."
@@ -1589,15 +1634,18 @@ TICK_DELIVERY_FAILED=0
 load_state
 run_one_tick
 update_heartbeat
-close_watchdog_failure_issue_if_open
 # Round-3 review finding 4: detection succeeding is not enough — if a due
 # alert (or the heartbeat) could not actually be DELIVERED this tick,
 # that's a failure of the whole check's purpose even though TICK_EXIT_CODE
 # from run_one_tick alone (which only reflects DETECTION evidence) may
-# still be 0. Escalate, never de-escalate an already-2 exit code.
+# still be 0. Escalate, never de-escalate an already-2 exit code. Done
+# BEFORE the watchdog-close step so a heartbeat delivery failure resets
+# that step's healthy streak instead of counting toward closing the
+# "checker failed" issue.
 if [[ "$TICK_EXIT_CODE" -eq 0 && "$TICK_DELIVERY_FAILED" -gt 0 ]]; then
     TICK_EXIT_CODE=2
 fi
+close_watchdog_failure_issue_if_open
 exit "$TICK_EXIT_CODE"
 SCRIPT
 sed -i "s|__ALERT_REPO__|$ALERT_REPO|; s|__DEBOUNCE_TICKS__|$DEBOUNCE_TICKS|; s|__QUEUED_ALERT_GRACE__|$QUEUED_ALERT_GRACE|" /usr/local/bin/runner-liveness-check
