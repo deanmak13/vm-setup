@@ -849,10 +849,12 @@ run_one_tick() {
 
 # Best-effort dead-man's-switch heartbeat: update a single pinned issue's
 # body with the current timestamp so a human can glance and see how
-# recently the checker actually ran. This does NOT alert on its own if
-# the timer stops firing entirely (see the KNOWN REMAINING GAP note at
-# the top of vm-setup/runner-liveness-check.sh) — it only makes that
-# failure mode observable to someone who looks.
+# recently the checker actually ran. It does not alert by itself: a
+# stopped timer is alerted on by runner-reaper's cross-watch (this
+# check's state file going stale). What nothing on the host can alert on
+# — the reaper's own timer stopping too, or the host being down — stays
+# visible here to someone who looks (see WHO WATCHES THE WATCHER at the
+# top of vm-setup/runner-liveness-check.sh).
 update_heartbeat() {
     [[ "$MODE" == "live" ]] || return 0
     local title="[runner-liveness] heartbeat"
