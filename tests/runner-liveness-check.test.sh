@@ -123,6 +123,26 @@ printf '[{"number": 5, "title": "[runner-liveness] heartbeat"}]\n' > "$work/issu
 echo 'PATCH .*/issues/5$' > "$work/fail_pattern"; run
 expect "heartbeat PATCH fails: exits non-zero" 1 "$([[ $RC -ne 0 ]] && echo 1 || echo 0)"
 
+# finding 4: heartbeat CREATE fails (no heartbeat issue yet)
+reset; touch "$work/listener_up"; online online
+echo 'POST .*/issues$' > "$work/fail_pattern"; run
+expect "heartbeat create fails: exits non-zero" 1 "$([[ $RC -ne 0 ]] && echo 1 || echo 0)"
+
+# finding 4: closing a recovered runner's issue fails
+reset; touch "$work/listener_up"; online online
+printf 'runner:pneuma-portal:pneuma-portal-contabo\t2\tdead\t12\t0\t0\n' > "$work/state/streak.tsv"
+printf '[{"number": 5, "title": "[runner-liveness] heartbeat"}]\n' > "$work/issues.json"
+echo 'PATCH .*/issues/12$' > "$work/fail_pattern"
+close_rcs=""
+for _ in 1 2 3; do
+    run
+    [[ $(calls 'PATCH .*/issues/12$') -gt 0 ]] && close_rcs+="$RC "
+done
+expect "resolve-close fails: every tick that tried it exits non-zero" 1 \
+    "$([[ -n "$close_rcs" && ! " $close_rcs" =~ " 0 " ]] && echo 1 || echo 0)"
+expect "resolve-close fails: the issue is kept for a retry, not orphaned" 12 \
+    "$(awk -F'\t' '$1 == "runner:pneuma-portal:pneuma-portal-contabo" {print $4}' "$work/state/streak.tsv")"
+
 # N4: a tracked ghost survives a tick where its repo's runner fetch fails
 reset; touch "$work/listener_up"; online online
 printf 'ghost:pneuma-ops:orphan\t3\tdead\t77\t0\t0\n' > "$work/state/streak.tsv"

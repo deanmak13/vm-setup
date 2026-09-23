@@ -839,12 +839,10 @@ run_one_tick() {
     if [[ "$TICK_API_TOTAL" -gt 0 && "$TICK_API_TOTAL" -eq "$TICK_API_FAIL" ]]; then
         TICK_EXIT_CODE=2
     fi
-    # Round-3 review finding 4: also computed here (not only in the
-    # top-level live dispatch) so --self-test, which never reaches that
-    # dispatch, can assert on it per simulated tick.
-    if [[ "$TICK_EXIT_CODE" -eq 0 && "$TICK_DELIVERY_FAILED" -gt 0 ]]; then
-        TICK_EXIT_CODE=2
-    fi
+    # Delivery failures escalate the exit code in ONE place, the top-level
+    # live dispatch (after the heartbeat, whose failures count too). A
+    # second copy here was unobservable — nothing reads TICK_EXIT_CODE
+    # between the two — so no test could prove either (round-4 review N12).
 }
 
 # Best-effort dead-man's-switch heartbeat: update a single pinned issue's
