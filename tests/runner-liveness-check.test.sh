@@ -187,6 +187,8 @@ run; expect "healthy tick 1 after a failure: self-failure issue left open" 0 "$(
 touch "$work/kill_on_curl"; run; kill_rc=$RC
 rm -f "$work/tmp/"*   # a SIGKILL skips the EXIT trap; on the host PrivateTmp=yes discards this
 expect "a tick SIGKILLed mid-way (exit 137)" 137 "$kill_rc"
+expect "even a SIGKILLed tick leaves no token under STATE_DIR (the header file lives in the unit's private /tmp)" 0 \
+    "$(grep -rlF tok-test "$work/state" | wc -l)"
 run; expect "healthy tick after the killed one: still left open (streak was reset)" 0 "$(calls 'PATCH .*/issues/55$')"
 run; expect "second consecutive healthy tick: closed" 1 "$(calls 'PATCH .*/issues/55$')"
 
