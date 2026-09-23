@@ -109,6 +109,11 @@ done
 
 install -m 600 "$TOKEN_FILE" /root/.runner-reaper-token
 log "token installed at /root/.runner-reaper-token"
+# Every alert search filters on the runner-liveness label; without it each
+# tick would file a duplicate. Ensure it exists before any timer starts.
+install -m 755 "$REPO_DIR/bin/runner-alert-label" /usr/local/bin/runner-alert-label
+/usr/local/bin/runner-alert-label /root/.runner-reaper-token "$ALERT_REPO" \
+    || err "could not ensure the runner-liveness label in deanmak13/$ALERT_REPO (token needs Issues: write there)"
 
 mkdir -p /var/lib/runner-reaper
 
