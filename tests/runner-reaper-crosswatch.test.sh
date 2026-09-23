@@ -69,13 +69,14 @@ STALE_TITLE="[runner-liveness] the liveness checker's timer appears to have stop
 FAILURE_TITLE="[runner-reaper] runner-reaper failed (crash or undelivered alert)"
 
 RC=0
-run() {  # [config] — one reaper run; sets RC, leaves curl.calls/reaper.log for inspection
+run() {  # [config] [reaper args...] — one reaper run; sets RC, leaves curl.calls/reaper.log for inspection
+    local config="${1:-$work/config}"; shift || true
     : > "$work/curl.calls"; : > "$work/reaper.log"
     RC=0
     # setsid: its own process group, so the curl stub's kill_on_curl can
     # SIGKILL the whole run (a crash mid-run) without touching this test.
-    ( RUNNER_REAPER_CONFIG="${1:-$work/config}" TMPDIR="$work/tmp" PATH="$work/stub:$PATH" \
-        setsid -w bash "$REAPER_BIN" >/dev/null 2>&1; exit $? ) 2>/dev/null || RC=$?
+    ( RUNNER_REAPER_CONFIG="$config" TMPDIR="$work/tmp" PATH="$work/stub:$PATH" \
+        setsid -w bash "$REAPER_BIN" "$@" >/dev/null 2>&1; exit $? ) 2>/dev/null || RC=$?
 }
 stale() { touch -d "@$(( $(date +%s) - $1 ))" "$work/lstate/streak.tsv"; }
 calls() { grep -c -- "$1" "$work/curl.calls" || true; }
@@ -147,6 +148,14 @@ expect "fresh again: run succeeds" 0 "$RC"
 reset; open_issues 21 "$STALE_TITLE"; touch "$work/lstate/streak.tsv"; echo 'PATCH' > "$work/fail_pattern"; run
 expect "close fails: run exits non-zero" 1 "$RC"
 
+# ── --dry-run writes nothing to GitHub ─────────────────────────────────
+reset; stale 1300; run "$work/config" --dry-run
+expect "--dry-run, stale: nothing filed" 0 "$(calls 'POST')"
+expect "--dry-run, stale: the would-be alert is logged" 1 "$(grep -c 'DRY-RUN: would file/update liveness-timer-stale issue' "$work/reaper.log" || true)"
+reset; open_issues 21 "$STALE_TITLE"; touch "$work/lstate/streak.tsv"; run "$work/config" --dry-run
+expect "--dry-run, fresh with issue open: nothing closed" 0 "$(calls 'PATCH')"
+expect "--dry-run, fresh: the would-be close is logged" 1 "$(grep -c 'DRY-RUN: would close liveness-timer-stale issue #21' "$work/reaper.log" || true)"
+
 # ── --alert-repo is honoured ─────────────────────────────────────────────
 reset; stale 1300; run "$work/config-alt"
 expect "--alert-repo my-alerts: issue filed there" 1 "$(calls 'POST .*/repos/deanmak13/my-alerts/issues$')"
@@ -168,6 +177,8 @@ expect "a run SIGKILLed mid-way (exit 137)" 137 "$kill_rc"
 expect "a run SIGKILLed mid-way resets the healthy streak: next healthy run does not close" 0 "$(calls 'PATCH .*/issues/30$')"
 run
 expect "two healthy runs after the kill: closed" 1 "$(calls 'PATCH .*/issues/30$')"
+reset; open_issues 30 "$FAILURE_TITLE"; touch "$work/lstate/streak.tsv"; run; echo 'PATCH' > "$work/fail_pattern"; run
+expect "closing the OnFailure issue fails: logged for a retry next run" 1 "$(grep -c 'FAILED to close reaper self-failure issue #30' "$work/reaper.log" || true)"
 
 # ── installer wiring ─────────────────────────────────────────────────────
 expect "runner-reaper.service declares its OnFailure unit" 1 \
