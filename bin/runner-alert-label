@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# runner-alert-label <token-file> <alert-repo> — make sure the `runner-liveness`
+# label exists in deanmak13/<alert-repo>. Idempotent: an existing label is left
+# untouched.
+#
+# Every CI-host watchdog (runner-liveness-check, runner-reaper's cross-watch,
+# runner-failure-alert) finds its open alert by listing issues with
+# ?labels=runner-liveness. If the label does not exist, a new issue is filed
+# without it (a fine-grained token cannot rely on GitHub creating it on the
+# fly), the search never matches, and every tick files a duplicate. So both
+# installers run this before starting any timer and abort if it fails.
+#
+# The token goes to curl through a mode-600 header file, never argv.
+set -uo pipefail
+
+LABEL=runner-liveness
+OWNER=deanmak13
+TOKEN_FILE="${1:-}"
+ALERT_REPO="${2:-}"
+[[ -n "$TOKEN_FILE" && "$ALERT_REPO" =~ ^[A-Za-z0-9._-]+$ ]] \
+    || { echo "usage: runner-alert-label <token-file> <alert-repo>" >&2; exit 2; }
+TOKEN=$(cat "$TOKEN_FILE" 2>/dev/null) && [[ -n "$TOKEN" ]] \
+    || { echo "runner-alert-label: no token in $TOKEN_FILE" >&2; exit 1; }
+
+AUTH_HEADER_FILE=$(mktemp)
+trap 'rm -f "$AUTH_HEADER_FILE"' EXIT
+( umask 077; printf 'Authorization: Bearer %s\n' "$TOKEN" > "$AUTH_HEADER_FILE" )
+
+gh_status() {  # <method> <url> [body] — prints only the HTTP status code
+    local extra=()
+    [[ $# -ge 3 ]] && extra=(-d "$3")
+    curl -s -o /dev/null -w '%{http_code}' -m 20 -X "$1" -H @"$AUTH_HEADER_FILE" \
+        -H "Accept: application/vnd.github+json" "$2" "${extra[@]}"
+}
+
+code=$(gh_status GET "https://api.github.com/repos/$OWNER/$ALERT_REPO/labels/$LABEL")
+case "$code" in
+    200) echo "label '$LABEL' already exists in $OWNER/$ALERT_REPO"; exit 0 ;;
+    404) ;;
+    *) echo "runner-alert-label: checking for label '$LABEL' in $OWNER/$ALERT_REPO failed (HTTP ${code:-none})" >&2; exit 1 ;;
+esac
+
+code=$(gh_status POST "https://api.github.com/repos/$OWNER/$ALERT_REPO/labels" \
+    "{\"name\":\"$LABEL\",\"color\":\"d93f0b\",\"description\":\"Filed by the CI-host runner watchdogs (runner-liveness-check, runner-reaper)\"}")
+case "$code" in
+    201) echo "created label '$LABEL' in $OWNER/$ALERT_REPO" ;;
+    422) echo "label '$LABEL' already exists in $OWNER/$ALERT_REPO (created concurrently)" ;;
+    *) echo "runner-alert-label: creating label '$LABEL' in $OWNER/$ALERT_REPO failed (HTTP ${code:-none}) — the token needs Issues: write on it" >&2; exit 1 ;;
+esac
