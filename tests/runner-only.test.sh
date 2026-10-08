@@ -23,6 +23,13 @@ grep -qx 'registered:pneuma-terraformer' "$work/result"
 RUNNER_HOME="$work/home" bash "$BOOTSTRAP" --runners-only --runner-repo pneuma-terraformer --plan-runners > "$work/plan"
 grep -q 'pneuma-terraformer-contabo would be registered' "$work/plan"
 ! grep -q 'pneuma-engine\|pneuma-portal' "$work/plan"
+# Artifact repositories must have an enabled, selectable runner on the
+# approved build lane. Exercise the real selector rather than matching source.
+for repo in pneuma-terraformer pneuma-mem0; do
+  selected=$(RUNNER_HOME="$work/home" bash "$BOOTSTRAP" --runners-only --runner-repo "$repo" --plan-runners)
+  expected="[ci-builder-bootstrap] plan: $repo-contabo would be registered for deanmak13/$repo in $work/home/actions-runner-$repo-contabo (labels: self-hosted,ci-builder; enabled: y)"
+  test "$selected" = "$expected"
+done
 # Invalid selection must fail before registering anything.
 if RUNNER_HOME="$work/home" bash "$BOOTSTRAP" --runners-only --runner-repo unknown-repo --plan-runners > "$work/invalid" 2>&1; then
   echo 'FAIL unknown runner repo accepted'; exit 1

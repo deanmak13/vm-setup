@@ -53,8 +53,8 @@ err() { echo "[ci-builder-bootstrap] ERROR: $*" >&2; exit 1; }
 # and deployments-3: >5 concurrent jobs made every job slower on the shared
 # host), plus pneuma-ops, whose scheduled [self-hosted, ci-builder] workflows
 # had queued unrun since the migration because no runner was ever registered
-# for that repo. pneuma-branding/-docs/-mem0 run on ubuntu-latest only, so
-# they have no row.
+# for that repo. Terraformer and mem0 artifact builds also select ci-builder.
+# pneuma-branding/-docs run on ubuntu-latest only, so they have no row.
 #
 # GitHub adds self-hosted/Linux/X64 itself. The labels column is the lane the
 # workflows' runs-on: selects: `ci-builder` for gate jobs, `ci-builder-build`
@@ -77,6 +77,7 @@ pneuma-deployments pneuma-deployments-contabo ci-builder y
 pneuma-deployments pneuma-deployments-contabo-2 ci-builder y
 pneuma-ops pneuma-ops-contabo ci-builder y
 pneuma-terraformer pneuma-terraformer-contabo ci-builder y
+pneuma-mem0 pneuma-mem0-contabo ci-builder y
 EOF
 )
 RUNNER_BASE_LABELS="self-hosted"
