@@ -30,7 +30,11 @@
 #   any step runs: nothing installed, downloaded or registered, no token
 #   needed. The way to check the inventory against a live host.
 #
+# --runners-only registers runners without packages, Docker, watchdogs or OpenBao setup.
+# --runner-repo REPO narrows that mode to entries in the canonical inventory.
+#
 # Safe to re-run: every step checks for existing state before acting.
+set +x  # Registration credentials must never appear in shell tracing.
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -38,24 +42,11 @@ OWNER=deanmak13
 GH_TOKEN_FILE=""
 STATE_TARBALL=""
 PLAN_RUNNERS=0
+RUNNERS_ONLY=0
+RUNNER_REPO=""
 
 log() { echo "[ci-builder-bootstrap] $*"; }
 err() { echo "[ci-builder-bootstrap] ERROR: $*" >&2; exit 1; }
-
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --gh-token-file) GH_TOKEN_FILE="$2"; shift 2 ;;
-        --state-tarball) STATE_TARBALL="$2"; shift 2 ;;
-        --plan-runners) PLAN_RUNNERS=1; shift ;;
-        *) err "Unknown argument: $1" ;;
-    esac
-done
-
-if (( ! PLAN_RUNNERS )); then
-    [[ $EUID -eq 0 ]] || err "run as root"
-    [[ -n "$GH_TOKEN_FILE" && -f "$GH_TOKEN_FILE" ]] || err "--gh-token-file is required and must exist"
-    GH_TOKEN=$(cat "$GH_TOKEN_FILE")
-fi
 
 # Runner inventory — one row per runner. Mirrors the live ci-builder as of
 # 2026-09-02 (12 services after the 2026-09-01 drain of engine-3/-4, portal-3
@@ -85,6 +76,7 @@ pneuma-helm-charts pneuma-helm-charts-contabo ci-builder y
 pneuma-deployments pneuma-deployments-contabo ci-builder y
 pneuma-deployments pneuma-deployments-contabo-2 ci-builder y
 pneuma-ops pneuma-ops-contabo ci-builder y
+pneuma-terraformer pneuma-terraformer-contabo ci-builder y
 EOF
 )
 RUNNER_BASE_LABELS="self-hosted"
@@ -95,6 +87,86 @@ RUNNER_VERSION="2.336.0"
 RUNNER_HOME="${RUNNER_HOME:-/home/ubuntu}"
 runner_dir() { printf '%s/actions-runner-%s\n' "$RUNNER_HOME" "$1"; }
 
+register_runners() {
+# ── 9. Register GitHub Actions runners ──────────────────────────────────
+id ubuntu &>/dev/null || useradd -m -s /bin/bash ubuntu
+usermod -aG docker ubuntu 2>/dev/null || true
+
+mint_reg_token() {
+    curl -sf -X POST \
+        -H "Authorization: Bearer $GH_TOKEN" \
+        -H "Accept: application/vnd.github+json" \
+        "https://api.github.com/repos/$OWNER/$1/actions/runners/registration-token" \
+        | jq -r .token
+}
+
+while read -r repo runner_name labels enabled; do
+    [[ -n "$repo" ]] || continue
+    dir=$(runner_dir "$runner_name")
+    runner_labels="$RUNNER_BASE_LABELS,$labels"
+
+    if [[ -f "$dir/.runner" ]]; then
+        log "runner $runner_name already registered in $dir — skipping"
+        continue
+    fi
+
+    log "registering $runner_name for $OWNER/$repo (labels: $runner_labels)"
+    su - ubuntu -c "mkdir -p '$dir'"
+    su - ubuntu -c "
+        cd '$dir' &&
+        curl -fsSL -o actions-runner.tar.gz \
+          https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz &&
+        tar xzf actions-runner.tar.gz && rm actions-runner.tar.gz
+    "
+    REG_TOKEN=$(mint_reg_token "$repo")
+    [[ -n "$REG_TOKEN" && "$REG_TOKEN" != "null" ]] || err "failed to mint registration token for $repo"
+    su - ubuntu -c "
+        cd '$dir' &&
+        ./config.sh --unattended \
+          --url https://github.com/$OWNER/$repo \
+          --token '$REG_TOKEN' \
+          --name '$runner_name' \
+          --labels '$runner_labels' \
+          --work _work
+    "
+    ( cd "$dir" && ./svc.sh install ubuntu )
+    if [[ "$enabled" == "y" ]]; then
+        ( cd "$dir" && ./svc.sh start )
+    else
+        log "  $runner_name is disabled in the inventory — service installed but left stopped"
+        systemctl disable "actions.runner.$OWNER-$repo.$runner_name.service" 2>/dev/null || true
+        systemctl stop "actions.runner.$OWNER-$repo.$runner_name.service" 2>/dev/null || true
+    fi
+done <<< "$RUNNERS"
+
+}
+
+require_root() { [[ $EUID -eq 0 ]] || err "run as root"; }
+
+main() {
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --gh-token-file) GH_TOKEN_FILE="$2"; shift 2 ;;
+        --state-tarball) STATE_TARBALL="$2"; shift 2 ;;
+        --runners-only) RUNNERS_ONLY=1; shift ;;
+        --runner-repo) RUNNER_REPO="$2"; shift 2 ;;
+        --plan-runners) PLAN_RUNNERS=1; shift ;;
+        *) err "Unknown argument: $1" ;;
+    esac
+done
+
+if [[ -n "$RUNNER_REPO" ]]; then
+    (( RUNNERS_ONLY )) || err "--runner-repo requires --runners-only"
+    RUNNERS=$(awk -v repo="$RUNNER_REPO" '$1 == repo' <<< "$RUNNERS")
+    [[ -n "$RUNNERS" ]] || err "unknown runner repo: $RUNNER_REPO"
+fi
+
+if (( ! PLAN_RUNNERS )); then
+    require_root
+    [[ -n "$GH_TOKEN_FILE" && -f "$GH_TOKEN_FILE" ]] || err "--gh-token-file is required and must exist"
+    GH_TOKEN=$(cat "$GH_TOKEN_FILE")
+fi
+
 if (( PLAN_RUNNERS )); then
     while read -r repo runner_name labels enabled; do
         [[ -n "$repo" ]] || continue
@@ -104,7 +176,13 @@ if (( PLAN_RUNNERS )); then
             log "plan: $runner_name would be registered for $OWNER/$repo in $(runner_dir "$runner_name") (labels: $RUNNER_BASE_LABELS,$labels; enabled: $enabled)"
         fi
     done <<< "$RUNNERS"
-    exit 0
+    return 0
+fi
+
+if (( RUNNERS_ONLY )); then
+    [[ "$(hostname)" == "vmi3387590" ]] || err "runner-only setup requires the approved ci-builder host"
+    register_runners
+    return 0
 fi
 
 # ── Host-only from here [host-only-begin] ────────────────────────────────
@@ -236,56 +314,7 @@ fi
 bash "$REPO_DIR/runner-refresh.sh"
 bash "$REPO_DIR/ci-disk-janitor.sh"
 
-# ── 9. Register GitHub Actions runners ──────────────────────────────────
-id ubuntu &>/dev/null || useradd -m -s /bin/bash ubuntu
-usermod -aG docker ubuntu 2>/dev/null || true
-
-mint_reg_token() {
-    curl -sf -X POST \
-        -H "Authorization: Bearer $GH_TOKEN" \
-        -H "Accept: application/vnd.github+json" \
-        "https://api.github.com/repos/$OWNER/$1/actions/runners/registration-token" \
-        | jq -r .token
-}
-
-while read -r repo runner_name labels enabled; do
-    [[ -n "$repo" ]] || continue
-    dir=$(runner_dir "$runner_name")
-    runner_labels="$RUNNER_BASE_LABELS,$labels"
-
-    if [[ -f "$dir/.runner" ]]; then
-        log "runner $runner_name already registered in $dir — skipping"
-        continue
-    fi
-
-    log "registering $runner_name for $OWNER/$repo (labels: $runner_labels)"
-    su - ubuntu -c "mkdir -p '$dir'"
-    su - ubuntu -c "
-        cd '$dir' &&
-        curl -fsSL -o actions-runner.tar.gz \
-          https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz &&
-        tar xzf actions-runner.tar.gz && rm actions-runner.tar.gz
-    "
-    REG_TOKEN=$(mint_reg_token "$repo")
-    [[ -n "$REG_TOKEN" && "$REG_TOKEN" != "null" ]] || err "failed to mint registration token for $repo"
-    su - ubuntu -c "
-        cd '$dir' &&
-        ./config.sh --unattended \
-          --url https://github.com/$OWNER/$repo \
-          --token '$REG_TOKEN' \
-          --name '$runner_name' \
-          --labels '$runner_labels' \
-          --work _work
-    "
-    ( cd "$dir" && ./svc.sh install ubuntu )
-    if [[ "$enabled" == "y" ]]; then
-        ( cd "$dir" && ./svc.sh start )
-    else
-        log "  $runner_name is disabled in the inventory — service installed but left stopped"
-        systemctl disable "actions.runner.$OWNER-$repo.$runner_name.service" 2>/dev/null || true
-        systemctl stop "actions.runner.$OWNER-$repo.$runner_name.service" 2>/dev/null || true
-    fi
-done <<< "$RUNNERS"
+register_runners
 
 # --- OpenBao access for CI (cloudflared Access TCP proxy) ---
 # Declarative replacement for the old "ssh -R 18200 reverse tunnel, nobody
@@ -316,3 +345,8 @@ log "  systemctl list-timers | grep -E 'reaper|janitor'"
 log "  systemctl status cloudflared-access-openbao"
 log "OPEN ITEM: run the WireGuard manifest apply command printed in step 7 (not automated)."
 # [host-only-end]
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

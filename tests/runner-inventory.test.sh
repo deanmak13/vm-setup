@@ -160,7 +160,8 @@ check "coverage.sh excludes one begin:end region" test "$(wc -w <<< "$region")" 
 expect_out "the begin marker heads the comment block that precedes step 1" \
     "# ── 1. Packages ──────────────────────────────────────────────────────────" \
     bash -c 'grep -n -F "$2" "$1" | cut -d: -f1 | { read -r n; sed -n "$((n + 6))p" "$1"; }' _ "$BOOTSTRAP" "${region%% *}"
-expect_out "the end marker is the bootstrap's last line" "# ${region##* }" tail -n 1 "$BOOTSTRAP"
+expect_out "the end marker closes host setup before the guarded entry point" "}" \
+    bash -c 'grep -A1 -F "$2" "$1" | tail -n 1' _ "$BOOTSTRAP" "# ${region##* }"
 check "each marker appears exactly once" \
     bash -c 'test "$(grep -cF "$2" "$1")" -eq 1 && test "$(grep -cF "$3" "$1")" -eq 1' _ "$BOOTSTRAP" "${region%% *}" "${region##* }"
 
