@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# pneuma-remote-gate — dev-box client: run a repo's pre-push gate for one exact
+# commit on the build host (ci-builder) and bring the verdict + log back.
+#
+#   pneuma-remote-gate --head SHA --base SHA [--repo-dir DIR] [--profile NAME]
+#                      [--host ci-builder] [--log-dir DIR]
+#
+# Defaults: --repo-dir = cwd's repo, --profile = repo directory name with any
+# leading "pneuma-" kept (profile files are gate-profiles/<name>.sh).
+#
+# Exit status (the ONLY trusted signal; a PASS means exactly head+tree):
+#   0   gate GREEN on the builder for this head and tree
+#   1   gate RED
+#   75  no verdict (builder unreachable / refused / disk>=85% / queue timeout /
+#       result for a different commit) — treated as NOT green by callers
+#
+# What ships is the commit, never the worktree: a git bundle of head (and base)
+# minus whatever the builder already holds. No credentials cross the wire; the
+# builder runs the gate in a scrubbed environment with no ambient secrets.
+set -uo pipefail
+
+HOST="${PNEUMA_GATE_HOST:-ci-builder}"
+EXPECT_HOST="${PNEUMA_GATE_EXPECT_HOST-vmi3387590}"
+RUNNER="${PNEUMA_GATE_RUNNER:-/usr/local/bin/pneuma-gate-runner}"
+SSH_OPTS=(-o BatchMode=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=6 -o ConnectTimeout=20)
+PROBE_DEPTH="${PNEUMA_GATE_PROBE_DEPTH:-300}"
+
+head="" base="" repo_dir="" profile="" log_dir=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --head) head="$2"; shift 2;; --base) base="$2"; shift 2;;
+    --repo-dir) repo_dir="$2"; shift 2;; --profile) profile="$2"; shift 2;;
+    --host) HOST="$2"; shift 2;; --log-dir) log_dir="$2"; shift 2;;
+    *) echo "pneuma-remote-gate: unknown argument $1" >&2; exit 2;;
+  esac
+done
+
+# The caller's git hook exports GIT_DIR & friends; resolve everything explicitly.
+G() { env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_OBJECT_DIRECTORY \
+        -u GIT_ALTERNATE_OBJECT_DIRECTORIES -u GIT_COMMON_DIR -u GIT_PREFIX git -C "$repo_dir" "$@"; }
+nogate() { echo "pneuma-remote-gate: $*" >&2; exit 75; }
+
+[ -n "$repo_dir" ] || repo_dir="$(git rev-parse --show-toplevel 2>/dev/null)" || nogate "not inside a git repo (use --repo-dir)"
+head="$(G rev-parse --verify --quiet "${head}^{commit}")" || nogate "--head is not a commit in $repo_dir"
+base="$(G rev-parse --verify --quiet "${base}^{commit}")" || nogate "--base is not a commit in $repo_dir"
+tree="$(G rev-parse "${head}^{tree}")"
+repo="$(basename "$(G rev-parse --show-toplevel)")"
+[ -n "$profile" ] || profile="$repo"
+common="$(G rev-parse --path-format=absolute --git-common-dir)"
+[ -n "$log_dir" ] || log_dir="$common/pneuma-remote-gate"
+mkdir -p "$log_dir" || nogate "cannot create $log_dir"
+log="$log_dir/${head:0:12}-$(date -u +%Y%m%dT%H%M%SZ).log"
+
+echo "remote-gate: $repo ${head:0:12} (tree ${tree:0:12}) base ${base:0:12} -> $HOST profile=$profile" >&2
+echo "remote-gate: log $log" >&2
+
+# 1) Which of our recent ancestors does the builder already hold? Bundle only the delta.
+cands=$( { echo "$base"; G rev-list --first-parent --max-count="$PROBE_DEPTH" "$head"; } | awk '!s[$0]++')
+have=$(printf '%s\n' "$cands" | xargs ssh "${SSH_OPTS[@]}" "$HOST" "$RUNNER have --repo $repo" 2>"$log.err") \
+  || { cat "$log.err" >&2; nogate "cannot reach $HOST (ssh failed) — no verdict"; }
+prereq=$(printf '%s\n' "$cands" | grep -Fx -f <(printf '%s\n' "$have") | grep -vFx "$head" | head -1 || true)
+
+# 2) Bundle: head (+ base) minus what the builder has. Temp refs name the tips.
+tmpref_head="refs/pneuma-gate/head-${head:0:12}"; tmpref_base="refs/pneuma-gate/base-${base:0:12}"
+bundle="$(mktemp "${TMPDIR:-/tmp}/pneuma-gate-bundle.XXXXXX")"
+cleanup() { G update-ref -d "$tmpref_head" 2>/dev/null; G update-ref -d "$tmpref_base" 2>/dev/null; [ -n "${origin_main:-}" ] && G update-ref -d "$tmpref_om" 2>/dev/null; rm -f "$bundle" "$log.err"; }
+trap cleanup EXIT
+G update-ref "$tmpref_head" "$head" && G update-ref "$tmpref_base" "$base" || nogate "cannot name bundle tips"
+# origin/main as this checkout last fetched it: guards resolve it, so it travels too.
+origin_main="$(G rev-parse --verify --quiet 'refs/remotes/origin/main^{commit}' || true)"
+tmpref_om="refs/pneuma-gate/om-${origin_main:0:12}"
+refs=("$tmpref_head")
+if [ -n "$origin_main" ]; then G update-ref "$tmpref_om" "$origin_main"; refs+=("$tmpref_om"); fi
+[ "$base" != "$head" ] && refs+=("$tmpref_base")
+if [ -n "$prereq" ] && [ "$prereq" != "$head" ]; then
+  G bundle create "$bundle" "${refs[@]}" "^$prereq" >/dev/null 2>&1 \
+    || G bundle create "$bundle" "${refs[@]}" >/dev/null 2>&1 || nogate "git bundle failed"
+else
+  G bundle create "$bundle" "${refs[@]}" >/dev/null 2>&1 || nogate "git bundle failed"
+fi
+# Same scope knobs the local hook honours travel with the commit.
+fwd_args=()
+[ "${PNEUMA_PREPUSH_FULL:-}" = 1 ] && fwd_args+=(--env PNEUMA_PREPUSH_FULL=1)
+shallow_args=()
+[ -n "$origin_main" ] && fwd_args+=(--origin-main "$origin_main")
+shallow_file="$(G rev-parse --path-format=absolute --git-path shallow)"
+if [ -s "$shallow_file" ]; then
+  # only the boundary commits that actually lie under what we ship
+  sl=$(while read -r s; do
+         if G merge-base --is-ancestor "$s" "$head" 2>/dev/null || G merge-base --is-ancestor "$s" "$base" 2>/dev/null \
+            || { [ -n "$origin_main" ] && G merge-base --is-ancestor "$s" "$origin_main" 2>/dev/null; }; then echo "$s"; fi
+       done < "$shallow_file" | paste -sd, -)
+  [ -n "$sl" ] && shallow_args=(--shallow "$sl")
+fi
+echo "remote-gate: shipping $(du -h "$bundle" | cut -f1) bundle (builder already has ${prereq:+${prereq:0:12}}${prereq:+ and older}${prereq:-nothing yet})" >&2
+
+# 3) Run. Output streams back live; the verdict is the PNEUMA_GATE_RESULT marker.
+ssh "${SSH_OPTS[@]}" "$HOST" "$RUNNER run --profile $profile --repo $repo --head $head --base $base --tree $tree --bundle ${shallow_args[*]:-} ${fwd_args[*]:-}" \
+  < "$bundle" 2>&1 | tee "$log" >&2
+ssh_rc=${PIPESTATUS[0]}
+
+marker=$(grep '^PNEUMA_GATE_RESULT ' "$log" | tail -1)
+[ -n "$marker" ] || nogate "no PNEUMA_GATE_RESULT marker (ssh exit $ssh_rc) — treating as NOT green; log $log"
+field() { printf '%s' "$marker" | tr ' ' '\n' | sed -n "s/^$1=//p" | head -1; }
+[ "$(field head)" = "$head" ] && [ "$(field tree)" = "$tree" ] \
+  || nogate "result is for head=$(field head) tree=$(field tree), expected $head/$tree — NOT green"
+[ -z "$EXPECT_HOST" ] || [ "$(field host)" = "$EXPECT_HOST" ] \
+  || nogate "result came from host '$(field host)', not the approved builder $EXPECT_HOST — NOT green"
+rc="$(field exit)"
+case "$rc" in
+  0) echo "remote-gate: GREEN for ${head:0:12} on $(field host) in $(field elapsed)  (log $log)" >&2; exit 0;;
+  1) echo "remote-gate: RED for ${head:0:12} on $(field host) in $(field elapsed)  (log $log)" >&2; exit 1;;
+  *) nogate "no verdict (exit=$rc $(printf '%s' "$marker" | sed -n 's/.*\(reason=.*\)/\1/p')) — NOT green; log $log";;
+esac
