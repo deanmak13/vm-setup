@@ -47,9 +47,10 @@
 # the checker itself ever fails to run.
 #
 # WHERE IT ALERTS: files/updates a GitHub issue in deanmak13/vm-setup
-# (labelled `runner-liveness`), using the SAME GitHub token already
-# installed for runner-reaper (classic PAT, `repo` scope — already
-# sufficient for issues:write, no new credential). This was chosen over
+# (labelled `runner-liveness`), using a fine-grained token with the
+# grants listed under "Token (least privilege)" below (the installer
+# can reuse the one already installed for runner-reaper, which needs the
+# same grants — no new credential). This was chosen over
 # routing through the pneuma-deployments Grafana/Pushgateway alerting
 # stack (which has a working Slack/Pushover path) because ci-builder is
 # NOT a node of the TST k3s cluster and has no network route to its
@@ -130,7 +131,7 @@
 #   - nothing else.
 # The installer copies the token from --token-file (falling back to the
 # already-installed reaper token at /root/.runner-reaper-token if
-# --token-file is omitted) to its own /root/.runner-liveness-token, so
+# --token-file is omitted; an already-installed liveness token is kept) to its own /root/.runner-liveness-token, so
 # this check's credential lifecycle is independent of runner-reaper's.
 #
 # Usage:
@@ -180,7 +181,16 @@ done
 
 if [[ -n "$TOKEN_FILE" ]]; then
     [[ -f "$TOKEN_FILE" ]] || err "--token-file given but does not exist: $TOKEN_FILE"
-    install -m 600 "$TOKEN_FILE" /root/.runner-liveness-token
+    # Re-running the installer with the installed token as its own source
+    # (--token-file /root/.runner-liveness-token) is a no-op, not an
+    # "are the same file" abort of the whole install.
+    if [[ "$TOKEN_FILE" -ef /root/.runner-liveness-token ]]; then
+        chmod 600 /root/.runner-liveness-token
+    else
+        install -m 600 "$TOKEN_FILE" /root/.runner-liveness-token
+    fi
+elif [[ -f /root/.runner-liveness-token ]]; then
+    log "no --token-file given — keeping the already-installed /root/.runner-liveness-token"
 elif [[ -f /root/.runner-reaper-token ]]; then
     install -m 600 /root/.runner-reaper-token /root/.runner-liveness-token
     log "no --token-file given — copied the existing runner-reaper token (it needs the same grants; see this file's header)"

@@ -458,23 +458,29 @@ FIND_ISSUE_RESULT=""
 
 gh_find_open_issue() {
     # $1=title (exact match). Sets FIND_ISSUE_OK (1/0) + FIND_ISSUE_RESULT.
+    # Searches the runner-liveness label first; if that finds nothing, falls
+    # back to an exact-title search of ALL open issues, so an alert whose
+    # label was removed by hand is still found instead of duplicated.
     FIND_ISSUE_OK=0
     FIND_ISSUE_RESULT=""
-    local body
-    body=$(api "https://api.github.com/repos/$OWNER/$ALERT_REPO/issues?labels=runner-liveness&state=open&per_page=100") || return
-    # A 2xx whose body isn't the expected JSON list is a failed search
-    # too, not "no match" — only a parsed list sets FIND_ISSUE_OK.
-    local parsed
-    parsed=$(printf '%s' "$body" | python3 -c "
+    local base="https://api.github.com/repos/$OWNER/$ALERT_REPO/issues?state=open&per_page=100"
+    local query body parsed
+    for query in "&labels=runner-liveness" ""; do
+        body=$(api "$base$query") || return
+        # A 2xx whose body isn't the expected JSON list is a failed search
+        # too, not "no match" — only a parsed list sets FIND_ISSUE_OK.
+        parsed=$(printf '%s' "$body" | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
 if not isinstance(d, list):
     sys.exit(1)
 title = sys.argv[1]
 for i in d:
-    if i.get('title') == title:
+    if i.get('title') == title and 'pull_request' not in i:
         print(i['number']); break
 " "$1" 2>/dev/null) || return
+        [[ -n "$parsed" ]] && break
+    done
     FIND_ISSUE_OK=1
     FIND_ISSUE_RESULT="$parsed"
 }
@@ -902,6 +908,7 @@ print(json.dumps({'title': sys.argv[1], 'body': sys.argv[2], 'labels': ['runner-
 # far writes the real value — so a run killed part-way (OOM, SIGKILL,
 # timeout) counts as a failure, never as a healthy tick that could close
 # the issue early.
+CLOSE_FAIL_ESCALATE_AFTER=6   # consecutive failed closes (~30 min at the 5-min cadence) before the run fails
 WATCHDOG_PREV_STREAK=0
 watchdog_streak_begin() {
     [[ "$MODE" == "live" ]] || return 0
@@ -914,6 +921,7 @@ watchdog_streak_begin() {
 close_watchdog_failure_issue_if_open() {
     [[ "$MODE" == "live" ]] || return 0
     local streak_file="$STATE_DIR/watchdog-healthy-streak"
+    local fail_file="$STATE_DIR/watchdog-close-failures"
     local streak="$WATCHDOG_PREV_STREAK"
     if [[ "$TICK_EXIT_CODE" -ne 0 ]]; then
         WATCHDOG_PREV_STREAK=0
@@ -936,8 +944,21 @@ close_watchdog_failure_issue_if_open() {
     curl -sf -m 20 -X PATCH -H @"$AUTH_HEADER_FILE" -H "Accept: application/vnd.github+json" \
         "https://api.github.com/repos/$OWNER/$ALERT_REPO/issues/$existing" \
         -d '{"state":"closed"}' >/dev/null 2>&1 \
-        && note "closed self-failure issue #$existing (checker healthy for $streak consecutive ticks)" \
-        || note "FAILED to close self-failure issue #$existing"
+        && { note "closed self-failure issue #$existing (checker healthy for $streak consecutive ticks)"; echo 0 > "$fail_file" 2>/dev/null || true; return 0; }
+    # A close that keeps failing (token lost Issues: write, say) must not
+    # retry silently forever: after CLOSE_FAIL_ESCALATE_AFTER consecutive
+    # healthy ticks it fails the run, so OnFailure= comments on the stuck
+    # issue and a human learns the watchdog's own issue cannot be closed.
+    local fails
+    fails=$(cat "$fail_file" 2>/dev/null || echo 0)
+    [[ "$fails" =~ ^[0-9]+$ ]] || fails=0
+    fails=$((fails + 1))
+    echo "$fails" > "$fail_file" 2>/dev/null || true
+    note "FAILED to close self-failure issue #$existing ($fails consecutive)"
+    if [[ "$fails" -ge "$CLOSE_FAIL_ESCALATE_AFTER" ]]; then
+        note "ESCALATING: self-failure issue #$existing could not be closed for $fails consecutive healthy ticks"
+        TICK_EXIT_CODE=2
+    fi
 }
 
 # ============================================================

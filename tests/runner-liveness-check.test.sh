@@ -217,4 +217,24 @@ expect "runner-liveness-check.service runs with a private /tmp" 1 \
 expect "runner-liveness-check.service declares its OnFailure unit" 1 \
     "$(grep -c '^OnFailure=runner-failure-alert@runner-liveness-check.service$' "$INSTALLER" || true)"
 
+# ── installer run end to end in a sandbox root ───────────────────────────
+# shellcheck source=tests/installer-sandbox.lib.sh
+. "$TESTS_DIR/installer-sandbox.lib.sh"
+SB="$work/sb"; mkdir -p "$SB"
+inst_rc=0; sandbox_install "$INSTALLER" "$SB" --token-file "$work/token" || inst_rc=$?
+expect "sandboxed install succeeds" 0 "$inst_rc"
+expect "installed token is mode 600" 600 "$(stat -c %a "$SB/root/.runner-liveness-token")"
+expect "failure-alert template uses the instance name (%i), not %p" 0 "$(grep -c '%p' "$SB/etc/systemd/system/runner-failure-alert@.service" || true)"
+expect "failure-alert template names its instance in ExecStart" 1 "$(grep -c '^ExecStart=.*runner-failure-alert %i$' "$SB/etc/systemd/system/runner-failure-alert@.service" || true)"
+first=$(sandbox_digest "$SB")
+inst_rc=0; sandbox_install "$INSTALLER" "$SB" --token-file "$work/token" || inst_rc=$?
+expect "second install succeeds" 0 "$inst_rc"
+expect "installing twice leaves byte-identical files (no appended units/config)" "$first" "$(sandbox_digest "$SB")"
+inst_rc=0; sandbox_install "$INSTALLER" "$SB" --token-file "$SB/root/.runner-liveness-token" || inst_rc=$?
+expect "--token-file naming the installed token itself is not an abort" 0 "$inst_rc"
+expect "...and leaves the files unchanged" "$first" "$(sandbox_digest "$SB")"
+inst_rc=0; sandbox_install "$INSTALLER" "$SB" || inst_rc=$?
+expect "no --token-file keeps the already-installed liveness token" 0 "$inst_rc"
+expect "...and leaves the files unchanged" "$first" "$(sandbox_digest "$SB")"
+
 exit "$fail"

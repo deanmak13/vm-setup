@@ -56,6 +56,7 @@ printf '%s\n' '#!/usr/bin/env bash' \
     'if [[ -f "$W/kill_on_curl" ]]; then rm -f "$W/kill_on_curl"; kill -KILL -- "-$(awk "{print \$5}" /proc/$$/stat)"; fi' \
     'if [[ -s "$W/fail_pattern" ]] && [[ "$method $url" =~ $(cat "$W/fail_pattern") ]]; then exit 22; fi' \
     'case "$url" in' \
+    '  *"labels=runner-liveness"*) if [[ -f "$W/label_removed" ]]; then echo "[]"; elif [[ -f "$W/issues.json" ]]; then cat "$W/issues.json"; else echo "[]"; fi ;;' \
     '  *"/issues?"*) if [[ -f "$W/issues.json" ]]; then cat "$W/issues.json"; else echo "[]"; fi ;;' \
     '  */issues) echo "{\"number\": 99}" ;;' \
     '  *) echo "{}" ;;' \
@@ -88,7 +89,7 @@ open_issues() {  # <number> <title> pairs
     done
     printf '%s]\n' "$out" > "$work/issues.json"
 }
-reset() { rm -f "$work/issues.json" "$work/fail_pattern" "$work/rstate/"*; }
+reset() { rm -f "$work/label_removed" "$work/issues.json" "$work/fail_pattern" "$work/rstate/"*; }
 
 # ── threshold: both sides of 1200s ───────────────────────────────────────
 reset; stale 1190; run
@@ -101,8 +102,16 @@ expect "1210s old: one stale-timer issue filed" 1 "$(calls 'POST .*/repos/deanma
 expect "filing records the last-notification time" 1 "$([[ -s $work/rstate/liveness-alert-last-comment ]] && echo 1 || echo 0)"
 
 reset; rm -f "$work/lstate/streak.tsv"; run
-expect "no state file at all counts as stale: issue filed" 1 "$(calls 'POST .*/issues$')"
+expect "no state file (checker never ran): no false-alarm issue" 0 "$(calls 'POST .*/issues$')"
+expect "no state file: run succeeds" 0 "$RC"
+expect "no state file: the skip is logged" 1 "$(grep -c 'cross-watch skipped' "$work/reaper.log" || true)"
 touch "$work/lstate/streak.tsv"
+
+# ── an alert whose label was removed by hand is still found (no duplicate) ──
+reset; open_issues 21 "$STALE_TITLE"; touch "$work/label_removed"; stale 1300; run
+expect "label stripped from the open alert: still found, commented on" 1 "$(calls 'POST .*/issues/21/comments')"
+expect "label stripped: no duplicate issue filed" 0 "$(calls 'POST .*/issues$')"
+rm -f "$work/label_removed"
 
 # ── comment throttle ─────────────────────────────────────────────────────
 reset; open_issues 21 "$STALE_TITLE"; stale 1300; run
@@ -180,6 +189,15 @@ expect "two healthy runs after the kill: closed" 1 "$(calls 'PATCH .*/issues/30$
 reset; open_issues 30 "$FAILURE_TITLE"; touch "$work/lstate/streak.tsv"; run; echo 'PATCH' > "$work/fail_pattern"; run
 expect "closing the OnFailure issue fails: logged for a retry next run" 1 "$(grep -c 'FAILED to close reaper self-failure issue #30' "$work/reaper.log" || true)"
 
+# A self-failure issue whose close keeps failing escalates instead of retrying silently.
+reset; open_issues 30 "$FAILURE_TITLE"; touch "$work/lstate/streak.tsv"; run; echo 'PATCH' > "$work/fail_pattern"
+esc_rcs=""
+for _ in 1 2 3 4 5 6; do run; esc_rcs+="$RC "; done
+expect "close failing 5 times: still only logged (exit 0)" "0 0 0 0 0 1 " "$esc_rcs"
+expect "the 6th consecutive failed close escalates" 1 "$(grep -c 'ESCALATING: reaper self-failure issue #30' "$work/reaper.log" || true)"
+rm -f "$work/fail_pattern"; run
+expect "a successful close resets the failure counter" "0" "$(cat "$work/rstate/close-failures")"
+
 # ── installer wiring ─────────────────────────────────────────────────────
 expect "runner-reaper.service declares its OnFailure unit" 1 \
     "$(grep -c '^OnFailure=runner-failure-alert@runner-reaper.service$' "$INSTALLER" || true)"
@@ -203,6 +221,23 @@ fi
 printf 'GRACE=soon\n' > "$work/config-bad"
 run "$work/config-bad"
 expect "a non-numeric GRACE in the config file stops the reaper (exit 2)" 2 "$RC"
+
+# ── installer run end to end in a sandbox root ───────────────────────────
+# shellcheck source=tests/installer-sandbox.lib.sh
+. "$TESTS_DIR/installer-sandbox.lib.sh"
+SB="$work/sb"; mkdir -p "$SB"
+inst_rc=0; sandbox_install "$INSTALLER" "$SB" --token-file "$work/token" || inst_rc=$?
+expect "sandboxed install succeeds" 0 "$inst_rc"
+expect "installed token is mode 600" 600 "$(stat -c %a "$SB/root/.runner-reaper-token")"
+expect "failure-alert template uses the instance name (%i), not %p" 0 "$(grep -c '%p' "$SB/etc/systemd/system/runner-failure-alert@.service" || true)"
+expect "failure-alert template names its instance in ExecStart" 1 "$(grep -c '^ExecStart=.*runner-failure-alert %i$' "$SB/etc/systemd/system/runner-failure-alert@.service" || true)"
+first=$(sandbox_digest "$SB")
+inst_rc=0; sandbox_install "$INSTALLER" "$SB" --token-file "$work/token" || inst_rc=$?
+expect "second install succeeds" 0 "$inst_rc"
+expect "installing twice leaves byte-identical files (no appended units/config)" "$first" "$(sandbox_digest "$SB")"
+inst_rc=0; sandbox_install "$INSTALLER" "$SB" --token-file "$SB/root/.runner-reaper-token" || inst_rc=$?
+expect "--token-file naming the installed token itself is not an abort" 0 "$inst_rc"
+expect "...and leaves the files unchanged" "$first" "$(sandbox_digest "$SB")"
 
 # ── the token never leaks ────────────────────────────────────────────────
 expect "token never on curl's command line" 0 "$(grep -c -- "$TOKEN_VALUE" "$work/curl.argv" || true)"

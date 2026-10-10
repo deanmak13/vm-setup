@@ -241,11 +241,14 @@ LIVENESS_COMMENT_THROTTLE_SECONDS=3600
 LIVENESS_ALERT_REPO="$ALERT_REPO"
 LIVENESS_ALERT_TITLE="[runner-liveness] the liveness checker's timer appears to have stopped"
 LIVENESS_LAST_COMMENT_FILE="$STATE_DIR/liveness-alert-last-comment"
-# Filed by runner-reaper-failure-alert.service (the OnFailure= unit below);
+# Filed by runner-failure-alert@runner-reaper.service (the OnFailure= unit,
+# bin/runner-failure-alert);
 # closed here once DEBOUNCE_HEALTHY_RUNS consecutive runs delivered
 # everything, so a flapping reaper doesn't create/close it every tick.
-REAPER_FAILURE_TITLE="[runner-reaper] runner-reaper failed (crash or undelivered alert)"   # must match REAPER_FAILURE_TITLE in runner-reaper
+REAPER_FAILURE_TITLE="[runner-reaper] runner-reaper failed (crash or undelivered alert)"   # must match the title in bin/runner-failure-alert
 DEBOUNCE_HEALTHY_RUNS=2
+CLOSE_FAIL_ESCALATE_AFTER=6   # consecutive failed self-issue closes before the run fails
+REAPER_CLOSE_FAIL_FILE="$STATE_DIR/close-failures"
 DELIVERY_FAILED=0
 
 gh_api() {  # method url [json-body] — body on stdout, curl's exit status
@@ -267,8 +270,12 @@ find_liveness_issue() {
     LIVENESS_EXISTING=""
     REAPER_FAILURE_EXISTING=""
     local body parsed
-    body=$(gh_api GET "https://api.github.com/repos/$OWNER/$LIVENESS_ALERT_REPO/issues?labels=runner-liveness&state=open&per_page=100") || return 0
-    parsed=$(printf '%s' "$body" | python3 -c "
+    local query
+    # Label first; if neither title is found, fall back to all open issues
+    # so an alert whose label was removed by hand is not duplicated.
+    for query in "&labels=runner-liveness" ""; do
+        body=$(gh_api GET "https://api.github.com/repos/$OWNER/$LIVENESS_ALERT_REPO/issues?state=open&per_page=100$query") || return 0
+        parsed=$(printf '%s' "$body" | python3 -c "
 import json,sys
 d=json.load(sys.stdin)
 if not isinstance(d, list):
@@ -276,10 +283,12 @@ if not isinstance(d, list):
 found={}
 for i in d:
     t=i.get('title')
-    if t in sys.argv[1:] and t not in found:
+    if t in sys.argv[1:] and t not in found and 'pull_request' not in i:
         found[t]=str(i['number'])
 print('x'+found.get(sys.argv[1],'')+chr(9)+'x'+found.get(sys.argv[2],''))
 " "$LIVENESS_ALERT_TITLE" "$REAPER_FAILURE_TITLE" 2>/dev/null) || return 0
+        [[ "$parsed" != $'x\tx' ]] && break
+    done
     LIVENESS_SEARCH_OK=1
     IFS=$'\t' read -r LIVENESS_EXISTING REAPER_FAILURE_EXISTING <<< "$parsed"
     LIVENESS_EXISTING=${LIVENESS_EXISTING#x}
@@ -288,10 +297,15 @@ print('x'+found.get(sys.argv[1],'')+chr(9)+'x'+found.get(sys.argv[2],''))
 
 delivery_failed() { note "$*"; DELIVERY_FAILED=$((DELIVERY_FAILED + 1)); }
 
+# No state file at all means the checker has never run on this host (not
+# installed yet, or installed after this reaper): there is nothing to
+# cross-watch, and alerting would be a false alarm on every fresh install.
+# A checker that ran and then stopped leaves its state file behind, aging.
+LIVENESS_WATCH_ACTIVE=0
+liveness_age=0
 if [[ -f "$LIVENESS_STATE_FILE" ]]; then
+    LIVENESS_WATCH_ACTIVE=1
     liveness_age=$(( $(date +%s) - $(stat -c %Y "$LIVENESS_STATE_FILE" 2>/dev/null || echo 0) ))
-else
-    liveness_age=99999999   # no state file at all yet (e.g. never installed) counts as maximally stale
 fi
 
 now_epoch=$(date +%s)
@@ -299,7 +313,9 @@ last_comment=$(cat "$LIVENESS_LAST_COMMENT_FILE" 2>/dev/null || echo 0)
 [[ "$last_comment" =~ ^[0-9]+$ ]] || last_comment=0
 
 find_liveness_issue
-if [[ "$LIVENESS_SEARCH_OK" != "1" ]]; then
+if (( LIVENESS_WATCH_ACTIVE == 0 )); then
+    note "runner-liveness-check has no state file ($LIVENESS_STATE_FILE) — not installed or never ran; cross-watch skipped"
+elif [[ "$LIVENESS_SEARCH_OK" != "1" ]]; then
     # Neither "file" nor "close" is safe without knowing what is open:
     # filing could duplicate, closing has no number. Retry next tick.
     if (( liveness_age > LIVENESS_STALE_SECONDS )); then
@@ -358,9 +374,19 @@ fi
 echo "$healthy_streak" > "$REAPER_HEALTHY_STREAK_FILE"
 if (( DELIVERY_FAILED == 0 && healthy_streak >= DEBOUNCE_HEALTHY_RUNS && DRY_RUN == 0 )) && [[ -n "$REAPER_FAILURE_EXISTING" ]]; then
     if gh_api PATCH "https://api.github.com/repos/$OWNER/$LIVENESS_ALERT_REPO/issues/$REAPER_FAILURE_EXISTING" '{"state":"closed"}' >/dev/null; then
+        echo 0 > "$REAPER_CLOSE_FAIL_FILE"
         note "closed reaper self-failure issue #$REAPER_FAILURE_EXISTING (healthy for $healthy_streak consecutive runs)"
     else
-        note "FAILED to close reaper self-failure issue #$REAPER_FAILURE_EXISTING — will retry next run"
+        close_fails=$(cat "$REAPER_CLOSE_FAIL_FILE" 2>/dev/null || echo 0)
+        [[ "$close_fails" =~ ^[0-9]+$ ]] || close_fails=0
+        close_fails=$((close_fails + 1))
+        echo "$close_fails" > "$REAPER_CLOSE_FAIL_FILE"
+        note "FAILED to close reaper self-failure issue #$REAPER_FAILURE_EXISTING ($close_fails consecutive) — will retry next run"
+        # Not a silent forever-retry: past the threshold the run itself fails,
+        # so OnFailure= comments on the stuck issue and a human sees it.
+        if (( close_fails >= CLOSE_FAIL_ESCALATE_AFTER )); then
+            delivery_failed "ESCALATING: reaper self-failure issue #$REAPER_FAILURE_EXISTING could not be closed for $close_fails consecutive healthy runs"
+        fi
     fi
 fi
 

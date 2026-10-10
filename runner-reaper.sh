@@ -64,11 +64,9 @@
 #     `runner-liveness` label the installers ensure;
 #   - nothing else.
 # (runner-liveness-check.sh copies this same token when given none, so
-# one token meets both.) As installed on ci-builder (checked 2026-09-23)
-# it is instead a classic OAuth token whose scopes include `repo` and far
-# more (admin:org, delete_repo, ...): it works, but should be replaced by
-# the token above. One that can't write issues makes every cross-watch
-# alert a delivery failure — the run exits 1 and the OnFailure= unit
+# one token meets both.) A token that can't write issues (e.g. Issues set
+# to read-only on the alert repo) can still reap and read, but makes every
+# cross-watch alert a delivery failure — the run exits 1 and the OnFailure= unit
 # reports it (see below).
 #
 # Usage:
@@ -107,7 +105,11 @@ done
 
 # ── Host-only from here [host-only-begin] ────────────────────────────────
 
-install -m 600 "$TOKEN_FILE" /root/.runner-reaper-token
+if [[ "$TOKEN_FILE" -ef /root/.runner-reaper-token ]]; then
+    chmod 600 /root/.runner-reaper-token   # re-run with the installed token as its own source
+else
+    install -m 600 "$TOKEN_FILE" /root/.runner-reaper-token
+fi
 log "token installed at /root/.runner-reaper-token"
 # Every alert search filters on the runner-liveness label; without it each
 # tick would file a duplicate. Ensure it exists before any timer starts.
