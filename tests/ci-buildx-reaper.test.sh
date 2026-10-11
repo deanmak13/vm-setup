@@ -79,6 +79,11 @@ mkdir -p "$work/mnt/buildx_buildkit_builder-orphan-a_state" "$work/mnt/buildx_bu
 head -c 4096 /dev/zero > "$work/mnt/buildx_buildkit_builder-orphan-a_state/blob"
 head -c 8192 /dev/zero > "$work/mnt/buildx_buildkit_builder-orphan-b_state/blob"
 
+# Expected sizes are measured the same way the reaper measures them (du -sb of the
+# mountpoint), so the assertions do not depend on the filesystem's directory accounting.
+size_a=$(du -sb "$work/mnt/buildx_buildkit_builder-orphan-a_state" | cut -f1)
+size_b=$(du -sb "$work/mnt/buildx_buildkit_builder-orphan-b_state" | cut -f1)
+
 registry="$work/active-builders.txt"
 printf '%s\n' "# comment line" "pneuma-engine-main-v10   # trailing comment" "" > "$registry"
 
@@ -94,8 +99,8 @@ unset FAKE_RM_FAIL
 run --dry-run --floor-bytes 0
 expect "dry-run exit code" 0 "$RC"
 expect_absent "dry-run issues no volume rm" "volume rm" "$CALLS"
-expect_contains "dry-run reports orphan-a" "would delete buildx_buildkit_builder-orphan-a_state size=4096B" "$(cat "$work/reaper.log")"
-expect_contains "dry-run reports orphan-b" "would delete buildx_buildkit_builder-orphan-b_state size=8192B" "$(cat "$work/reaper.log")"
+expect_contains "dry-run reports orphan-a" "would delete buildx_buildkit_builder-orphan-a_state size=${size_a}B" "$(cat "$work/reaper.log")"
+expect_contains "dry-run reports orphan-b" "would delete buildx_buildkit_builder-orphan-b_state size=${size_b}B" "$(cat "$work/reaper.log")"
 expect_absent "dry-run never names the active builder" "would delete buildx_buildkit_pneuma-engine-main-v10_state" "$(cat "$work/reaper.log")"
 expect_absent "dry-run never names the referenced volume" "would delete buildx_buildkit_stopped-builder_state" "$(cat "$work/reaper.log")"
 
@@ -109,7 +114,7 @@ expect_absent "never rm a referenced volume" "volume rm buildx_buildkit_stopped-
 expect_absent "never rm a non-matching name" "volume rm buildx_buildkit_extra_state_x" "$CALLS"
 expect_absent "never rm an unrelated volume" "volume rm my_unrelated_volume" "$CALLS"
 expect_absent "never volume prune" "prune" "$CALLS"
-expect_contains "deletion logged with size" "deleted buildx_buildkit_builder-orphan-b_state size=8192B" "$(cat "$work/reaper.log")"
+expect_contains "deletion logged with size" "deleted buildx_buildkit_builder-orphan-b_state size=${size_b}B" "$(cat "$work/reaper.log")"
 expect_contains "summary counts" "deleted=3 kept=2" "$(cat "$work/reaper.log")"
 
 # 3. Refused removal is logged as FAILED and the run continues.
