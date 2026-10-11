@@ -103,9 +103,15 @@ out=$("$CLIENT" --repo-dir "$src" --profile redfake --head "$head" --base "$base
 expect_eq "client: red gate exits 1" 1 "$rc"
 chmod -R u+w "$PNEUMA_GATE_BASE/envs" 2>/dev/null || true
 
-out=$(PNEUMA_GATE_DISK_LIMIT_PCT=0 "$CLIENT" --repo-dir "$src" --profile fake --head "$head" --base "$base" --log-dir "$work/logs" 2>&1) && rc=0 || rc=$?
-expect_eq "client: disk at/over the limit exits 75 (no verdict)" 75 "$rc"
+out=$(PNEUMA_GATE_MIN_FREE_GIB=99999999 "$CLIENT" --repo-dir "$src" --profile fake --head "$head" --base "$base" --log-dir "$work/logs" 2>&1) && rc=0 || rc=$?
+expect_eq "client: free space under the floor exits 75 (no verdict)" 75 "$rc"
 check "disk refusal says why" grep -q 'refusing to start' <<<"$out"
+out=$(PNEUMA_GATE_MIN_FREE_GIB=1 "$CLIENT" --repo-dir "$src" --profile fake --head "$head" --base "$base" --log-dir "$work/logs" 2>&1) && rc=0 || rc=$?
+expect_eq "client: ample free space (floor 1GiB) is admitted regardless of percent used" 0 "$rc"
+chmod -R u+w "$PNEUMA_GATE_BASE/envs" 2>/dev/null || true
+
+out=$("$RUNNER" status 2>&1)
+check "status reports the free-space floor" grep -q 'disk_free>=40GiB' <<<"$out"
 
 out=$(PNEUMA_GATE_EXPECT_HOST=not-the-builder "$RUNNER" run --profile fake --repo fakerepo --head "$head" --base "$base" --tree "$tree" 2>&1) && rc=0 || rc=$?
 expect_eq "runner: wrong host identity exits 75" 75 "$rc"

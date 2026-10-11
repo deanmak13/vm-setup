@@ -26,7 +26,7 @@ BASE_DIR="${PNEUMA_GATE_BASE:-/var/lib/pneuma-gate}"
 RUN_AS="${PNEUMA_GATE_RUN_AS-pneuma-gate}"           # empty = no privilege drop (tests)
 PROFILE_DIR="${PNEUMA_GATE_PROFILE_DIR:-/usr/local/lib/pneuma-gate/profiles}"
 EXPECT_HOST="${PNEUMA_GATE_EXPECT_HOST-vmi3387590}"   # approved builder identity
-DISK_LIMIT_PCT="${PNEUMA_GATE_DISK_LIMIT_PCT:-85}"
+MIN_FREE_GIB="${PNEUMA_GATE_MIN_FREE_GIB:-40}"          # absolute free-space floor on $BASE_DIR's filesystem; ci-builder also runs k3s, whose kubelet evicts below ~10% free (~29GiB of 290GiB) — 40 leaves room for one ~5GiB gate above that line
 RESERVE_CORES="${PNEUMA_GATE_RESERVE_CORES:-3}"       # left for runners + k3s
 RESERVE_MEM_MB="${PNEUMA_GATE_RESERVE_MEM_MB:-6144}"
 MAX_CONCURRENT="${PNEUMA_GATE_MAX_CONCURRENT:-4}"
@@ -47,6 +47,9 @@ check_host() {
   [ "$(hostname)" = "$EXPECT_HOST" ]
 }
 disk_pct() { df --output=pcent "$BASE_DIR" 2>/dev/null | tail -1 | tr -dc '0-9'; }
+# Admission is an ABSOLUTE floor, not a percentage: on a big disk 85% used can
+# still leave far more than a gate needs (39G free at 87% used).
+disk_free_gib() { df -BG --output=avail "$BASE_DIR" 2>/dev/null | tail -1 | tr -dc '0-9'; }
 
 # ── capacity ─────────────────────────────────────────────────────────────────
 mem_available_mb() { awk '/^MemAvailable:/ {print int($2/1024)}' "$MEMINFO"; }
@@ -124,8 +127,8 @@ cmd_janitor() {
 }
 
 cmd_status() {
-  echo "host=$(hostname) nproc=$NPROC mem_available_mb=$(mem_available_mb) load1=$(awk '{print $1}' "$LOADAVG") disk_pct=$(disk_pct)"
-  echo "limits: disk<${DISK_LIMIT_PCT}% reserve_cores=$RESERVE_CORES reserve_mem_mb=$RESERVE_MEM_MB max_concurrent=$MAX_CONCURRENT"
+  echo "host=$(hostname) nproc=$NPROC mem_available_mb=$(mem_available_mb) load1=$(awk '{print $1}' "$LOADAVG") disk_pct=$(disk_pct) disk_free_gib=$(disk_free_gib)"
+  echo "limits: disk_free>=${MIN_FREE_GIB}GiB reserve_cores=$RESERVE_CORES reserve_mem_mb=$RESERVE_MEM_MB max_concurrent=$MAX_CONCURRENT"
   live_runs | sed 's/^/live-run: /'
 }
 
@@ -233,10 +236,10 @@ cmd_run() {
     || refuse "cannot create $BASE_DIR"
   if [ -n "$RUN_AS" ]; then chown "$RUN_AS" "$BASE_DIR" "$BASE_DIR"/repos "$BASE_DIR"/envs "$BASE_DIR"/queue 2>/dev/null; fi
 
-  local pct; pct="$(disk_pct)"
-  [ -n "$pct" ] || refuse "cannot read disk usage for $BASE_DIR"
-  [ "$pct" -ge "$DISK_LIMIT_PCT" ] && refuse "disk ${pct}% >= ${DISK_LIMIT_PCT}% — refusing to start"
-  cmd_janitor >/dev/null 2>&1
+  cmd_janitor >/dev/null 2>&1   # reap dead runs first so their space counts
+  local free; free="$(disk_free_gib)"
+  [ -n "$free" ] || refuse "cannot read disk usage for $BASE_DIR"
+  [ "$free" -lt "$MIN_FREE_GIB" ] && refuse "disk free ${free}GiB < ${MIN_FREE_GIB}GiB floor — refusing to start"
 
   # shellcheck disable=SC1090
   source "$PROFILE_DIR/$profile.sh" || refuse "profile $profile failed to load"
