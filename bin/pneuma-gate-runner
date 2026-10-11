@@ -1,0 +1,314 @@
+#!/usr/bin/env bash
+# pneuma-gate-runner — runs a repo's pre-push gate for ONE exact commit on the
+# dedicated build host (ci-builder), isolated per run, bounded by free capacity.
+# Installed to /usr/local/bin by ci-builder-gate.sh; driven over ssh by the dev
+# box's pneuma-remote-gate. Repo-specific knowledge lives in gate-profiles/*.sh
+# (one file per repo; adding a repo is adding a profile, never editing this).
+#
+#   pneuma-gate-runner have   --repo R <sha>...     print the commits the host holds
+#   pneuma-gate-runner run    --profile P --repo R --head SHA --base SHA --tree T
+#                             [--bundle]            (bundle on stdin; log on stdout)
+#   pneuma-gate-runner status                       capacity / disk / live runs
+#   pneuma-gate-runner janitor                      reap dead runs + stale keep-refs
+#
+# Verdict contract: the LAST stdout line of `run` is
+#   PNEUMA_GATE_RESULT repo=.. head=.. tree=.. exit=N ...
+# exit 0 = gate green for exactly that head+tree; 1 = gate RED; 75 = the gate
+# did not run to a verdict (refused / queue timeout / infra) — never green.
+#
+# Isolation: each run gets its own clone (alternates to the shared object
+# store), HOME, TMPDIR and gate lock; the dependency environment is an
+# immutable cache keyed by the profile's key. Everything per-run is deleted on
+# exit. The runner NEVER touches k3s or the GitHub runner services.
+set -uo pipefail
+
+BASE_DIR="${PNEUMA_GATE_BASE:-/var/lib/pneuma-gate}"
+RUN_AS="${PNEUMA_GATE_RUN_AS-pneuma-gate}"           # empty = no privilege drop (tests)
+PROFILE_DIR="${PNEUMA_GATE_PROFILE_DIR:-/usr/local/lib/pneuma-gate/profiles}"
+EXPECT_HOST="${PNEUMA_GATE_EXPECT_HOST-vmi3387590}"   # approved builder identity
+DISK_LIMIT_PCT="${PNEUMA_GATE_DISK_LIMIT_PCT:-85}"
+RESERVE_CORES="${PNEUMA_GATE_RESERVE_CORES:-3}"       # left for runners + k3s
+RESERVE_MEM_MB="${PNEUMA_GATE_RESERVE_MEM_MB:-6144}"
+MAX_CONCURRENT="${PNEUMA_GATE_MAX_CONCURRENT:-4}"
+QUEUE_TIMEOUT_S="${PNEUMA_GATE_QUEUE_TIMEOUT_S:-10800}"
+GATE_TIMEOUT_S="${PNEUMA_GATE_TIMEOUT_S:-5400}"
+LOAD_CEILING_PCT="${PNEUMA_GATE_LOAD_CEILING_PCT:-150}" # % of nproc; only blocks stacking a 2nd gate
+POLL_S="${PNEUMA_GATE_POLL_S:-5}"
+NPROC="${PNEUMA_GATE_NPROC:-$(nproc)}"
+MEMINFO="${PNEUMA_GATE_MEMINFO:-/proc/meminfo}"
+LOADAVG="${PNEUMA_GATE_LOADAVG:-/proc/loadavg}"
+
+log() { printf '[gate-runner %s] %s\n' "$(date -u +%H:%M:%SZ)" "$*"; }
+as_gate() { if [ -n "$RUN_AS" ]; then runuser -u "$RUN_AS" -- "$@"; else "$@"; fi; }
+
+# ── host identity + disk guard ───────────────────────────────────────────────
+check_host() {
+  [ -z "$EXPECT_HOST" ] && return 0
+  [ "$(hostname)" = "$EXPECT_HOST" ]
+}
+disk_pct() { df --output=pcent "$BASE_DIR" 2>/dev/null | tail -1 | tr -dc '0-9'; }
+
+# ── capacity ─────────────────────────────────────────────────────────────────
+mem_available_mb() { awk '/^MemAvailable:/ {print int($2/1024)}' "$MEMINFO"; }
+load1_x100() { awk '{printf "%d", $1*100}' "$LOADAVG"; }
+live_runs() {   # prints "<id> <cores> <mem_mb>" for each live run
+  local d pid
+  for d in "$BASE_DIR"/runs/*/; do
+    [ -f "$d/pid" ] || continue
+    pid="$(cat "$d/pid" 2>/dev/null)"
+    { [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; } || continue
+    printf '%s %s %s\n' "$(basename "$d")" "$(cat "$d/cores" 2>/dev/null || echo 1)" "$(cat "$d/mem_mb" 2>/dev/null || echo 2048)"
+  done
+}
+# can_admit <cores> <mem_mb> — true when this gate fits beside the live ones
+# AND beside whatever the host's runners/k3s are already using.
+can_admit() {
+  local cores="$1" mem="$2" n=0 used_c=0 id c m
+  while read -r id c m; do
+    [ -n "$id" ] || continue
+    n=$((n + 1)); used_c=$((used_c + c))
+  done < <(live_runs)
+  [ "$n" -ge "$MAX_CONCURRENT" ] && return 1
+  # Core budget = cores minus the reserve; one gate is always allowed to use
+  # its own weight so a tiny host still makes progress.
+  local budget=$((NPROC - RESERVE_CORES))
+  [ "$budget" -lt "$cores" ] && budget="$cores"
+  [ $((used_c + cores)) -gt "$budget" ] && return 1
+  # Memory: what is available NOW (already net of live gates) minus the reserve.
+  [ $(($(mem_available_mb) - RESERVE_MEM_MB)) -lt "$mem" ] && return 1
+  # Load: when the host is already saturated by runners/k3s, only the first
+  # gate may start (never stack gates on a starved box).
+  if [ "$n" -gt 0 ] && [ "$(load1_x100)" -gt $((NPROC * LOAD_CEILING_PCT)) ]; then return 1; fi
+  return 0
+}
+
+# ── repo store ───────────────────────────────────────────────────────────────
+safe_name() { [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]] && [ "$1" != . ] && [ "$1" != .. ]; }
+store_for() { printf '%s/repos/%s.git' "$BASE_DIR" "$1"; }
+
+cmd_have() {
+  local repo="" shas=()
+  while [ $# -gt 0 ]; do
+    case "$1" in --repo) repo="$2"; shift 2;; *) shas+=("$1"); shift;; esac
+  done
+  safe_name "$repo" || { echo "bad repo" >&2; return 2; }
+  local store; store="$(store_for "$repo")"
+  [ -d "$store" ] || return 0
+  printf '%s\n' "${shas[@]}" | git --git-dir="$store" cat-file --batch-check='%(objectname) %(objecttype)' 2>/dev/null | awk '$2=="commit"{print $1}'
+}
+
+# ── janitor ──────────────────────────────────────────────────────────────────
+cmd_janitor() {
+  local d pid store ref ts f
+  for d in "$BASE_DIR"/runs/*/; do
+    [ -d "$d" ] || continue
+    pid="$(cat "$d/pid" 2>/dev/null || true)"
+    if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+      log "janitor: removing dead run $(basename "$d")"; rm -rf "$d"
+    fi
+  done
+  for f in "$BASE_DIR"/queue/*; do
+    [ -e "$f" ] || continue
+    case "$(basename "$f")" in in-*) [ -n "$(find "$f" -mmin +120 2>/dev/null)" ] && rm -f "$f"; continue;; esac
+    pid="${f##*-}"; kill -0 "$pid" 2>/dev/null || rm -f "$f"
+  done
+  # keep-refs older than 2 days no longer pin their objects
+  for store in "$BASE_DIR"/repos/*.git; do
+    [ -d "$store" ] || continue
+    git --git-dir="$store" for-each-ref --format='%(refname) %(committerdate:unix)' refs/gate-keep 2>/dev/null |
+      while read -r ref ts; do
+        [ $(($(date +%s) - ts)) -gt 172800 ] && git --git-dir="$store" update-ref -d "$ref"
+      done
+  done
+  return 0
+}
+
+cmd_status() {
+  echo "host=$(hostname) nproc=$NPROC mem_available_mb=$(mem_available_mb) load1=$(awk '{print $1}' "$LOADAVG") disk_pct=$(disk_pct)"
+  echo "limits: disk<${DISK_LIMIT_PCT}% reserve_cores=$RESERVE_CORES reserve_mem_mb=$RESERVE_MEM_MB max_concurrent=$MAX_CONCURRENT"
+  live_runs | sed 's/^/live-run: /'
+}
+
+# ── run ──────────────────────────────────────────────────────────────────────
+RUN_DIR=""; QUEUE_FILE=""; START_TS=0
+R_REPO=""; R_HEAD=""; R_TREE=""; R_PROFILE=""
+result() {   # result <exit> [reason]
+  printf 'PNEUMA_GATE_RESULT repo=%s head=%s tree=%s profile=%s exit=%s elapsed=%ss host=%s%s\n' \
+    "$R_REPO" "$R_HEAD" "$R_TREE" "$R_PROFILE" "$1" "$(($(date +%s) - START_TS))" "$(hostname)" "${2:+ reason=\"$2\"}"
+}
+cleanup() {
+  [ -n "$QUEUE_FILE" ] && rm -f "$QUEUE_FILE"
+  [ -n "$RUN_DIR" ] && [ -d "$RUN_DIR" ] && rm -rf "$RUN_DIR"
+}
+refuse() { log "REFUSED: $1"; result 75 "$1"; exit 75; }
+
+# first live waiter in the FIFO queue (dead waiters are dropped as we go)
+first_live_waiter() {
+  local f
+  for f in $(ls "$BASE_DIR/queue" 2>/dev/null | grep -v '^in-' | sort); do
+    if kill -0 "${f##*-}" 2>/dev/null; then printf '%s' "$f"; return 0; fi
+    rm -f "$BASE_DIR/queue/$f"
+  done
+}
+
+admit() {   # admit <cores> <mem_mb> — block until admitted; creates RUN_DIR
+  local cores="$1" mem="$2" waited=0
+  QUEUE_FILE="$BASE_DIR/queue/$(date +%s%N)-$$"; : > "$QUEUE_FILE"
+  exec 9>"$BASE_DIR/admit.lock"
+  while :; do
+    flock 9
+    if [ "$(first_live_waiter)" = "$(basename "$QUEUE_FILE")" ] && can_admit "$cores" "$mem"; then
+      RUN_DIR="$BASE_DIR/runs/$(date +%Y%m%dT%H%M%S)-$$"
+      mkdir -p "$RUN_DIR/work" "$RUN_DIR/tmp" "$RUN_DIR/home"
+      echo $$ > "$RUN_DIR/pid"; echo "$cores" > "$RUN_DIR/cores"; echo "$mem" > "$RUN_DIR/mem_mb"
+      if [ -n "$RUN_AS" ]; then chown -R "$RUN_AS" "$RUN_DIR"; fi
+      chmod 755 "$RUN_DIR"
+      rm -f "$QUEUE_FILE"; QUEUE_FILE=""
+      flock -u 9; exec 9>&-
+      log "admitted run $(basename "$RUN_DIR") after ${waited}s queued (cores=$cores mem=${mem}MB)"
+      return 0
+    fi
+    flock -u 9
+    if [ $((waited % 60)) -eq 0 ]; then
+      log "queued: $(live_runs | wc -l) running, no capacity (nproc=$NPROC reserve=$RESERVE_CORES mem_avail=$(mem_available_mb)MB load1=$(awk '{print $1}' "$LOADAVG")) waited ${waited}s"
+    fi
+    [ "$waited" -ge "$QUEUE_TIMEOUT_S" ] && refuse "queue timeout after ${waited}s"
+    sleep "$POLL_S"; waited=$((waited + POLL_S))
+  done
+}
+
+ensure_env() {   # ensure_env <profile> <work> → sets ENV_DIR (immutable shared cache)
+  local profile="$1" work="$2" key
+  key="$(as_gate bash -c 'source "$1"; cd "$2"; profile_env_key' _ "$PROFILE_DIR/$profile.sh" "$work")" || refuse "profile_env_key failed"
+  [ -n "$key" ] || refuse "empty environment key"
+  ENV_DIR="$BASE_DIR/envs/$profile/$key"
+  [ -e "$ENV_DIR/.ready" ] && { log "environment $profile/$key ready (read-only shared cache)"; return 0; }
+  mkdir -p "$BASE_DIR/envs/$profile"
+  if [ -n "$RUN_AS" ]; then chown "$RUN_AS" "$BASE_DIR/envs/$profile"; fi
+  exec 8>"$BASE_DIR/envs/$profile/.build.lock"
+  log "environment $profile/$key not cached — waiting for the build lock"
+  flock 8
+  if [ ! -e "$ENV_DIR/.ready" ]; then
+    log "building environment $profile/$key (one-time per dependency set)"
+    ( source "$PROFILE_DIR/$profile.sh"; cd "$work" || exit 1
+      if declare -F profile_stage_root >/dev/null; then profile_stage_root "$BASE_DIR"; fi ) \
+      || { flock -u 8; refuse "profile_stage_root failed"; }
+    # Built IN PLACE (venv scripts embed their own path); the .ready marker is
+    # written last, so a crashed build is never mistaken for a usable one.
+    chmod -R u+w "$ENV_DIR" 2>/dev/null; rm -rf "$ENV_DIR"
+    as_gate bash -c 'source "$1"; cd "$2"; export PNEUMA_GATE_BASE="$4"; profile_env_build "$3"' \
+      _ "$PROFILE_DIR/$profile.sh" "$work" "$ENV_DIR" "$BASE_DIR" 2>&1 | sed 's/^/  env-build: /'
+    if [ "${PIPESTATUS[0]}" -ne 0 ]; then
+      chmod -R u+w "$ENV_DIR" 2>/dev/null; rm -rf "$ENV_DIR"; flock -u 8; refuse "environment build failed"
+    fi
+    as_gate bash -c 'touch "$1/.ready" && chmod -R a-w "$1"' _ "$ENV_DIR" \
+      || { flock -u 8; refuse "environment publish failed"; }
+  fi
+  flock -u 8; exec 8>&-
+  log "environment $profile/$key ready (read-only shared cache)"
+}
+
+cmd_run() {
+  local profile="" repo="" head="" base="" tree="" bundle=0 shallow="" origin_main="" fwd_env=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --shallow) shallow="$2"; shift 2;;
+      --origin-main) origin_main="$2"; shift 2;;
+      --env)   # only the gate's own scope knobs may cross the wire
+        [[ "$2" =~ ^PNEUMA_PREPUSH_(FULL|NO_CACHE)=[01]$ ]] || { echo "refusing env '$2'" >&2; return 2; }
+        fwd_env+=("$2"); shift 2;;
+      --profile) profile="$2"; shift 2;; --repo) repo="$2"; shift 2;;
+      --head) head="$2"; shift 2;; --base) base="$2"; shift 2;;
+      --tree) tree="$2"; shift 2;; --bundle) bundle=1; shift;;
+      *) echo "unknown arg $1" >&2; return 2;;
+    esac
+  done
+  START_TS="$(date +%s)"; R_REPO="$repo"; R_HEAD="$head"; R_TREE="$tree"; R_PROFILE="$profile"
+  trap cleanup EXIT
+  { safe_name "$repo" && safe_name "$profile"; } || refuse "bad repo/profile name"
+  [[ "$head" =~ ^[0-9a-f]{40}$ && "$base" =~ ^[0-9a-f]{40}$ && "$tree" =~ ^[0-9a-f]{40}$ ]] || refuse "head/base/tree must be 40-hex"
+  check_host || refuse "host $(hostname) is not the approved builder ($EXPECT_HOST)"
+  [ -r "$PROFILE_DIR/$profile.sh" ] || refuse "no gate profile '$profile' in $PROFILE_DIR"
+  mkdir -p "$BASE_DIR/runs" "$BASE_DIR/repos" "$BASE_DIR/envs" "$BASE_DIR/wheels" "$BASE_DIR/queue" 2>/dev/null \
+    || refuse "cannot create $BASE_DIR"
+  if [ -n "$RUN_AS" ]; then chown "$RUN_AS" "$BASE_DIR" "$BASE_DIR"/repos "$BASE_DIR"/envs "$BASE_DIR"/queue 2>/dev/null; fi
+
+  local pct; pct="$(disk_pct)"
+  [ -n "$pct" ] || refuse "cannot read disk usage for $BASE_DIR"
+  [ "$pct" -ge "$DISK_LIMIT_PCT" ] && refuse "disk ${pct}% >= ${DISK_LIMIT_PCT}% — refusing to start"
+  cmd_janitor >/dev/null 2>&1
+
+  # shellcheck disable=SC1090
+  source "$PROFILE_DIR/$profile.sh" || refuse "profile $profile failed to load"
+  local cores mem; cores="$(profile_cores)"; mem="$(profile_mem_mb)"
+
+  local store; store="$(store_for "$repo")"
+  if [ ! -d "$store" ]; then as_gate git init -q --bare "$store" || refuse "cannot init object store"; fi
+  # A shallow dev-box clone cannot ship history past its boundary: record the
+  # boundary commits so the store (and every workspace) accepts the cut.
+  if [ -n "$shallow" ]; then
+    { cat "$store/shallow" 2>/dev/null; tr ',' '\n' <<<"$shallow" | grep -E '^[0-9a-f]{40}$'; } |
+      sort -u | as_gate tee "$store/shallow.new" >/dev/null && as_gate mv "$store/shallow.new" "$store/shallow"
+  fi
+  if [ "$bundle" = 1 ]; then
+    local bf="$BASE_DIR/queue/in-$$.bundle"
+    cat > "$bf"
+    if [ -n "$RUN_AS" ]; then chown "$RUN_AS" "$bf"; fi
+    log "received bundle ($(du -h "$bf" | cut -f1))"
+    as_gate git --git-dir="$store" fetch -q "$bf" "refs/pneuma-gate/*:refs/gate-keep/*" 2>&1 | sed 's/^/  fetch: /'
+    [ "${PIPESTATUS[0]}" -eq 0 ] || { rm -f "$bf"; refuse "bundle fetch failed"; }
+    rm -f "$bf"
+  fi
+  local o
+  [[ -z "$origin_main" || "$origin_main" =~ ^[0-9a-f]{40}$ ]] || refuse "bad --origin-main"
+  for o in "$head" "$base" ${origin_main:+"$origin_main"}; do
+    as_gate git --git-dir="$store" cat-file -e "${o}^{commit}" 2>/dev/null || refuse "commit $o not in the store (ship a bundle)"
+  done
+  [ "$(as_gate git --git-dir="$store" rev-parse "${head}^{tree}")" = "$tree" ] || refuse "tree mismatch for $head"
+
+  admit "$cores" "$mem"
+
+  # ── per-run workspace: its own .git, objects via alternates to the store ───
+  local work="$RUN_DIR/work"
+  as_gate bash -c '
+    set -e; cd "$1"; git init -q .; echo "$2/objects" > .git/objects/info/alternates
+    if [ -f "$2/shallow" ]; then cp "$2/shallow" .git/shallow; fi
+    git update-ref refs/gate/head "$3"; git update-ref refs/gate/base "$4"
+    # tests (e.g. the dead-SHA citation guard) resolve origin/main: give the
+    # workspace the same one the dev box had, never a guess.
+    if [ -n "$5" ]; then git update-ref refs/remotes/origin/main "$5"; fi
+    git -c advice.detachedHead=false checkout -q --detach "$3"' _ "$work" "$store" "$head" "$base" "$origin_main" \
+    || refuse "workspace checkout failed"
+  [ "$(as_gate git -C "$work" rev-parse 'HEAD^{tree}')" = "$tree" ] || refuse "workspace tree mismatch"
+  [ -z "$(as_gate git -C "$work" status --porcelain)" ] || refuse "workspace not clean after checkout"
+
+  ENV_DIR=""
+  ensure_env "$profile" "$work"
+
+  # ── the gate itself, in a scrubbed environment (no ambient credentials) ────
+  local rc
+  as_gate env -i PATH=/usr/local/bin:/usr/bin:/bin HOME="$RUN_DIR/home" TMPDIR="$RUN_DIR/tmp" LANG=C.UTF-8 \
+    PNEUMA_GATE_REMOTE_RUN=1 PNEUMA_GATE_RUN_DIR="$RUN_DIR" PNEUMA_GATE_CORES="$cores" "${fwd_env[@]}" \
+    bash -c 'source "$1"; cd "$2"; shift 2; profile_gate "$@"' _ \
+    "$PROFILE_DIR/$profile.sh" "$work" "$ENV_DIR" "$head" "$base" "$GATE_TIMEOUT_S" 2>&1
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    log "gate GREEN"; result 0; return 0
+  elif [ "$rc" -eq 124 ]; then
+    log "gate TIMED OUT after ${GATE_TIMEOUT_S}s"; result 75 "gate timeout"; return 75
+  fi
+  log "gate RED (exit $rc)"; result 1; return 1
+}
+
+main() {
+  local sub="${1:-}"
+  [ $# -gt 0 ] && shift
+  case "$sub" in
+    have) cmd_have "$@";;
+    run) cmd_run "$@"; exit $?;;
+    status) cmd_status;;
+    janitor) cmd_janitor;;
+    *) echo "usage: pneuma-gate-runner {have|run|status|janitor}" >&2; exit 2;;
+  esac
+}
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then main "$@"; fi
