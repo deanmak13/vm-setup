@@ -26,7 +26,7 @@ BASE_DIR="${PNEUMA_GATE_BASE:-/var/lib/pneuma-gate}"
 RUN_AS="${PNEUMA_GATE_RUN_AS-pneuma-gate}"           # empty = no privilege drop (tests)
 PROFILE_DIR="${PNEUMA_GATE_PROFILE_DIR:-/usr/local/lib/pneuma-gate/profiles}"
 EXPECT_HOST="${PNEUMA_GATE_EXPECT_HOST-vmi3387590}"   # approved builder identity
-MIN_FREE_GIB="${PNEUMA_GATE_MIN_FREE_GIB:-25}"          # absolute free-space floor on $BASE_DIR's filesystem
+MIN_FREE_GIB="${PNEUMA_GATE_MIN_FREE_GIB:-40}"          # absolute free-space floor on $BASE_DIR's filesystem; ci-builder also runs k3s, whose kubelet evicts below ~10% free (~29GiB of 290GiB) — 40 leaves room for one ~5GiB gate above that line
 RESERVE_CORES="${PNEUMA_GATE_RESERVE_CORES:-3}"       # left for runners + k3s
 RESERVE_MEM_MB="${PNEUMA_GATE_RESERVE_MEM_MB:-6144}"
 MAX_CONCURRENT="${PNEUMA_GATE_MAX_CONCURRENT:-4}"

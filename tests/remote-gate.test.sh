@@ -111,7 +111,7 @@ expect_eq "client: ample free space (floor 1GiB) is admitted regardless of perce
 chmod -R u+w "$PNEUMA_GATE_BASE/envs" 2>/dev/null || true
 
 out=$("$RUNNER" status 2>&1)
-check "status reports the free-space floor" grep -q 'disk_free>=25GiB' <<<"$out"
+check "status reports the free-space floor" grep -q 'disk_free>=40GiB' <<<"$out"
 
 out=$(PNEUMA_GATE_EXPECT_HOST=not-the-builder "$RUNNER" run --profile fake --repo fakerepo --head "$head" --base "$base" --tree "$tree" 2>&1) && rc=0 || rc=$?
 expect_eq "runner: wrong host identity exits 75" 75 "$rc"
