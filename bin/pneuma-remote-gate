@@ -11,7 +11,7 @@
 # Exit status (the ONLY trusted signal; a PASS means exactly head+tree):
 #   0   gate GREEN on the builder for this head and tree
 #   1   gate RED
-#   75  no verdict (builder unreachable / refused / disk>=85% / queue timeout /
+#   75  no verdict (builder unreachable / refused / free disk < 25GiB / queue timeout /
 #       result for a different commit) — treated as NOT green by callers
 #
 # What ships is the commit, never the worktree: a git bundle of head (and base)
