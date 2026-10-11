@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# ci-buildx-reaper — reap ORPHANED buildx BuildKit cache volumes on the CI host.
+#
+# A volume is reaped only when ALL of these hold:
+#   1. its name is buildx_buildkit_<builder>_state (exact shape, nothing else);
+#   2. <builder> is NOT listed in the active-builder registry (--registry);
+#   3. NO container, running or stopped, references it (docker ps -a --filter volume=).
+# It deletes by name with `docker volume rm` (no -f, so docker itself refuses an
+# in-use volume). It never runs volume prune, system prune, and never touches k3s,
+# containerd, or any other volume.
+#
+# Each deletion is logged with its size. If free space on / is still under
+# --floor-bytes after the run, the script exits 3 so that its OnFailure= unit
+# (runner-failure-alert) files the alert.
+#
+# Usage: ci-buildx-reaper [--dry-run] [--registry FILE] [--floor-bytes N] [--log FILE]
+set -uo pipefail
+
+DRY_RUN=0
+REGISTRY=/etc/ci-buildx-reaper/active-builders.txt
+FLOOR_BYTES=$((40 * 1024 * 1024 * 1024))
+LOG=/var/log/ci-buildx-reaper.log
+DISK=/
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --dry-run) DRY_RUN=1; shift ;;
+        --registry) REGISTRY="$2"; shift 2 ;;
+        --floor-bytes) FLOOR_BYTES="$2"; shift 2 ;;
+        --log) LOG="$2"; shift 2 ;;
+        *) echo "usage: ci-buildx-reaper [--dry-run] [--registry FILE] [--floor-bytes N] [--log FILE]" >&2; exit 2 ;;
+    esac
+done
+
+note() {
+    local line
+    line="$(date -Is) $*"
+    echo "$line" >> "$LOG" 2>/dev/null || echo "$line" >&2
+    logger -t ci-buildx-reaper "$*" 2>/dev/null || true
+}
+
+[[ "$FLOOR_BYTES" =~ ^[0-9]+$ ]] || { echo "--floor-bytes must be an integer" >&2; exit 2; }
+[[ -r "$REGISTRY" ]] || { note "FAILED registry $REGISTRY is not readable"; exit 1; }
+
+# Active builders: one name per line; blank lines and '#' comments ignored.
+active=$(sed -e 's/#.*$//' -e 's/[[:space:]]//g' "$REGISTRY" | grep -v '^$' || true)
+
+is_active() {
+    grep -qxF "$1" <<< "$active"
+}
+
+free_bytes() {
+    df --output=avail -B1 "$DISK" | tail -1 | tr -dc '0-9'
+}
+
+volume_size() {
+    local mount
+    mount=$(docker volume inspect --format '{{.Mountpoint}}' "$1" 2>/dev/null) || { echo 0; return; }
+    du -sb "$mount" 2>/dev/null | cut -f1 | tr -dc '0-9'
+}
+
+[[ "$DRY_RUN" == 1 ]] && note "dry-run: no volumes will be removed"
+
+deleted=0
+kept=0
+reclaimed=0
+while read -r vol; do
+    [[ "$vol" =~ ^buildx_buildkit_(.+)_state$ ]] || continue
+    builder="${BASH_REMATCH[1]}"
+    if is_active "$builder"; then
+        kept=$((kept + 1))
+        continue
+    fi
+    if [[ -n "$(docker ps -aq --filter "volume=$vol" </dev/null)" ]]; then
+        kept=$((kept + 1))
+        continue
+    fi
+    size=$(volume_size "$vol")
+    size=${size:-0}
+    if [[ "$DRY_RUN" == 1 ]]; then
+        note "dry-run: would delete $vol size=${size}B"
+        continue
+    fi
+    if docker volume rm "$vol" </dev/null >/dev/null 2>&1; then
+        deleted=$((deleted + 1))
+        reclaimed=$((reclaimed + size))
+        note "deleted $vol size=${size}B"
+    else
+        note "FAILED to delete $vol (docker volume rm refused)"
+    fi
+done < <(docker volume ls -q --filter "name=buildx_buildkit_" 2>/dev/null)
+
+avail=$(free_bytes)
+note "finished: deleted=$deleted kept=$kept reclaimed=${reclaimed}B free=${avail}B floor=${FLOOR_BYTES}B"
+
+if [[ "$DRY_RUN" == 0 ]] && (( avail < FLOOR_BYTES )); then
+    note "ALERT free disk ${avail}B is under the gate floor ${FLOOR_BYTES}B after reaping"
+    exit 3
+fi
+exit 0

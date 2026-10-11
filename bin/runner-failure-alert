@@ -30,8 +30,13 @@ case "$PROGRAM" in
         TITLE="[runner-liveness] the liveness checker itself failed to run"
         BODY="runner-liveness-check.service failed on ci-builder — see 'journalctl -u runner-liveness-check' for the crash. The watchdog cannot currently detect wedged runners."
         ;;
+    ci-buildx-reaper)
+        TOKEN_FILE_PATH=/root/.runner-reaper-token
+        TITLE="[ci-buildx-reaper] buildx cache reaper failed or disk still under the gate floor"
+        BODY="ci-buildx-reaper.service failed on ci-builder — see 'journalctl -u ci-buildx-reaper' and /var/log/ci-buildx-reaper.log. Exit 3 means free disk is still under the 40GiB gate floor after reaping orphaned buildx volumes."
+        ;;
     *)
-        echo "usage: runner-failure-alert runner-reaper|runner-liveness-check" >&2
+        echo "usage: runner-failure-alert runner-reaper|runner-liveness-check|ci-buildx-reaper" >&2
         exit 2
         ;;
 esac
