@@ -113,3 +113,19 @@ Check syslog: `journalctl -t zombie-monitor`
 - Never commit credentials, tokens, or secrets to this repo
 - Keep setup.sh generic — no project-specific logic belongs here
 - All sensitive/personal state goes to S3 via save-state.sh
+
+## ci-builder buildx cache reaper
+
+Daily timer that deletes ORPHANED `buildx_buildkit_*_state` volumes (no container,
+running or stopped, references them and the builder is not in
+`buildx-reaper/active-builders.txt`). Never volume/system prune, k3s or containerd.
+
+```bash
+sudo bash ~/vm-setup/ci-buildx-reaper.sh                  # install / refresh the timer
+sudo /usr/local/bin/ci-buildx-reaper --dry-run            # preview deletions
+bash ~/vm-setup/tests/ci-buildx-reaper.test.sh            # fake-docker tests
+```
+
+Add a builder to the registry before creating it on the host. Exit 3 (free disk
+still under the 40GiB gate floor) files a `[ci-buildx-reaper]` issue through
+`runner-failure-alert`.

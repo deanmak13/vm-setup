@@ -1,0 +1,8 @@
+# Active buildx builders on ci-builder. Their *_state volumes are NEVER reaped,
+# even if no container references them right now. One builder name per line
+# (the part between buildx_buildkit_ and _state). Add a builder here before
+# creating it on the host; remove it only after the builder is retired.
+builder-05ce7c5f-1d4a-487d-a2cc-96f76526e8740
+builder-2f45c280-d19f-43d9-83df-3e6caa9fcd060
+pneuma-engine-main-v10
+pneuma-engine-pr-v10
