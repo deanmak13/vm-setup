@@ -83,6 +83,15 @@ exec bash -c "$*"
 SSH
 chmod +x "$work/bin/ssh"
 export PATH="$work/bin:$PATH" PNEUMA_GATE_RUNNER="$RUNNER" PNEUMA_GATE_HOST=fakehost
+# systemd-run stand-in: records its arguments, then runs the command after `--`.
+cat > "$work/bin/systemd-run-stub" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$SCOPE_RECORD"
+while [ $# -gt 0 ] && [ "$1" != -- ]; do shift; done; shift
+exec "$@"
+STUB
+chmod +x "$work/bin/systemd-run-stub"
+export SCOPE_RECORD="$work/scope-record.txt" PNEUMA_GATE_SYSTEMD_RUN="$work/bin/systemd-run-stub"
 
 marker_of() { grep '^PNEUMA_GATE_RESULT ' <<<"$1" | tail -1; }
 field_of() { tr ' ' '\n' <<<"$1" | sed -n "s/^$2=//p" | head -1; }
@@ -124,6 +133,8 @@ check "live-pg: the missing-binaries failure is named" grep -q "cannot be green"
 
 pg_case loopback
 pg_ok=$(PATH="$pgstub:$PATH" PNEUMA_GATE_PG_BIN="$pgstub" bash -c 'source "$1"; _engine_pg_up "$2" && echo "dsn=$PGTEST_DSN int=$INTEGRATION_TEST"; _engine_pg_down' _ "$ENGINE_PROFILE" "$PGRUN" 2>&1)
+PG_CAPS_CALLS="$PGRUN/pg/calls"
+PG_CAPS_CALLS="$PGRUN/pg/calls"
 check "live-pg: exports a loopback DSN and INTEGRATION_TEST=1" grep -qE "^dsn=postgresql://gate:[A-Za-z0-9]{32}@127\.0\.0\.1:[0-9]+/postgres int=1$" <<<"$pg_ok"
 check "live-pg: the cluster is stopped on teardown" grep -q "pg_ctl -D $PGRUN/pg/data -m immediate -w stop" "$PG_STUB_CALLS"
 check "live-pg: the password file is private" test "$(stat -c %a "$PGRUN/pg/pw")" = 600
@@ -282,6 +293,15 @@ printf '%s\n' '#!/usr/bin/env bash' 'echo "some log, then the connection dropped
 chmod +x "$work/bin/dropped-runner"
 out=$(PNEUMA_GATE_RUNNER="$work/bin/dropped-runner" "$CLIENT" --repo-dir "$src" --profile fake --head "$head" --base "$base" --log-dir "$work/logs" 2>&1) && rc=0 || rc=$?
 expect_eq "client: no marker (dropped connection) is NOT green" 75 "$rc"
+
+# ── resource scope: the gate runs in a transient systemd scope with the run's budget,
+# and the per-run PostgreSQL is capped (GATE-PG-1 review) ─────────────────────────
+check "scope: the gate runs in a transient scope named for its run" grep -q -- "--unit=pneuma-gate-" "$SCOPE_RECORD"
+check "scope: the scope carries the run's memory budget (MemoryMax = admitted mem)" grep -q -- "-p MemoryMax=512M" "$SCOPE_RECORD"
+check "scope: the scope carries the run's CPU budget (CPUQuota = cores x 100%)" grep -q -- "-p CPUQuota=200%" "$SCOPE_RECORD"
+check "scope: the scope caps the task count" grep -q -- "-p TasksMax=512" "$SCOPE_RECORD"
+check "PG: the per-run postmaster is capped (shared_buffers, connections)" bash -c 'grep -q "shared_buffers=128MB" "$1" && grep -q "max_connections=50" "$1"' _ "$PG_CAPS_CALLS"
+check "scope: no systemd-run means refusal, never an unscoped gate" bash -c 'PNEUMA_GATE_SYSTEMD_RUN=/nonexistent "$1" run --profile fake --repo fakerepo --head "$2" --base "$3" --tree "$4" >/dev/null 2>&1; test $? = 75' _ "$RUNNER" "$head" "$base" "$tree"
 
 # ── runner: tree mismatch, shallow boundary, have ────────────────────────────
 out=$("$RUNNER" run --profile fake --repo fakerepo --head "$head" --base "$base" --tree "$base" 2>&1) && rc=0 || rc=$?

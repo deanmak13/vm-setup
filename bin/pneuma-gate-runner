@@ -290,7 +290,15 @@ cmd_run() {
 
   # ── the gate itself, in a scrubbed environment (no ambient credentials) ────
   local rc
-  as_gate env -i PATH=/usr/local/bin:/usr/bin:/bin HOME="$RUN_DIR/home" TMPDIR="$RUN_DIR/tmp" LANG=C.UTF-8 \
+  # The run's resource budget is a transient systemd scope: every process the gate starts,
+  # the per-run PostgreSQL included (it double-forks but keeps its cgroup), is bounded by
+  # this run's memory and CPU. The admission budget (cores, mem) is what the scope enforces.
+  local scope_bin="${PNEUMA_GATE_SYSTEMD_RUN:-systemd-run}" runner_prefix=()
+  command -v "$scope_bin" >/dev/null 2>&1 || refuse "no $scope_bin: the gate's resource scope is required"
+  [ -n "$RUN_AS" ] && runner_prefix=(runuser -u "$RUN_AS" --)
+  "$scope_bin" --scope --quiet --collect --unit="pneuma-gate-$(basename "$RUN_DIR")" \
+    -p MemoryMax="${mem}M" -p CPUQuota="$((cores * 100))%" -p TasksMax=512 -- \
+    "${runner_prefix[@]}" env -i PATH=/usr/local/bin:/usr/bin:/bin HOME="$RUN_DIR/home" TMPDIR="$RUN_DIR/tmp" LANG=C.UTF-8 \
     PNEUMA_GATE_REMOTE_RUN=1 PNEUMA_GATE_RUN_DIR="$RUN_DIR" PNEUMA_GATE_CORES="$cores" "${fwd_env[@]}" \
     bash -c 'source "$1"; cd "$2"; shift 2; profile_gate "$@"' _ \
     "$PROFILE_DIR/$profile.sh" "$work" "$ENV_DIR" "$head" "$base" "$GATE_TIMEOUT_S" 2>&1

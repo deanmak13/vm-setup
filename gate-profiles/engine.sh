@@ -152,10 +152,14 @@ _engine_pg_up() {  # <run dir> — exports INTEGRATION_TEST + PGTEST_DSN; return
   pw="$(head -c 48 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 32)"
   mkdir -p "$root" && printf '%s' "$pw" > "$root/pw" && chmod 600 "$root/pw" || return 1
   printf '%s\n' "$$" > "$1/owner.pid" || return 1       # the gate PID the reaper keys on
+  # The postmaster runs inside the gate's systemd scope (see the runner), so the run's
+  # MemoryMax covers it. These caps keep its own footprint small for throwaway tests.
   "$ENGINE_PG_BIN/initdb" -D "$root/data" -U gate --pwfile="$root/pw" -A scram-sha-256 -E UTF8 \
     > "$root/initdb.log" 2>&1 || { echo "live-pg: FAILED — initdb (see $root/initdb.log)" >&2; return 1; }
   "$ENGINE_PG_BIN/pg_ctl" -D "$root/data" -l "$root/server.log" -w \
-    -o "-p $port -c listen_addresses=127.0.0.1 -c unix_socket_directories= -c fsync=off" start >/dev/null 2>&1 \
+    -o "-p $port -c listen_addresses=127.0.0.1 -c unix_socket_directories= -c fsync=off \
+       -c shared_buffers=128MB -c work_mem=4MB -c maintenance_work_mem=64MB -c max_connections=50 -c max_wal_size=256MB" \
+    start >/dev/null 2>&1 \
     || { echo "live-pg: FAILED — server did not start (see $root/server.log)" >&2; return 1; }
   _ENGINE_PG_ROOT="$root"
   if ! _engine_pg_assert_loopback "$port"; then _engine_pg_down; return 1; fi
