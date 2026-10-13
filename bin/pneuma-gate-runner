@@ -284,6 +284,12 @@ cmd_run() {
     || refuse "workspace checkout failed"
   [ "$(as_gate git -C "$work" rev-parse 'HEAD^{tree}')" = "$tree" ] || refuse "workspace tree mismatch"
   [ -z "$(as_gate git -C "$work" status --porcelain)" ] || refuse "workspace not clean after checkout"
+  # Optional profile hook: the scoping decision (diff size, selected services) at
+  # the top of the log, so a wrong selection is visible in every verdict.
+  if declare -F profile_scope_report >/dev/null; then
+    as_gate bash -c 'source "$1"; cd "$2"; profile_scope_report "$3" "$4"' _ \
+      "$PROFILE_DIR/$profile.sh" "$work" "$base" "$head" 2>&1 | sed 's/^/  scope: /' || true
+  fi
 
   ENV_DIR=""
   ensure_env "$profile" "$work"

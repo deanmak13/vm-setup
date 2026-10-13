@@ -25,10 +25,11 @@ RUNNER="${PNEUMA_GATE_RUNNER:-/usr/local/bin/pneuma-gate-runner}"
 SSH_OPTS=(-o BatchMode=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=6 -o ConnectTimeout=20)
 PROBE_DEPTH="${PNEUMA_GATE_PROBE_DEPTH:-300}"
 
-head="" base="" repo_dir="" profile="" log_dir=""
+head="" base="" repo_dir="" profile="" log_dir="" scope_only=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --head) head="$2"; shift 2;; --base) base="$2"; shift 2;;
+    --scope-only) scope_only=1; shift;;
     --repo-dir) repo_dir="$2"; shift 2;; --profile) profile="$2"; shift 2;;
     --host) HOST="$2"; shift 2;; --log-dir) log_dir="$2"; shift 2;;
     *) echo "pneuma-remote-gate: unknown argument $1" >&2; exit 2;;
@@ -42,7 +43,25 @@ nogate() { echo "pneuma-remote-gate: $*" >&2; exit 75; }
 
 [ -n "$repo_dir" ] || repo_dir="$(git rev-parse --show-toplevel 2>/dev/null)" || nogate "not inside a git repo (use --repo-dir)"
 head="$(G rev-parse --verify --quiet "${head}^{commit}")" || nogate "--head is not a commit in $repo_dir"
-base="$(G rev-parse --verify --quiet "${base}^{commit}")" || nogate "--base is not a commit in $repo_dir"
+# The scoping base is merge-base(head, FRESHLY fetched origin/main). A caller's
+# --base is usually `git rev-parse origin/main` from a checkout that was last
+# fetched days ago, and then every commit merged since inflates the selection
+# (measured: P2-07 7bef90046 selected 17 services on a stale base, 2 on a fresh
+# one, and FULL fan-out on another). Fetch, recompute, and say so when we differ.
+fetch_err="$(mktemp)"
+G fetch -q origin main 2>"$fetch_err" || nogate "cannot fetch origin/main: $(head -1 "$fetch_err") — refusing to scope on a stale base"
+rm -f "$fetch_err"
+fresh_om="$(G rev-parse --verify --quiet 'refs/remotes/origin/main^{commit}')" || nogate "origin/main does not resolve after fetch"
+fresh_base="$(G merge-base "$fresh_om" "$head")" || nogate "no merge-base between origin/main and $head"
+if [ -n "$base" ] && [ "$(G rev-parse --verify --quiet "${base}^{commit}" 2>/dev/null)" != "$fresh_base" ]; then
+  echo "remote-gate: WARNING caller --base ${base:0:12} is not merge-base(head, fresh origin/main) ${fresh_base:0:12}; scoping on ${fresh_base:0:12}" >&2
+fi
+base="$fresh_base"
+if [ "$scope_only" = 1 ]; then
+  # Dry run: the scoping decision for this head, no bundle, no builder, no verdict.
+  echo "remote-gate: scope-only head ${head:0:12} base ${fresh_base:0:12} ($(G diff --name-only "$fresh_base" "$head" | grep -c .) changed file(s))"
+  exit 0
+fi
 tree="$(G rev-parse "${head}^{tree}")"
 repo="$(basename "$(G rev-parse --show-toplevel)")"
 [ -n "$profile" ] || profile="$repo"

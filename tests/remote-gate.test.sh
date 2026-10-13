@@ -51,12 +51,18 @@ git -C "$src" commit -qam two
 head=$(git -C "$src" rev-parse HEAD)
 tree=$(git -C "$src" rev-parse 'HEAD^{tree}')
 printf 'dirty\n' > "$src/untracked-must-not-ship.txt"   # worktree noise the gate must never see
+# The client fetches origin/main before scoping: give the fixture a real origin
+# whose main is the parent commit, so merge-base(head, origin/main) == base.
+git init -q --bare "$work/origin.git"
+git -C "$src" remote add origin "$work/origin.git"
+git -C "$src" push -q origin "$base:refs/heads/main"
 
 # A fake profile: the gate passes iff the checked-out f.txt says "two" and
 # the file ./PLANT_RED does not exist; it reports where it ran.
 cat > "$work/profiles/fake.sh" <<'PROFILE'
 profile_cores() { echo "${FAKE_CORES:-2}"; }
 profile_mem_mb() { echo "${FAKE_MEM_MB:-512}"; }
+profile_scope_report() { echo "fake-scope base=${1:0:8} head=${2:0:8}"; }
 profile_env_key() { echo "fakekey1"; }
 profile_env_build() { mkdir -p "$1" && echo built > "$1/marker"; }
 profile_gate() {
@@ -87,10 +93,35 @@ export PATH="$work/bin:$PATH" PNEUMA_GATE_RUNNER="$RUNNER" PNEUMA_GATE_HOST=fake
 marker_of() { grep '^PNEUMA_GATE_RESULT ' <<<"$1" | tail -1; }
 field_of() { tr ' ' '\n' <<<"$1" | sed -n "s/^$2=//p" | head -1; }
 
+# ── scoping base: the client recomputes it from a fresh origin/main ────────
+scope_out=$("$CLIENT" --repo-dir "$src" --head "$head" --base "$head" --scope-only 2>&1) && scope_rc=0 || scope_rc=$?
+check "scope-only: exits 0 without a bundle or verdict" test "$scope_rc" = 0
+check "scope-only: a stale caller base is overridden by merge-base(head, origin/main)" \
+  grep -q "WARNING caller --base ${head:0:12}.* scoping on ${base:0:12}" <<<"$scope_out"
+check "scope-only: the scoped base is the merge-base" grep -q "base ${base:0:12} (" <<<"$scope_out"
+
+# The engine profile's scope report, run in a throwaway checkout whose selector is
+# a stub: the test covers the report's plumbing (diff count, selector grep), not
+# the selector itself (tools/ci has its own suite).
+ENGINE_PROFILE="$(cd "$(dirname "$CLIENT")/.." && pwd)/gate-profiles/engine.sh"
+scope_repo="$work/scope-repo"
+mkdir -p "$scope_repo/tools/ci"
+git -C "$scope_repo" init -q -b main
+printf 'a\n' > "$scope_repo/a.txt"; git -C "$scope_repo" add a.txt; git -C "$scope_repo" commit -qm a
+scope_base=$(git -C "$scope_repo" rev-parse HEAD)
+printf 'b\n' > "$scope_repo/b.txt"; git -C "$scope_repo" add b.txt; git -C "$scope_repo" commit -qm b
+scope_head=$(git -C "$scope_repo" rev-parse HEAD)
+printf '%s\n' "import sys" "print(\"services selected: ['svc']\")" "print(\"connectors selected: ['<none>']\")" \
+  > "$scope_repo/tools/ci/detect_changed_services.py"
+report_out=$(cd "$scope_repo" && bash -c 'source "$1"; profile_scope_report "$2" "$3"' _ "$ENGINE_PROFILE" "$scope_base" "$scope_head" 2>&1)
+check "engine profile: scope report counts the changed files" grep -q "1 changed file(s) vs base ${scope_base:0:12}" <<<"$report_out"
+check "engine profile: scope report shows the selected services" grep -q "services selected: \['svc'\]" <<<"$report_out"
+
 # ── client end to end ────────────────────────────────────────────────────────
 out=$("$CLIENT" --repo-dir "$src" --profile fake --head "$head" --base "$base" --log-dir "$work/logs" 2>&1) && rc=0 || rc=$?
 echo "DBG:$out" >&2
 expect_eq "client: green gate exits 0" 0 "$rc"
+check "runner: the profile scope report opens the log" grep -q "scope: fake-scope base=" <<<"$out"
 check "client: log names the exact head and tree" grep -q "$head" <<<"$out"
 check "client: log kept on the dev side" test -n "$(ls "$work/logs"/*.log)"
 check "client: dirty worktree file was NOT shipped (no LEAK)" not grep -q LEAK <<<"$out"
