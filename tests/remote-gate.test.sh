@@ -213,6 +213,31 @@ git -C "$disc" add -A && git -C "$disc" -c user.name=t -c user.email=t@t commit 
 disc_out="$(cd "$disc" && bash -c 'source "$1"; _engine_live_modules' _ "$ENGINE_PROFILE")"
 check "live discovery: finds the caller, not the definition or plain tests" test "$disc_out" = "tests/integration/test_a.py"
 
+# profile_gate end to end, with a stub venv whose python writes a canned junit report:
+# the live step's wiring runs for real (discovery, pytest call, verdict, exit status).
+live_repo="$work/live-repo"; mkdir -p "$live_repo/.githooks" "$live_repo/tests/integration"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$live_repo/.githooks/pre-push"; chmod +x "$live_repo/.githooks/pre-push"
+printf 'from tools.ci.pgtest_env import require_pgtest_dsn\nDSN = require_pgtest_dsn()\n' > "$live_repo/tests/integration/test_a.py"
+printf 'from tools.ci.pgtest_env import require_pgtest_dsn\nDSN = require_pgtest_dsn()\n' > "$live_repo/tests/integration/test_b.py"
+git -C "$live_repo" init -q -b main; git -C "$live_repo" add -A
+git -C "$live_repo" -c user.name=t -c user.email=t@t commit -qm live
+mkdir -p "$work/gvenv/venv/bin"
+cat > "$work/gvenv/venv/bin/python" <<'STUB'
+#!/usr/bin/env bash
+for a in "$@"; do case "$a" in --junitxml=*) f="${a#--junitxml=}";; esac; done
+cp "$CANNED_JUNIT" "$f"
+STUB
+chmod +x "$work/gvenv/venv/bin/python"
+mkdir -p "$work/gbase/runs" "$work/ghome"
+live_gate() {  # <canned junit> → the profile_gate verdict
+  pg_case "live-$(basename "$1")"
+  (cd "$live_repo" && HOME="$work/ghome" PATH="$pgstub:$PATH" PNEUMA_GATE_PG_BIN="$pgstub" PNEUMA_GATE_BASE="$work/gbase" \
+    PNEUMA_GATE_RUN_DIR="$PGRUN" PNEUMA_GATE_CORES=1 PG_STUB_SS=loopback CANNED_JUNIT="$1" \
+    bash -c 'source "$1"; profile_gate "$2" h b 60; echo "rc=$?"' _ "$ENGINE_PROFILE" "$work/gvenv" 2>&1)
+}
+check "profile_gate: live modules all ran (junit ok) -> the gate is green" grep -q "rc=0" <<<"$(live_gate "$work/live/ok.xml")"
+check "profile_gate: a DSN skip in the live run -> the gate is RED" grep -q "rc=1" <<<"$(live_gate "$work/live/dsn-skip.xml")"
+
 # ── client end to end ────────────────────────────────────────────────────────
 out=$("$CLIENT" --repo-dir "$src" --profile fake --head "$head" --base "$base" --log-dir "$work/logs" 2>&1) && rc=0 || rc=$?
 echo "DBG:$out" >&2
