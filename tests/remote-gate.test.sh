@@ -149,6 +149,37 @@ PATH="$pgstub:$PATH" PNEUMA_GATE_PG_BIN="$pgstub" bash -c '
 check "live-pg: a previous EXIT handler still runs (chained, not replaced)" grep -q "previous-exit-handler" "$chain_log"
 check "live-pg: the cluster is stopped by the same EXIT handler" grep -q "pg_ctl -D $PGRUN/pg/data -m immediate -w stop" "$PG_STUB_CALLS"
 
+# ── engine profile: orphan reaping and the live-skip guard (GATE-PG-1) ───
+reap_base="$work/reapbase"
+mkdir -p "$reap_base/runs/dead-owner/pg/data" "$reap_base/runs/current/pg/data"
+sleep 300 & orphan_pid=$!
+echo "$orphan_pid" > "$reap_base/runs/dead-owner/pg/data/postmaster.pid"
+echo "$orphan_pid" > "$reap_base/runs/current/pg/data/postmaster.pid"
+PATH="$pgstub:$PATH" PNEUMA_GATE_PG_BIN="$pgstub" bash -c 'source "$1"; _engine_pg_reap_orphans "$2" "$2/runs/current"' _ "$ENGINE_PROFILE" "$reap_base" 2>/dev/null
+check "reap: a leftover cluster of a dead owner is stopped" grep -q "pg_ctl -D $reap_base/runs/dead-owner/pg/data -m immediate -w stop" "$reap_base/runs/dead-owner/pg/calls"
+check "reap: this run's own cluster is left alone" test ! -e "$reap_base/runs/current/pg/calls"
+touch -d '2 hours ago' "$reap_base/runs/current/pg/data/postmaster.pid"
+PNEUMA_GATE_PG_MAX_AGE_S=60 PATH="$pgstub:$PATH" PNEUMA_GATE_PG_BIN="$pgstub" bash -c 'source "$1"; _engine_pg_reap_orphans "$2" "$2/runs/current"' _ "$ENGINE_PROFILE" "$reap_base" 2>/dev/null
+check "reap: an age sweep stops even this run's cluster when it is older than the limit" grep -q "stop" "$reap_base/runs/current/pg/calls"
+kill "$orphan_pid" 2>/dev/null; wait "$orphan_pid" 2>/dev/null || true
+
+skip_base="$work/skipbase"; mkdir -p "$skip_base/runs" "$work/skiphome" "$work/skipenv/venv"
+mkdir -p "$work/skiprepo/.githooks" "$work/okrepo/.githooks"
+printf '#!/usr/bin/env bash\necho "SKIPPED [1] t.py:1: PGTEST_DSN is not set"\nexit 0\n' > "$work/skiprepo/.githooks/pre-push"
+printf '#!/usr/bin/env bash\necho "1 passed"\nexit 0\n' > "$work/okrepo/.githooks/pre-push"
+chmod +x "$work/skiprepo/.githooks/pre-push" "$work/okrepo/.githooks/pre-push"
+gate_run() {  # <repo> → the profile's own verdict line
+  pg_case "gate-$(basename "$1")"
+  (cd "$1" && HOME="$work/skiphome" PATH="$pgstub:$PATH" PNEUMA_GATE_PG_BIN="$pgstub" PNEUMA_GATE_BASE="$skip_base" \
+    PNEUMA_GATE_RUN_DIR="$PGRUN" PNEUMA_GATE_CORES=1 PG_STUB_SS=loopback \
+    bash -c 'source "$1"; profile_gate "$2" h b 60; echo "rc=$?"' _ "$ENGINE_PROFILE" "$work/skipenv" 2>&1)
+}
+skip_out="$(gate_run "$work/skiprepo")"
+check "gate: live skips for a missing DSN FAIL the gate when the cluster was up" grep -q "although the cluster was up" <<<"$skip_out"
+check "gate: and its verdict is red (rc=1)" grep -q "rc=1" <<<"$skip_out"
+ok_out="$(gate_run "$work/okrepo")"
+check "gate: a clean hook run is green (rc=0)" grep -q "rc=0" <<<"$ok_out"
+
 # ── client end to end ────────────────────────────────────────────────────────
 out=$("$CLIENT" --repo-dir "$src" --profile fake --head "$head" --base "$base" --log-dir "$work/logs" 2>&1) && rc=0 || rc=$?
 echo "DBG:$out" >&2

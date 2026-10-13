@@ -115,6 +115,28 @@ _engine_pg_assert_loopback() {  # <port>
   [ "$bad" = 0 ] || { echo "live-pg: FAILED — the cluster listens beyond 127.0.0.1: $lines" >&2; return 1; }
 }
 
+# A gate killed with SIGKILL never runs its EXIT trap, so its postmaster outlives it.
+# At the start of every gate, stop the clusters whose owner is gone (a live postmaster
+# in another run's directory), and any cluster older than the age limit.
+_engine_pg_reap_orphans() {  # <base> <current run dir>
+  local pidfile data pid age max="${PNEUMA_GATE_PG_MAX_AGE_S:-21600}" now mtime
+  now="$(date +%s)"
+  for pidfile in "$1"/runs/*/pg/data/postmaster.pid; do
+    [ -f "$pidfile" ] || continue
+    data="$(dirname "$pidfile")"
+    pid="$(head -1 "$pidfile" 2>/dev/null)"
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    kill -0 "$pid" 2>/dev/null || continue            # already gone: nothing to stop
+    mtime="$(stat -c %Y "$pidfile" 2>/dev/null || echo "$now")"
+    age=$(( now - mtime ))
+    if [ "$(dirname "$data")" != "$2/pg" ] || [ "$age" -gt "$max" ]; then
+      echo "live-pg: reaping leftover cluster $data (pid $pid, age ${age}s)" >&2
+      "$ENGINE_PG_BIN/pg_ctl" -D "$data" -m immediate -w stop >/dev/null 2>&1 || kill -9 "$pid" 2>/dev/null
+    fi
+  done
+  return 0
+}
+
 _engine_pg_up() {  # <run dir> — exports INTEGRATION_TEST + PGTEST_DSN; returns 1 on any failure
   local root="$1/pg" port pw
   if [ ! -x "$ENGINE_PG_BIN/initdb" ]; then
@@ -147,8 +169,12 @@ _engine_pg_arm_exit() {
 
 profile_gate() {
   local envdir="$1" head="$2" base="$3" timeout_s="$4"
+  _engine_pg_reap_orphans "$PNEUMA_GATE_BASE" "$PNEUMA_GATE_RUN_DIR"
   _engine_pg_up "$PNEUMA_GATE_RUN_DIR" || return 1
   _engine_pg_arm_exit
+  # pytest prints the skip reason in its summary only with -rs. The gate counts the
+  # skips that mean "the DSN did not reach the tests", and fails when there are any.
+  export PYTEST_ADDOPTS="${PYTEST_ADDOPTS:+$PYTEST_ADDOPTS }-rs"
   # The gate pip-installs INTO its interpreter (editable project + per-service
   # extras), so each run gets its own venv: a hard-linked copy of the frozen
   # cache (instant, no extra disk) with writable directories. Files stay
@@ -158,9 +184,17 @@ profile_gate() {
   cp -al "$envdir/venv" "$venv" && find "$venv" -type d -exec chmod u+w {} + || return 1
   # A scratch identity for tests that create commits; the HOME is per run.
   printf '[user]\n\tname = pneuma-gate\n\temail = gate@localhost\n' > "$HOME/.gitconfig"
+  local hook_rc skipped
   printf 'refs/heads/gate %s refs/heads/gate %s\n' "$head" "$base" |
     env PATH="$venv/bin:$PATH" PYTHON="$venv/bin/python" PYTHONDONTWRITEBYTECODE=1 \
         PNEUMA_GATE_LOCK_FILE="$PNEUMA_GATE_RUN_DIR/gate.lock" \
         PNEUMA_PREPUSH_NO_CACHE=1 PNEUMA_PREPUSH_PARALLELISM="$PNEUMA_GATE_CORES" \
-      timeout "$timeout_s" nice -n 10 bash .githooks/pre-push
+      timeout "$timeout_s" nice -n 10 bash .githooks/pre-push 2>&1 | tee "$PNEUMA_GATE_RUN_DIR/hook.log"
+  hook_rc="${PIPESTATUS[1]}"
+  skipped="$(grep -c 'PGTEST_DSN is not set' "$PNEUMA_GATE_RUN_DIR/hook.log" || true)"
+  if [ "$hook_rc" = 0 ] && [ "${skipped:-0}" -gt 0 ]; then
+    echo "live-pg: FAILED — $skipped live test(s) skipped for a missing PGTEST_DSN although the cluster was up" >&2
+    return 1
+  fi
+  return "$hook_rc"
 }
