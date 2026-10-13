@@ -3,6 +3,7 @@
 # commit on the build host (ci-builder) and bring the verdict + log back.
 #
 #   pneuma-remote-gate --head SHA --base SHA [--repo-dir DIR] [--profile NAME]
+#   (--base is advisory: the scoping base is always merge-base(head, fresh origin/main))
 #                      [--host ci-builder] [--log-dir DIR]
 #
 # Defaults: --repo-dir = cwd's repo, --profile = repo directory name with any
@@ -11,6 +12,7 @@
 # Exit status (the ONLY trusted signal; a PASS means exactly head+tree):
 #   0   gate GREEN on the builder for this head and tree
 #   1   gate RED
+#   3   nothing to gate (head already on origin/main, or no changed files) — not a verdict
 #   75  no verdict (builder unreachable / refused / free disk < 25GiB / queue timeout /
 #       result for a different commit) — treated as NOT green by callers
 #
@@ -48,18 +50,34 @@ head="$(G rev-parse --verify --quiet "${head}^{commit}")" || nogate "--head is n
 # fetched days ago, and then every commit merged since inflates the selection
 # (measured: P2-07 7bef90046 selected 17 services on a stale base, 2 on a fresh
 # one, and FULL fan-out on another). Fetch, recompute, and say so when we differ.
+# The origin must be this repo on GitHub, or the fetched main is someone else's.
+repo_name="$(basename "$(G rev-parse --show-toplevel)")"
+origin_url="$(G config --get remote.origin.url 2>/dev/null)" || nogate "no origin remote in $repo_dir"
+case "$origin_url" in
+  *github.com[:/]deanmak13/"$repo_name"|*github.com[:/]deanmak13/"$repo_name".git) ;;
+  *) nogate "origin '$origin_url' is not deanmak13/$repo_name — refusing to scope on it" ;;
+esac
 fetch_err="$(mktemp)"
 G fetch -q origin main 2>"$fetch_err" || nogate "cannot fetch origin/main: $(head -1 "$fetch_err") — refusing to scope on a stale base"
 rm -f "$fetch_err"
-fresh_om="$(G rev-parse --verify --quiet 'refs/remotes/origin/main^{commit}')" || nogate "origin/main does not resolve after fetch"
+# FETCH_HEAD is the tip this fetch just brought, not whatever refs/remotes/origin/main said before.
+fresh_om="$(G rev-parse --verify --quiet 'FETCH_HEAD^{commit}')" || nogate "origin/main does not resolve after fetch"
 fresh_base="$(G merge-base "$fresh_om" "$head")" || nogate "no merge-base between origin/main and $head"
 if [ -n "$base" ] && [ "$(G rev-parse --verify --quiet "${base}^{commit}" 2>/dev/null)" != "$fresh_base" ]; then
   echo "remote-gate: WARNING caller --base ${base:0:12} is not merge-base(head, fresh origin/main) ${fresh_base:0:12}; scoping on ${fresh_base:0:12}" >&2
 fi
 base="$fresh_base"
+# Nothing to gate: the head is already on main (it was gated when it landed), or it
+# changes no files. The hook would exit 0 on an empty diff, which is a vacuous green,
+# so say so and exit 3 (not a verdict; callers treat it as not green).
+changed_count="$(G diff --name-only "$fresh_base" "$head" | grep -c .)"
+if [ "$fresh_base" = "$head" ] || [ "$changed_count" = 0 ]; then
+  echo "remote-gate: NOTHING TO GATE for ${head:0:12}: already on origin/main or no changed files — no verdict" >&2
+  exit 3
+fi
 if [ "$scope_only" = 1 ]; then
   # Dry run: the scoping decision for this head, no bundle, no builder, no verdict.
-  echo "remote-gate: scope-only head ${head:0:12} base ${fresh_base:0:12} ($(G diff --name-only "$fresh_base" "$head" | grep -c .) changed file(s))"
+  echo "remote-gate: scope-only head ${head:0:12} base ${fresh_base:0:12} ($changed_count changed file(s))"
   exit 0
 fi
 tree="$(G rev-parse "${head}^{tree}")"

@@ -43,7 +43,13 @@ set -euo pipefail
 id pneuma-gate >/dev/null 2>&1 || useradd --system --home-dir /var/lib/pneuma-gate --shell /usr/sbin/nologin pneuma-gate
 install -d -o pneuma-gate -g pneuma-gate -m 0755 /var/lib/pneuma-gate
 chmod 0755 /usr/local/bin/pneuma-gate-runner
-chmod -R a+rX /usr/local/lib/pneuma-gate
+# They run as root (the runner sources the profiles as root), so nothing the
+# unprivileged gate user can write may ever be on that path: root owns everything,
+# directories 0755, files 0644.
+chown root:root /usr/local/bin/pneuma-gate-runner && chmod 0755 /usr/local/bin/pneuma-gate-runner
+chown -R root:root /usr/local/lib/pneuma-gate
+find /usr/local/lib/pneuma-gate -type d -exec chmod 0755 {} +
+find /usr/local/lib/pneuma-gate -type f -exec chmod 0644 {} +
 # Janitor: reap dead runs / stale keep-refs even when no gate is starting.
 printf '*/30 * * * * root /usr/local/bin/pneuma-gate-runner janitor >/dev/null 2>&1\n' > /etc/cron.d/pneuma-gate-janitor
 chmod 0644 /etc/cron.d/pneuma-gate-janitor
