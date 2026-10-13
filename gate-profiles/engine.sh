@@ -91,8 +91,64 @@ PYEOF
   return 0
 }
 
+# Live Postgres (GATE-PG-1): the live suites need a real PostgreSQL 16 and a gate
+# that runs them must not be green without them. A native per-run cluster from the
+# host's PG16 binaries, bound to 127.0.0.1 only (asserted, not assumed), random
+# port, random password, scram auth, unix socket disabled, stopped on exit. It
+# touches nothing docker-, k3s- or volume-shaped.
+ENGINE_PG_BIN="${PNEUMA_GATE_PG_BIN:-/usr/lib/postgresql/16/bin}"
+
+_engine_pg_down() {
+  [ -n "${_ENGINE_PG_ROOT:-}" ] && "$ENGINE_PG_BIN/pg_ctl" -D "$_ENGINE_PG_ROOT/data" -m immediate -w stop >/dev/null 2>&1
+  return 0
+}
+
+# Every listener on the cluster's port must be 127.0.0.1. Fails closed when ss is
+# missing or when nothing (or anything else) listens there.
+_engine_pg_assert_loopback() {  # <port>
+  command -v ss >/dev/null 2>&1 || { echo "live-pg: FAILED — ss is needed to prove the cluster binds 127.0.0.1 only" >&2; return 1; }
+  local lines listeners bad
+  lines="$(ss -H -ltn 2>/dev/null | awk -v p=":$1" '$4 ~ (p "$") {print $4}')"
+  listeners="$(printf '%s\n' "$lines" | grep -c .)"
+  bad="$(printf '%s\n' "$lines" | grep -vc '^127\.0\.0\.1:' || true)"
+  [ "$listeners" -ge 1 ] || { echo "live-pg: FAILED — nothing listens on port $1" >&2; return 1; }
+  [ "$bad" = 0 ] || { echo "live-pg: FAILED — the cluster listens beyond 127.0.0.1: $lines" >&2; return 1; }
+}
+
+_engine_pg_up() {  # <run dir> — exports INTEGRATION_TEST + PNEUMA_TEST_PG_DSN; returns 1 on any failure
+  local root="$1/pg" port pw
+  if [ ! -x "$ENGINE_PG_BIN/initdb" ]; then
+    echo "live-pg: FAILED — no PostgreSQL 16 binaries at $ENGINE_PG_BIN; the live suites cannot run, so this gate cannot be green" >&2
+    return 1
+  fi
+  port="$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')" || return 1
+  pw="$(head -c 48 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 32)"
+  mkdir -p "$root" && printf '%s' "$pw" > "$root/pw" && chmod 600 "$root/pw" || return 1
+  "$ENGINE_PG_BIN/initdb" -D "$root/data" -U gate --pwfile="$root/pw" -A scram-sha-256 -E UTF8 \
+    > "$root/initdb.log" 2>&1 || { echo "live-pg: FAILED — initdb (see $root/initdb.log)" >&2; return 1; }
+  "$ENGINE_PG_BIN/pg_ctl" -D "$root/data" -l "$root/server.log" -w \
+    -o "-p $port -c listen_addresses=127.0.0.1 -c unix_socket_directories= -c fsync=off" start >/dev/null 2>&1 \
+    || { echo "live-pg: FAILED — server did not start (see $root/server.log)" >&2; return 1; }
+  _ENGINE_PG_ROOT="$root"
+  if ! _engine_pg_assert_loopback "$port"; then _engine_pg_down; return 1; fi
+  export INTEGRATION_TEST=1 PNEUMA_TEST_PG_DSN="postgresql://gate:$pw@127.0.0.1:$port/postgres"
+  echo "live-pg: native PostgreSQL 16 on 127.0.0.1:$port (per-run cluster, stopped on exit)"
+}
+
+# Arm teardown without clobbering an EXIT handler the caller already set: ours runs
+# first, then the previous handler (simple one-line handlers are chained verbatim).
+_engine_pg_arm_exit() {
+  local prev body
+  prev="$(trap -p EXIT)"
+  body="$(printf '%s' "$prev" | sed -n "s/^trap -- '\(.*\)' EXIT\$/\1/p")"
+  _ENGINE_PREV_EXIT="$body"
+  trap '_engine_pg_down; [ -n "$_ENGINE_PREV_EXIT" ] && eval "$_ENGINE_PREV_EXIT"' EXIT
+}
+
 profile_gate() {
   local envdir="$1" head="$2" base="$3" timeout_s="$4"
+  _engine_pg_up "$PNEUMA_GATE_RUN_DIR" || return 1
+  _engine_pg_arm_exit
   # The gate pip-installs INTO its interpreter (editable project + per-service
   # extras), so each run gets its own venv: a hard-linked copy of the frozen
   # cache (instant, no extra disk) with writable directories. Files stay

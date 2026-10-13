@@ -87,6 +87,68 @@ export PATH="$work/bin:$PATH" PNEUMA_GATE_RUNNER="$RUNNER" PNEUMA_GATE_HOST=fake
 marker_of() { grep '^PNEUMA_GATE_RESULT ' <<<"$1" | tail -1; }
 field_of() { tr ' ' '\n' <<<"$1" | sed -n "s/^$2=//p" | head -1; }
 
+# ── engine profile: the per-run live-Postgres cluster (GATE-PG-1) ─────────
+# Stub PostgreSQL binaries and ss record their calls; the bring-up, the loopback
+# assertion and the teardown code run for real. A live cluster is exercised on
+# ci-builder, not here.
+pgstub="$work/pgstub"; mkdir -p "$pgstub"
+cat > "$pgstub/initdb" <<'STUB'
+#!/usr/bin/env bash
+d=""; for a in "$@"; do case "$a" in -D) n=1;; *) [ "${n:-0}" = 1 ] && d="$a" && n=0;; esac; done
+[ "${PG_STUB_INITDB_FAIL:-0}" = 1 ] && exit 1
+mkdir -p "$d" && echo initdb >> "$(dirname "$d")/calls"
+STUB
+cat > "$pgstub/pg_ctl" <<'STUB'
+#!/usr/bin/env bash
+d=""; prev=""; for a in "$@"; do [ "$prev" = -D ] && d="$a"; prev="$a"; done
+echo "pg_ctl $*" >> "$(dirname "$d")/calls"
+STUB
+cat > "$pgstub/ss" <<'STUB'
+#!/usr/bin/env bash
+port="$(grep -o -- '-p [0-9]*' "$PG_STUB_CALLS" | head -1 | cut -d' ' -f2)"
+case "${PG_STUB_SS:-loopback}" in
+  loopback) echo "LISTEN 0 4096 127.0.0.1:$port 0.0.0.0:*";;
+  wild)     echo "LISTEN 0 4096 0.0.0.0:$port 0.0.0.0:*";;
+  none)     :;;
+esac
+STUB
+chmod +x "$pgstub"/*
+pg_case() {  # <name> → a fresh run dir; sets PGRUN and PG_STUB_CALLS
+  PGRUN="$work/pgrun-$1"; mkdir -p "$PGRUN"; PG_STUB_CALLS="$PGRUN/pg/calls"; export PG_STUB_CALLS
+}
+
+pg_case missing
+pg_none=$(PNEUMA_GATE_PG_BIN="$work/no-such-bin" bash -c 'unset INTEGRATION_TEST PNEUMA_TEST_PG_DSN; source "$1"; _engine_pg_up "$2"; echo "rc=$?"' _ "$ENGINE_PROFILE" "$PGRUN" 2>&1)
+check "live-pg: missing binaries FAIL the gate (rc=1), never SKIPPED-and-green" grep -q "rc=1" <<<"$pg_none"
+check "live-pg: the missing-binaries failure is named" grep -q "cannot be green" <<<"$pg_none"
+
+pg_case loopback
+pg_ok=$(PATH="$pgstub:$PATH" PNEUMA_GATE_PG_BIN="$pgstub" bash -c 'source "$1"; _engine_pg_up "$2" && echo "dsn=$PNEUMA_TEST_PG_DSN int=$INTEGRATION_TEST"; _engine_pg_down' _ "$ENGINE_PROFILE" "$PGRUN" 2>&1)
+check "live-pg: exports a loopback DSN and INTEGRATION_TEST=1" grep -qE "^dsn=postgresql://gate:[A-Za-z0-9]{32}@127\.0\.0\.1:[0-9]+/postgres int=1$" <<<"$pg_ok"
+check "live-pg: the cluster is stopped on teardown" grep -q "pg_ctl -D $PGRUN/pg/data -m immediate -w stop" "$PG_STUB_CALLS"
+check "live-pg: the password file is private" test "$(stat -c %a "$PGRUN/pg/pw")" = 600
+
+pg_case wild
+pg_wild=$(PG_STUB_SS=wild PATH="$pgstub:$PATH" PNEUMA_GATE_PG_BIN="$pgstub" bash -c 'source "$1"; _engine_pg_up "$2"; echo "rc=$?"' _ "$ENGINE_PROFILE" "$PGRUN" 2>&1)
+check "live-pg: a listener beyond 127.0.0.1 FAILS the gate and stops the cluster" bash -c 'grep -q "rc=1" <<<"$1" && grep -q "beyond 127.0.0.1" <<<"$1" && grep -q "stop" "$2"' _ "$pg_wild" "$PG_STUB_CALLS"
+
+pg_case none
+pg_nolisten=$(PG_STUB_SS=none PATH="$pgstub:$PATH" PNEUMA_GATE_PG_BIN="$pgstub" bash -c 'source "$1"; _engine_pg_up "$2"; echo "rc=$?"' _ "$ENGINE_PROFILE" "$PGRUN" 2>&1)
+check "live-pg: no listener at all FAILS the gate" grep -q "nothing listens" <<<"$pg_nolisten"
+
+pg_case fail
+pg_fail=$(PG_STUB_INITDB_FAIL=1 PATH="$pgstub:$PATH" PNEUMA_GATE_PG_BIN="$pgstub" bash -c 'source "$1"; _engine_pg_up "$2"; echo "rc=$?"' _ "$ENGINE_PROFILE" "$PGRUN" 2>&1)
+check "live-pg: a failed initdb fails the gate" grep -q "rc=1" <<<"$pg_fail"
+
+pg_case chain
+chain_log="$work/chain.log"; : > "$chain_log"
+mkdir -p "$PGRUN/pg/data"; : > "$PG_STUB_CALLS"
+PATH="$pgstub:$PATH" PNEUMA_GATE_PG_BIN="$pgstub" bash -c '
+  trap "echo previous-exit-handler >> '"$chain_log"'" EXIT
+  source "$1"; _ENGINE_PG_ROOT="$2/pg"; _engine_pg_arm_exit' _ "$ENGINE_PROFILE" "$PGRUN"
+check "live-pg: a previous EXIT handler still runs (chained, not replaced)" grep -q "previous-exit-handler" "$chain_log"
+check "live-pg: the cluster is stopped by the same EXIT handler" grep -q "pg_ctl -D $PGRUN/pg/data -m immediate -w stop" "$PG_STUB_CALLS"
+
 # ── client end to end ────────────────────────────────────────────────────────
 out=$("$CLIENT" --repo-dir "$src" --profile fake --head "$head" --base "$base" --log-dir "$work/logs" 2>&1) && rc=0 || rc=$?
 echo "DBG:$out" >&2
