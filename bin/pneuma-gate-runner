@@ -31,10 +31,6 @@ RESERVE_CORES="${PNEUMA_GATE_RESERVE_CORES:-3}"       # left for runners + k3s
 RESERVE_MEM_MB="${PNEUMA_GATE_RESERVE_MEM_MB:-6144}"
 MAX_CONCURRENT="${PNEUMA_GATE_MAX_CONCURRENT:-4}"
 RUNS_CAP_MB="${PNEUMA_GATE_RUNS_CAP_MB:-61440}"          # admission refuses new runs past this many MB of run directories (60GiB)
-STOP_ATTEMPTS="${PNEUMA_GATE_STOP_ATTEMPTS:-5}"          # janitor passes that fail to stop a dead run's scope before the alert fires
-STOP_BACKOFF_S="${PNEUMA_GATE_STOP_BACKOFF_S:-2}"        # first retry delay within a pass; doubles each retry
-JANITOR_STATE="${PNEUMA_GATE_JANITOR_STATE:-/var/lib/pneuma-gate-janitor}"   # root-only: failure counters
-ALERT_FILE="${PNEUMA_GATE_ALERT_FILE:-/var/log/pneuma-gate-alerts.log}"      # root-owned alert log
 QUEUE_TIMEOUT_S="${PNEUMA_GATE_QUEUE_TIMEOUT_S:-10800}"
 GATE_TIMEOUT_S="${PNEUMA_GATE_TIMEOUT_S:-5400}"
 LOAD_CEILING_PCT="${PNEUMA_GATE_LOAD_CEILING_PCT:-150}" # % of nproc; only blocks stacking a 2nd gate
@@ -59,59 +55,21 @@ disk_free_gib() { df -BG --output=avail "$BASE_DIR" 2>/dev/null | tail -1 | tr -
 # ── capacity ─────────────────────────────────────────────────────────────────
 mem_available_mb() { awk '/^MemAvailable:/ {print int($2/1024)}' "$MEMINFO"; }
 load1_x100() { awk '{printf "%d", $1*100}' "$LOADAVG"; }
-# ROOT STATE. Every run has a record in $STATE_DIR/runs/<run id>, written by this root
-# runner. The gate user shares one uid across all runs, so nothing inside a run
-# directory is trusted: liveness, cores, memory and ownership come from here only.
-STATE_DIR="${PNEUMA_GATE_STATE_DIR:-/var/lib/pneuma-gate-state}"
-STATE_GRACE_S="${PNEUMA_GATE_STATE_GRACE_S:-120}"   # a scope that has just been requested may take this long to appear
-
-state_init() {  # root-owned, 0700, never a symlink
-  [ -L "$STATE_DIR" ] && return 1
-  mkdir -p "$STATE_DIR/runs" && chmod 0700 "$STATE_DIR" "$STATE_DIR/runs"
-}
-state_get() {  # <run id> <key>
-  local f="$STATE_DIR/runs/$1"
-  [ -f "$f" ] && [ ! -L "$f" ] || return 1
-  sed -n "s/^$2=//p" "$f" | head -1
-}
-state_create() {  # <run id> <runner pid> <cores> <mem_mb> <run dir>
-  local f="$STATE_DIR/runs/$1" tmp="$STATE_DIR/runs/.$1.$$"
-  [ -L "$f" ] && return 1
-  printf 'runner_pid=%s\ncores=%s\nmem_mb=%s\ndir=%s\nunit=pneuma-gate-%s.scope\nphase=admitted\nstopfails=0\ncreated=%s\n' \
-    "$2" "$3" "$4" "$5" "$1" "$(date +%s)" > "$tmp" && mv -f "$tmp" "$f"
-}
-state_set() {  # <run id> <key> <value>
-  local f="$STATE_DIR/runs/$1"
-  [ -f "$f" ] && [ ! -L "$f" ] || return 1
-  sed -i "s/^$2=.*/$2=$3/" "$f"
-}
-state_remove() { [ -L "$STATE_DIR/runs/$1" ] || rm -f "$STATE_DIR/runs/$1"; }
-
-# Live by ROOT state alone: the runner that admitted the run is alive, and the run's
-# scope is active (or the scope was requested so recently that it may not show yet).
-state_live() {  # <run id>
-  local rpid phase created
-  rpid="$(state_get "$1" runner_pid)" || return 1
-  kill -0 "$rpid" 2>/dev/null || return 1
-  phase="$(state_get "$1" phase)"
-  [ "$phase" = admitted ] && return 0
-  "$SYSTEMCTL_BIN" is-active --quiet "$(state_get "$1" unit)" && return 0
-  created="$(state_get "$1" created)"
-  [ $(( $(date +%s) - ${created:-0} )) -lt "$STATE_GRACE_S" ]
+# Admission counts the live gate SERVICES, from systemd: each unit's own configured
+# limits. Nothing inside a run directory is read, and no record is kept by this runner.
+live_runs() {   # prints "<id> <cores> <mem_mb>" for each active gate service
+  local unit id quota bytes cores mem
+  "$SYSTEMCTL_BIN" list-units --plain --no-legend --state=active,activating 'pneuma-gate-*.service' 2>/dev/null |
+    awk '{print $1}' | while read -r unit; do
+      id="${unit#pneuma-gate-}"; id="${id%.service}"
+      quota="$("$SYSTEMCTL_BIN" show -p CPUQuotaPerSecUSec --value "$unit" 2>/dev/null)"
+      bytes="$("$SYSTEMCTL_BIN" show -p MemoryMax --value "$unit" 2>/dev/null)"
+      cores="$(awk -v q="$quota" 'BEGIN { sub(/s$/, "", q); c = int(q + 0.5); if (c < 1) c = 1; print c }')"
+      case "$bytes" in ''|*[!0-9]*) mem=0;; *) mem=$(( bytes / 1048576 ));; esac
+      printf '%s %s %s\n' "$id" "$cores" "$mem"
+    done
 }
 
-live_runs() {   # prints "<id> <cores> <mem_mb>" for each live run, from root state only
-  local f id
-  [ -d "$STATE_DIR/runs" ] || return 0
-  for f in "$STATE_DIR"/runs/*; do
-    [ -f "$f" ] && [ ! -L "$f" ] || continue
-    id="$(basename "$f")"
-    state_live "$id" || continue
-    printf '%s %s %s\n' "$id" "$(state_get "$id" cores)" "$(state_get "$id" mem_mb)"
-  done
-}
-# can_admit <cores> <mem_mb> — true when this gate fits beside the live ones
-# AND beside whatever the host's runners/k3s are already using.
 can_admit() {
   local cores="$1" mem="$2" n=0 used_c=0 id c m
   while read -r id c m; do
@@ -149,9 +107,9 @@ cmd_have() {
 
 # ── janitor ──────────────────────────────────────────────────────────────────
 SYSTEMCTL_BIN="${PNEUMA_GATE_SYSTEMCTL:-systemctl}"
+command -v "$SYSTEMCTL_BIN" >/dev/null 2>&1 || { echo "pneuma-gate-runner: no systemctl ($SYSTEMCTL_BIN): admission and the gate unit need systemd" >&2; exit 75; }
 
-# The janitor decides from ROOT state only (state_live, the record's own fields). A
-# run directory is deleted only when it passes safe_run_dir: a real directory under
+# A run directory is deleted only when it passes safe_run_dir: a real directory under
 # the runs root, not a symlink, owned by the gate user. Defense in depth.
 safe_run_dir() {  # <dir>
   local real real_root
@@ -170,61 +128,23 @@ gate_rm() {  # <dir>
   else rm -rf --one-file-system -- "$1"; fi
 }
 
-# Stop a scope by unit name, retrying with doubling backoff within the pass.
-stop_run_scope() {  # <unit>: 0 when stopped (or never there)
-  local tries=0 delay="$STOP_BACKOFF_S"
-  while [ "$tries" -lt 3 ]; do
-    "$SYSTEMCTL_BIN" stop "$1" >/dev/null 2>&1 && return 0
-    tries=$((tries + 1)); sleep "$delay"; delay=$((delay * 2))
-  done
-  return 1
-}
 
-# The failure count is a field of the run's ROOT record.
-bump_stop_fail() {  # <run id>: the new count
-  local n
-  n=$(( $(state_get "$1" stopfails) + 1 ))
-  state_set "$1" stopfails "$n"
-  echo "$n"
-}
 
-# A leaked run is never silent: an ERROR in the journal (priority err) and the alert log.
-janitor_alert() {  # <message>
-  log "ERROR ALERT $1"
-  logger -t pneuma-gate -p daemon.err -- "ALERT $1" 2>/dev/null || true
-  [ -L "$ALERT_FILE" ] || printf '%s ALERT %s\n' "$(date -u +%FT%TZ)" "$1" >> "$ALERT_FILE"
-}
 
 cmd_janitor() {
-  local f id dir unit n d
-  for f in "$STATE_DIR"/runs/*; do
-    [ -f "$f" ] && [ ! -L "$f" ] || continue
-    id="$(basename "$f")"
-    state_live "$id" && continue
-    dir="$(state_get "$id" dir)"; unit="$(state_get "$id" unit)"
-    # The scope goes FIRST: stopping it kills whatever the run left, its postmaster included.
-    log "janitor: dead run $id: stopping $unit"
-    if ! stop_run_scope "$unit"; then
-      n="$(bump_stop_fail "$id")"
-      log "janitor: cannot stop $unit (failed pass $n of $STOP_ATTEMPTS); keeping its directory"
-      if [ "$n" -ge "$STOP_ATTEMPTS" ]; then
-        janitor_alert "gate run $id LEAKED: $unit cannot be stopped after $n passes; its directory is kept and counts toward the gate disk cap"
-      fi
-      continue
-    fi
-    if [ -z "$dir" ] || ! safe_run_dir "$dir"; then
-      janitor_alert "gate run $id has no safe directory to remove ($dir); record kept for review"
-      continue
-    fi
-    log "janitor: removing dead run $id"; gate_rm "$dir"
-    state_remove "$id"
-  done
-  # Directories with NO root record (a crash between mkdir and the record): removed only
-  # when a day old and safe. Nothing inside them is read.
+  # A gate runs as a transient systemd service: when its main process exits, crashes or
+  # hits RuntimeMaxSec, systemd kills its whole cgroup, postmaster included. The only
+  # thing left behind is a run directory, when the runner itself died before cleanup.
+  # Such a directory is removed only when its unit is not active AND it has been idle
+  # for an hour (a run being admitted right now is never touched), and the deletion
+  # runs as the gate user. Nothing inside the directory is read.
+  local d id
   while IFS= read -r d; do
-    [ -f "$STATE_DIR/runs/$(basename "$d")" ] && continue
-    safe_run_dir "$d" && gate_rm "$d"
-  done < <(find "$BASE_DIR/runs" -mindepth 1 -maxdepth 1 -type d ! -type l -mtime +1 2>/dev/null)
+    id="$(basename "$d")"
+    "$SYSTEMCTL_BIN" is-active --quiet "pneuma-gate-$id.service" && continue
+    safe_run_dir "$d" || continue
+    log "janitor: removing leftover run $id (its gate unit is not active)"; gate_rm "$d"
+  done < <(find "$BASE_DIR/runs" -mindepth 1 -maxdepth 1 -type d ! -type l -mmin +60 2>/dev/null)
   for f in "$BASE_DIR"/queue/*; do
     [ -e "$f" ] || continue
     case "$(basename "$f")" in in-*) [ -n "$(find "$f" -mmin +120 2>/dev/null)" ] && rm -f "$f"; continue;; esac
@@ -256,11 +176,13 @@ result() {   # result <exit> [reason]
 }
 cleanup() {
   [ -n "$QUEUE_FILE" ] && rm -f "$QUEUE_FILE"
-  if [ -n "$RUN_DIR" ] && [ -d "$RUN_DIR" ]; then
-    state_remove "$(basename "$RUN_DIR")"
-    gate_rm "$RUN_DIR"
-  fi
+  release_admit
+  if [ -n "$RUN_DIR" ] && [ -d "$RUN_DIR" ]; then gate_rm "$RUN_DIR"; fi
 }
+
+# The admission lock is held from admission until the gate's unit is up, so two runners
+# can never both count the same free capacity.
+release_admit() { flock -u 9 2>/dev/null || true; exec 9>&- 2>/dev/null || true; }
 refuse() { log "REFUSED: $1"; result 75 "$1"; exit 75; }
 
 # first live waiter in the FIFO queue (dead waiters are dropped as we go)
@@ -281,11 +203,10 @@ admit() {   # admit <cores> <mem_mb> — block until admitted; creates RUN_DIR
     if [ "$(first_live_waiter)" = "$(basename "$QUEUE_FILE")" ] && can_admit "$cores" "$mem"; then
       RUN_DIR="$BASE_DIR/runs/$(date +%Y%m%dT%H%M%S)-$$"
       mkdir -p "$RUN_DIR/work" "$RUN_DIR/tmp" "$RUN_DIR/home"
-      state_create "$(basename "$RUN_DIR")" "$$" "$cores" "$mem" "$RUN_DIR" || refuse "cannot record the run's state"
       if [ -n "$RUN_AS" ]; then chown -R "$RUN_AS" "$RUN_DIR"; fi
       chmod 755 "$RUN_DIR"
       rm -f "$QUEUE_FILE"; QUEUE_FILE=""
-      flock -u 9; exec 9>&-
+      # the lock stays held: release_admit runs once this run's unit is up
       log "admitted run $(basename "$RUN_DIR") after ${waited}s queued (cores=$cores mem=${mem}MB)"
       return 0
     fi
@@ -354,7 +275,6 @@ cmd_run() {
     || refuse "cannot create $BASE_DIR"
   if [ -n "$RUN_AS" ]; then chown "$RUN_AS" "$BASE_DIR" "$BASE_DIR"/repos "$BASE_DIR"/envs "$BASE_DIR"/queue 2>/dev/null; fi
 
-  state_init || refuse "cannot create the root run-state directory $STATE_DIR"
   cmd_janitor >/dev/null 2>&1   # reap dead runs first so their space counts
   local free; free="$(disk_free_gib)"
   [ -n "$free" ] || refuse "cannot read disk usage for $BASE_DIR"
@@ -412,22 +332,32 @@ cmd_run() {
   ensure_env "$profile" "$work"
 
   # ── the gate itself, in a scrubbed environment (no ambient credentials) ────
-  local rc
-  # The run's resource budget is a transient systemd scope: every process the gate starts,
-  # the per-run PostgreSQL included (it double-forks but keeps its cgroup), is bounded by
-  # this run's memory and CPU. The admission budget (cores, mem) is what the scope enforces.
-  local scope_bin="${PNEUMA_GATE_SYSTEMD_RUN:-systemd-run}" runner_prefix=()
-  command -v "$scope_bin" >/dev/null 2>&1 || refuse "no $scope_bin: the gate's resource scope is required"
-  [ -n "$RUN_AS" ] && runner_prefix=(runuser -u "$RUN_AS" --)
-  # From here the scope may exist: the root record says so (liveness now needs it active).
-  state_set "$(basename "$RUN_DIR")" phase scoped || refuse "cannot record the run's scope"
-  "$scope_bin" --scope --quiet --collect --unit="pneuma-gate-$(basename "$RUN_DIR")" \
-    -p MemoryMax="${mem}M" -p CPUQuota="$((cores * 100))%" -p TasksMax=512 -- \
-    "${runner_prefix[@]}" env -i PATH=/usr/local/bin:/usr/bin:/bin HOME="$RUN_DIR/home" TMPDIR="$RUN_DIR/tmp" LANG=C.UTF-8 \
+  local rc gate_pid i
+  # The gate is a transient systemd SERVICE. systemd owns its lifetime: when the main
+  # process exits, crashes or hits RuntimeMaxSec, KillMode=control-group kills everything
+  # in the unit, the per-run PostgreSQL included. No reaper, no records, no PID files.
+  local unit="pneuma-gate-$(basename "$RUN_DIR")" scope_bin="${PNEUMA_GATE_SYSTEMD_RUN:-systemd-run}" uid_args=()
+  command -v "$scope_bin" >/dev/null 2>&1 || refuse "no $scope_bin: the gate's service unit is required"
+  [ -n "$RUN_AS" ] && uid_args=(--uid="$RUN_AS")
+  "$scope_bin" --unit="$unit" --wait --collect --quiet "${uid_args[@]}" \
+    --property=KillMode=control-group --property=MemoryMax="${mem}M" \
+    --property=CPUQuota="$((cores * 100))%" --property=TasksMax=512 \
+    --property=RuntimeMaxSec="$GATE_TIMEOUT_S" -- \
+    env -i PATH=/usr/local/bin:/usr/bin:/bin HOME="$RUN_DIR/home" TMPDIR="$RUN_DIR/tmp" LANG=C.UTF-8 \
     PNEUMA_GATE_REMOTE_RUN=1 PNEUMA_GATE_RUN_DIR="$RUN_DIR" PNEUMA_GATE_CORES="$cores" "${fwd_env[@]}" \
     bash -c 'source "$1"; cd "$2"; shift 2; profile_gate "$@"' _ \
-    "$PROFILE_DIR/$profile.sh" "$work" "$ENV_DIR" "$head" "$base" "$GATE_TIMEOUT_S" 2>&1
-  rc=$?
+    "$PROFILE_DIR/$profile.sh" "$work" "$ENV_DIR" "$head" "$base" "$GATE_TIMEOUT_S" 9>&- &
+  gate_pid=$!
+  # The admission lock covers the start: released once the unit is up (or the start ended).
+  for i in $(seq 1 120); do
+    "$SYSTEMCTL_BIN" is-active --quiet "$unit.service" && break
+    kill -0 "$gate_pid" 2>/dev/null || break
+    sleep 0.5
+  done
+  release_admit
+  wait "$gate_pid"; rc=$?
+  # The unit's output went to the journal: keep it in this verdict's log.
+  "${JOURNALCTL_BIN:-journalctl}" -u "$unit.service" --no-pager -o cat 2>/dev/null | sed 's/^/  gate: /' || true
   if [ "$rc" -eq 0 ]; then
     log "gate GREEN"; result 0; return 0
   elif [ "$rc" -eq 124 ]; then
