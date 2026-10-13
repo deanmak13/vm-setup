@@ -112,6 +112,19 @@ git -C "$src" config remote.origin.url https://github.com/deanmak13/fakerepo.git
 done_out=$("$CLIENT" --repo-dir "$src" --head "$base" --base "$base" --scope-only 2>&1) && done_rc=0 || done_rc=$?
 check "scope: a head already on origin/main is NOTHING TO GATE (exit 3, not 0)" bash -c '[ "$1" = 3 ] && grep -q "NOTHING TO GATE" <<<"$2"' _ "$done_rc" "$done_out"
 
+# Mutation guards (review of #16): the scoping base must come from FETCH_HEAD, not
+# from a refs/remotes/origin/main that a fetch did not rewrite. Here the fetch only
+# updates refs/remotes/other/*, and refs/remotes/origin/main is left pointing at the
+# head itself. Reading the stale ref would scope on merge-base(head, head) and call
+# the head "nothing to gate"; FETCH_HEAD gives the real base.
+git -C "$src" config remote.origin.fetch '+refs/heads/*:refs/remotes/other/*'
+git -C "$src" update-ref refs/remotes/origin/main "$head"
+fh_out=$("$CLIENT" --repo-dir "$src" --head "$head" --base "$base" --scope-only 2>&1) && fh_rc=0 || fh_rc=$?
+check "scope: the base comes from FETCH_HEAD (a stale refs/remotes/origin/main is ignored)" \
+  bash -c '[ "$1" = 0 ] && grep -q "base '"${base:0:12}"'" <<<"$2"' _ "$fh_rc" "$fh_out"
+git -C "$src" config remote.origin.fetch '+refs/heads/*:refs/remotes/origin/*'
+git -C "$src" update-ref refs/remotes/origin/main "$base"
+
 # The engine profile's scope report, run in a throwaway checkout whose selector is
 # a stub: the test covers the report's plumbing (diff count, selector grep), not
 # the selector itself (tools/ci has its own suite).
@@ -130,6 +143,20 @@ check "engine profile: scope report counts the changed files" grep -q "1 changed
 check "engine profile: the scope report's selector runs scrubbed (no ambient secret)" bash -c '! grep -q SECRET_TEST_TOKEN "$1/stub-env.txt"' _ "$scope_repo"
 check "engine profile: scope report lists the always-on guards line" grep -q "always-on guards" <<<"$report_out"
 check "engine profile: scope report shows the selected services" grep -q "services selected: \['svc'\]" <<<"$report_out"
+
+# The scope report runs the head's selector (PR code): it must be time-bounded.
+hang_repo="$work/hang-repo"; mkdir -p "$hang_repo/tools/ci"
+git -C "$hang_repo" init -q -b main
+printf 'a\n' > "$hang_repo/a.txt"; git -C "$hang_repo" add a.txt; git -C "$hang_repo" commit -qm a
+hang_base=$(git -C "$hang_repo" rev-parse HEAD)
+printf 'b\n' > "$hang_repo/b.txt"; git -C "$hang_repo" add b.txt; git -C "$hang_repo" commit -qm b
+hang_head=$(git -C "$hang_repo" rev-parse HEAD)
+printf '%s\n' "import time" "time.sleep(30)" > "$hang_repo/tools/ci/detect_changed_services.py"
+hang_t0=$(date +%s)
+hang_out=$(cd "$hang_repo" && PNEUMA_SCOPE_TIMEOUT_S=2 bash -c 'source "$1"; profile_scope_report "$2" "$3"' _ "$ENGINE_PROFILE" "$hang_base" "$hang_head" 2>&1 || true)
+hang_secs=$(( $(date +%s) - hang_t0 ))
+check "scope report: a hanging selector is killed by the time limit (returns in seconds, not 30)" test "$hang_secs" -lt 15
+check "scope report: a killed selector yields no services line (no false selection)" bash -c '! grep -q "services selected" <<<"$1"' _ "$hang_out"
 
 # ── client end to end ────────────────────────────────────────────────────────
 out=$("$CLIENT" --repo-dir "$src" --profile fake --head "$head" --base "$base" --log-dir "$work/logs" 2>&1) && rc=0 || rc=$?

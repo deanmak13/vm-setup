@@ -100,7 +100,7 @@ profile_scope_report() {
   files="$(git diff --name-only "$base" "$head")"
   echo "$(printf '%s\n' "$files" | grep -c .) changed file(s) vs base ${base:0:12} (head ${head:0:12})"
   printf '%s\n' "$files" | env -i PATH=/usr/local/bin:/usr/bin:/bin HOME="$HOME" LANG=C.UTF-8 \
-      timeout 120 python3 tools/ci/detect_changed_services.py explain 2>&1 |
+      timeout "${PNEUMA_SCOPE_TIMEOUT_S:-120}" python3 tools/ci/detect_changed_services.py explain 2>&1 |
     grep -E "services selected|services: FULL|connectors selected|connectors: FULL|always-on guards"
 }
 
