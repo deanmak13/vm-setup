@@ -212,6 +212,12 @@ if pg_lsclusters 2>/dev/null | awk 'NR>1 && $1=="16" && $2=="main"{f=1} END{exit
 fi
 systemctl disable --now postgresql 2>/dev/null || true
 
+# Only root may schedule work. The gate user runs inside the gate's scope, and must not
+# be able to leave a cron job or an at job behind that outlives the scope.
+log "restricting cron and at to root"
+printf 'root\n' > /etc/cron.allow && chmod 0644 /etc/cron.allow
+printf 'root\n' > /etc/at.allow && chmod 0644 /etc/at.allow
+
 # ── 2. Docker ────────────────────────────────────────────────────────────
 if ! command -v docker &>/dev/null; then
     log "installing Docker CE"

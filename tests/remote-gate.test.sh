@@ -164,29 +164,44 @@ check "live-pg: the cluster is stopped by the same EXIT handler" grep -q "pg_ctl
 # A cluster belongs to the gate PID that started it (owner.pid). It is reaped only
 # when that owner is dead and the cluster has been idle past the threshold.
 reap_base="$work/reapbase"; mkdir -p "$reap_base/runs"
-mk_run() {  # <name> <owner pid> <idle ago>
-  local d="$reap_base/runs/$1"; mkdir -p "$d/pg/data"; : > "$d/pg/calls"
+# a run: owner (gate PID), a cluster, and WAL/log activity <idle_s> seconds ago
+mk_run() {  # <name> <owner pid> <idle_s>
+  local d="$reap_base/runs/$1"; mkdir -p "$d/pg/data/pg_wal"; : > "$d/pg/calls"
   printf '%s\n' "$2" > "$d/owner.pid"; printf '%s\n' "$2" > "$d/pg/data/postmaster.pid"
-  if [ -n "$3" ]; then touch -d "$3 ago" "$d/pg/data/postmaster.pid"; fi
+  : > "$d/pg/data/pg_wal/000000010000000000000001"; : > "$d/pg/server.log"
+  if [ -n "$3" ]; then
+    touch -d "@$(( $(date +%s) - $3 ))" "$d/pg/data/pg_wal/000000010000000000000001" "$d/pg/server.log" "$d/pg/data/postmaster.pid"
+  fi
   return 0
 }
 sleep 300 & live_owner=$!
 sleep 300 & other_live_owner=$!
 sleep 0 & dead_owner=$!; wait "$dead_owner" 2>/dev/null || true
-reap_run() {  # <current run name>
-  PNEUMA_GATE_PG_ORPHAN_AGE_S=900 PATH="$pgstub:$PATH" PNEUMA_GATE_PG_BIN="$pgstub" \
-    bash -c 'source "$1"; _engine_pg_reap_orphans "$2" "$2/runs/$3"' _ "$ENGINE_PROFILE" "$reap_base" "$1" 2>/dev/null
-}
-mk_run current "$live_owner" "2 hours"
-mk_run live-concurrent "$other_live_owner" "2 hours"
-mk_run dead-old "$dead_owner" "2 hours"
-mk_run dead-young "$dead_owner" "1 minute"
-mk_run mine-dead-owner "$live_owner" "2 hours"
-reap_run current
-check "reap: a concurrent run's live cluster survives (its owner is alive)" test ! -s "$reap_base/runs/live-concurrent/pg/calls"
-check "reap: a dead run's cluster idle past the threshold is reaped" grep -q "stop" "$reap_base/runs/dead-old/pg/calls"
-check "reap: a dead run's cluster still inside the threshold is left alone" test ! -s "$reap_base/runs/dead-young/pg/calls"
+mk_run current "$live_owner" 7200
+mk_run live-concurrent "$other_live_owner" 7200
+mk_run dead-old "$dead_owner" 7200
+mk_run dead-young "$dead_owner" 60
+mk_run dead-active "$dead_owner" 7200
+touch "$reap_base/runs/dead-active/pg/data/pg_wal/000000010000000000000001"   # WAL just written: active
+# ITEM 1: the production call: env -i, only PNEUMA_GATE_RUN_DIR (no PNEUMA_GATE_BASE)
+env -i PATH="$pgstub:/usr/bin:/bin" PNEUMA_GATE_PG_BIN="$pgstub" PNEUMA_GATE_PG_ORPHAN_AGE_S=900 \
+  PNEUMA_GATE_RUN_DIR="$reap_base/runs/current" bash -c 'source "$1"; _engine_pg_reap_current' _ "$ENGINE_PROFILE" 2>/dev/null
+check "reap (env -i, production path): a dead run's cluster idle past the threshold is reaped" grep -q "stop" "$reap_base/runs/dead-old/pg/calls"
+check "reap (env -i): a concurrent run's live cluster survives (its owner is alive)" test ! -s "$reap_base/runs/live-concurrent/pg/calls"
+check "reap (env -i): a dead run's cluster still inside the threshold is left alone" test ! -s "$reap_base/runs/dead-young/pg/calls"
+check "reap: a dead run with recent WAL activity is left alone (activity, not file age)" test ! -s "$reap_base/runs/dead-active/pg/calls"
 check "reap: the current run is never reaped" test ! -s "$reap_base/runs/current/pg/calls"
+# ITEM 3: symlinks never lead the reaper anywhere
+mkdir -p "$work/outside-lane/pg/data/pg_wal"; : > "$work/outside-lane/pg/calls"
+printf '%s\n' "$dead_owner" > "$work/outside-lane/owner.pid"; printf '%s\n' "$dead_owner" > "$work/outside-lane/pg/data/postmaster.pid"
+touch -d "@$(( $(date +%s) - 7200 ))" "$work/outside-lane/pg/data/postmaster.pid"
+mk_run planted-data "$dead_owner" 7200
+rm -rf "$reap_base/runs/planted-data/pg/data"; ln -s "$work/outside-lane/pg/data" "$reap_base/runs/planted-data/pg/data"
+ln -s "$work/outside-lane" "$reap_base/runs/planted-run"
+PNEUMA_GATE_PG_ORPHAN_AGE_S=900 PATH="$pgstub:$PATH" PNEUMA_GATE_PG_BIN="$pgstub" \
+  bash -c 'source "$1"; _engine_pg_reap_orphans "$2" "$3"' _ "$ENGINE_PROFILE" "$reap_base/runs" "$reap_base/runs/current" 2>/dev/null
+check "symlinks: a run directory that is a symlink into another lane is never touched" test ! -s "$work/outside-lane/pg/calls"
+check "symlinks: a data directory that is a symlink is never stopped" test ! -s "$work/outside-lane/pg/calls"
 kill "$live_owner" "$other_live_owner" 2>/dev/null; wait 2>/dev/null || true
 
 # The live verdict on canned junit reports (the same function the gate runs).
@@ -362,10 +377,41 @@ check "concurrency: runs were isolated HOME/TMPDIR" bash -c "[ \$(cat '$work'/c?
 expect_eq "concurrency: nothing left behind" 0 "$(find "$PNEUMA_GATE_BASE/runs" "$PNEUMA_GATE_BASE/queue" -mindepth 1 | wc -l)"
 rm -f "$work/profiles/sleep"
 
-# ── janitor reaps dead runs ─────────────────────────────────────────────────
+# ── janitor: scope first, then the directory; real run dirs only (GATE-PG-1 review) ─
+cat > "$work/bin/systemctl-stub" <<'STUB'
+#!/usr/bin/env bash
+# records "stop <unit> dir-present=<yes|no>" at the moment of the stop
+unit="$2"; run="${unit#pneuma-gate-}"; run="${run%.scope}"
+present=no; [ -d "$PNEUMA_GATE_BASE/runs/$run" ] && present=yes
+echo "stop $unit dir-present=$present" >> "$SYSTEMCTL_RECORD"
+case "$unit" in *fail-stop*) exit 1;; esac
+exit 0
+STUB
+chmod +x "$work/bin/systemctl-stub"
+export SYSTEMCTL_RECORD="$work/systemctl-record.txt"; : > "$SYSTEMCTL_RECORD"
+export PNEUMA_GATE_SYSTEMCTL="$work/bin/systemctl-stub"
 mkdir -p "$PNEUMA_GATE_BASE/runs/dead-1"; echo 999999 > "$PNEUMA_GATE_BASE/runs/dead-1/pid"
+mkdir -p "$PNEUMA_GATE_BASE/runs/fail-stop-1"; echo 999999 > "$PNEUMA_GATE_BASE/runs/fail-stop-1/pid"
+mkdir -p "$work/janitor-outside"; echo 999999 > "$work/janitor-outside/pid"; : > "$work/janitor-outside/keep.txt"
+ln -s "$work/janitor-outside" "$PNEUMA_GATE_BASE/runs/planted-run"
 "$RUNNER" janitor >/dev/null 2>&1
 check "janitor: removes a run whose owner died" not test -e "$PNEUMA_GATE_BASE/runs/dead-1"
+check "janitor: the run's scope is stopped BEFORE its directory is removed" grep -q "stop pneuma-gate-dead-1.scope dir-present=yes" "$SYSTEMCTL_RECORD"
+check "janitor: a planted symlink in runs/ is never followed (its target survives)" test -e "$work/janitor-outside/keep.txt"
+check "janitor: a planted symlink is never sent a scope stop" bash -c '! grep -q "planted-run" "$1"' _ "$SYSTEMCTL_RECORD"
+check "janitor: if the scope cannot be stopped, the directory is kept (fail closed)" test -e "$PNEUMA_GATE_BASE/runs/fail-stop-1"
+unset PNEUMA_GATE_SYSTEMCTL
+
+# ── cron and at: only root may schedule work (ITEM 6) ────────────────────────
+check "cron/at: the bootstrap restricts both to root (cron.allow and at.allow)" bash -c '
+  f="$1"; grep -q "printf .root.*/etc/cron.allow" "$f" && grep -q "printf .root.*/etc/at.allow" "$f"' _ "$REPO_DIR/ci-builder-bootstrap.sh"
+
+# ── live timeout: a hung live run fails the gate (ITEM 4) ─────────────────────
+hang_venv="$work/hangvenv"; mkdir -p "$hang_venv/bin"
+printf '#!/usr/bin/env bash\nsleep 30\n' > "$hang_venv/bin/python"; chmod +x "$hang_venv/bin/python"
+hang_run="$work/hangrun"; mkdir -p "$hang_run"
+hang_out=$(cd "$live_repo" && PNEUMA_LIVE_TIMEOUT_S=1 PNEUMA_GATE_RUN_DIR="$hang_run" bash -c 'source "$1"; _engine_run_live "$2"; echo "rc=$?"' _ "$ENGINE_PROFILE" "$hang_venv" 2>&1)
+check "live timeout: a hung live run FAILS the gate, promptly" bash -c 'grep -q "timed out" <<<"$1" && grep -q "rc=1" <<<"$1"' _ "$hang_out"
 
 # ── profiles honour the contract the runner depends on ──────────────────────
 for p in "$ENGINE_PROFILE" "$PORTAL_PROFILE"; do

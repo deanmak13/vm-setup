@@ -101,15 +101,37 @@ cmd_have() {
 }
 
 # ── janitor ──────────────────────────────────────────────────────────────────
+SYSTEMCTL_BIN="${PNEUMA_GATE_SYSTEMCTL:-systemctl}"
+
+# Real run directories only: no symlinks anywhere on the path, inside the runs root,
+# and owned by the gate user. A test that plants a symlink in runs/ gets nothing.
+gate_run_dirs() {
+  local root real_root d real
+  root="$BASE_DIR/runs"
+  [ -d "$root" ] && [ ! -L "$root" ] || return 0
+  real_root="$(realpath -e "$root")" || return 0
+  while IFS= read -r d; do
+    real="$(realpath -e "$d")" || continue
+    case "$real" in "$real_root"/*) ;; *) continue;; esac
+    if [ -n "$RUN_AS" ] && [ "$(stat -c %U "$real")" != "$RUN_AS" ]; then continue; fi
+    printf '%s\n' "$real"
+  done < <(find "$root" -mindepth 1 -maxdepth 1 -type d ! -type l 2>/dev/null)
+}
+
 cmd_janitor() {
   local d pid store ref ts f
-  for d in "$BASE_DIR"/runs/*/; do
-    [ -d "$d" ] || continue
+  while IFS= read -r d; do
     pid="$(cat "$d/pid" 2>/dev/null || true)"
     if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
-      log "janitor: removing dead run $(basename "$d")"; rm -rf "$d"
+      # The run's scope goes FIRST: stopping it kills the run's postmaster, so nothing
+      # is still writing into the directory when it is removed.
+      log "janitor: stopping the scope of dead run $(basename "$d")"
+      if ! "$SYSTEMCTL_BIN" stop "pneuma-gate-$(basename "$d").scope" >/dev/null 2>&1; then
+        log "janitor: cannot stop the scope of $(basename "$d"); keeping its directory"; continue
+      fi
+      log "janitor: removing dead run $(basename "$d")"; rm -rf -- "$d"
     fi
-  done
+  done < <(gate_run_dirs)
   for f in "$BASE_DIR"/queue/*; do
     [ -e "$f" ] || continue
     case "$(basename "$f")" in in-*) [ -n "$(find "$f" -mmin +120 2>/dev/null)" ] && rm -f "$f"; continue;; esac

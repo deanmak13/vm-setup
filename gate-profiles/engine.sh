@@ -116,30 +116,50 @@ _engine_pg_assert_loopback() {  # <port>
 }
 
 # A gate killed with SIGKILL never runs its EXIT trap, so its cluster outlives it.
-# Each run records its gate's PID (owner.pid) before it starts a cluster. A cluster is
-# reaped only when its OWNER is dead (kill -0 fails) AND its postmaster has been idle
-# longer than PNEUMA_GATE_PG_ORPHAN_AGE_S. A live owner, a young cluster, this run's
-# own cluster, and anything not in a run directory are never touched: no reaping by
-# pattern, port or age alone.
-_engine_pg_reap_orphans() {  # <base> <current run dir>
-  local owner run gate_pid data pidfile mtime age threshold="${PNEUMA_GATE_PG_ORPHAN_AGE_S:-900}" now
+# A cluster is reaped only when ALL of these hold:
+#   - it sits in a real run directory (no symlinks anywhere on the path) under the
+#     runs root, and is not this run's own;
+#   - its owner (the gate PID in owner.pid, a regular file) is dead: kill -0 fails;
+#   - the cluster has been idle past PNEUMA_GATE_PG_ORPHAN_AGE_S, judged by its WAL
+#     and server log activity, not by the postmaster file's age.
+# Nothing is reaped by pattern, port, or age alone; a live owner is never touched.
+_engine_pg_real_dir() {  # <path> — prints the resolved path when it is a real directory, else fails
+  [ -d "$1" ] && [ ! -L "$1" ] || return 1
+  realpath -e "$1"
+}
+
+_engine_pg_reap_orphans() {  # <runs root> <current run dir>
+  local root real_root run real_run owner gate_pid data pidfile newest now threshold="${PNEUMA_GATE_PG_ORPHAN_AGE_S:-900}"
+  real_root="$(_engine_pg_real_dir "$1")" || return 0
+  real_run="$(_engine_pg_real_dir "$2")" || real_run=""
   now="$(date +%s)"
-  for owner in "$1"/runs/*/owner.pid; do
-    [ -f "$owner" ] || continue
-    run="$(dirname "$owner")"
-    [ "$run" = "$2" ] && continue
+  while IFS= read -r run; do
+    run="$(_engine_pg_real_dir "$run")" || continue                  # real directory, no symlink
+    case "$run" in "$real_root"/*) ;; *) continue;; esac           # under the runs root
+    [ "$run" = "$real_run" ] && continue                             # never this run's own
+    owner="$run/owner.pid"
+    [ -f "$owner" ] && [ ! -L "$owner" ] || continue
     gate_pid="$(head -1 "$owner" 2>/dev/null)"
     [[ "$gate_pid" =~ ^[0-9]+$ ]] || continue
-    kill -0 "$gate_pid" 2>/dev/null && continue          # a live gate owns it: a concurrent run
-    data="$run/pg/data"; pidfile="$data/postmaster.pid"
-    [ -f "$pidfile" ] || continue
-    mtime="$(stat -c %Y "$pidfile" 2>/dev/null || echo "$now")"
-    age=$(( now - mtime ))
-    [ "$age" -ge "$threshold" ] || continue
-    echo "live-pg: reaping the cluster of dead gate $gate_pid (run ${run##*/}, idle ${age}s)" >&2
+    kill -0 "$gate_pid" 2>/dev/null && continue                     # a live gate owns it: a concurrent run
+    data="$(_engine_pg_real_dir "$run/pg/data")" || continue
+    case "$data" in "$real_root"/*) ;; *) continue;; esac
+    pidfile="$data/postmaster.pid"
+    [ -f "$pidfile" ] && [ ! -L "$pidfile" ] || continue
+    # activity: the newest WAL segment or server log line. Regular files only.
+    newest="$(find "$data/pg_wal" "$run/pg/server.log" -maxdepth 1 -type f ! -type l -printf '%T@\n' 2>/dev/null | sort -n | tail -1)"
+    newest="${newest%%.*}"; newest="${newest:-0}"
+    [ $(( now - newest )) -ge "$threshold" ] || continue
+    echo "live-pg: reaping the cluster of dead gate $gate_pid (run ${run##*/}, idle $(( now - newest ))s)" >&2
     "$ENGINE_PG_BIN/pg_ctl" -D "$data" -m immediate -w stop >/dev/null 2>&1 || true
-  done
+  done < <(find "$real_root" -mindepth 1 -maxdepth 1 -type d ! -type l 2>/dev/null)
   return 0
+}
+
+# The reaper for this run: the runs root is the parent of this run's own directory.
+# Derived from PNEUMA_GATE_RUN_DIR alone, so it works under the sandbox's env -i.
+_engine_pg_reap_current() {
+  _engine_pg_reap_orphans "$(dirname "$PNEUMA_GATE_RUN_DIR")" "$PNEUMA_GATE_RUN_DIR"
 }
 
 _engine_pg_up() {  # <run dir> — exports INTEGRATION_TEST + PGTEST_DSN; returns 1 on any failure
@@ -220,10 +240,12 @@ _engine_run_live() {  # <venv>
   mods="$(_engine_live_modules)"
   if [ -z "$mods" ]; then _engine_live_verdict "$report"; return 1; fi
   # shellcheck disable=SC2086  # the module list is a word list by design
-  "$venv/bin/python" -m pytest $mods -q -p no:cacheprovider --junitxml="$report" \
-    > "$PNEUMA_GATE_RUN_DIR/live.log" 2>&1
+  # Bounded: a hung live suite must fail the gate, not hold the runner's slot forever.
+  timeout "${PNEUMA_LIVE_TIMEOUT_S:-900}" "$venv/bin/python" -m pytest $mods -q -p no:cacheprovider \
+    --junitxml="$report" > "$PNEUMA_GATE_RUN_DIR/live.log" 2>&1
   pyrc=$?
   cat "$PNEUMA_GATE_RUN_DIR/live.log"
+  if [ "$pyrc" = 124 ]; then echo "live-pg: FAILED — the live suites timed out after ${PNEUMA_LIVE_TIMEOUT_S:-900}s" >&2; return 1; fi
   [ "$pyrc" = 0 ] || { echo "live-pg: FAILED — the live suites exited $pyrc" >&2; return 1; }
   # shellcheck disable=SC2086
   _engine_live_verdict "$report" $mods
@@ -239,7 +261,7 @@ _engine_pg_arm_exit() {
 
 profile_gate() {
   local envdir="$1" head="$2" base="$3" timeout_s="$4"
-  _engine_pg_reap_orphans "$PNEUMA_GATE_BASE" "$PNEUMA_GATE_RUN_DIR"
+  _engine_pg_reap_current
   _engine_pg_up "$PNEUMA_GATE_RUN_DIR" || return 1
   _engine_pg_arm_exit
   # The gate pip-installs INTO its interpreter (editable project + per-service
