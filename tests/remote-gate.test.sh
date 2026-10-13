@@ -61,6 +61,7 @@ profile_env_key() { echo "fakekey1"; }
 profile_env_build() { mkdir -p "$1" && echo built > "$1/marker"; }
 profile_gate() {
   echo "gate cwd=$PWD home=$HOME tmp=$TMPDIR run=$PNEUMA_GATE_RUN_DIR env=$1"
+  echo "lockfd=$(ls -l /proc/$$/fd 2>/dev/null | grep -c admit.lock)"   # no admission lock may be open in the gate
   [ -e untracked-must-not-ship.txt ] && { echo "LEAK: untracked file shipped"; return 3; }
   # the runner scrubs the environment, so the knob is a file beside the profile
   [ -f "$(dirname "${BASH_SOURCE[0]}")/sleep" ] && sleep "$(cat "$(dirname "${BASH_SOURCE[0]}")/sleep")"
@@ -128,6 +129,7 @@ chmod +x "$work/bin/systemctl-stub"
 export PNEUMA_GATE_SYSTEMCTL="$work/bin/systemctl-stub"   # every test: never the host systemctl
 export SYSTEMCTL_ACTIVE="$work/systemctl-active.txt" UNITS_FILE="$work/systemctl-units.txt"
 export SYSTEMCTL_RECORD="$work/systemctl-record.txt"; : > "$SYSTEMCTL_RECORD"
+export PNEUMA_GATE_STATE_DIR="$work/root-state" PNEUMA_GATE_RUN_ROOT="$work/run"   # tests never touch /run or /var/lib
 
 marker_of() { grep '^PNEUMA_GATE_RESULT ' <<<"$1" | tail -1; }
 field_of() { tr ' ' '\n' <<<"$1" | sed -n "s/^$2=//p" | head -1; }
@@ -264,7 +266,7 @@ expect_eq "client: green gate exits 0" 0 "$rc"
 check "client: log names the exact head and tree" grep -q "$head" <<<"$out"
 check "client: log kept on the dev side" test -n "$(ls "$work/logs"/*.log)"
 check "client: dirty worktree file was NOT shipped (no LEAK)" not grep -q LEAK <<<"$out"
-expect_eq "per-run workspaces are deleted after a run" 0 "$(find "$PNEUMA_GATE_BASE/runs" -mindepth 1 -maxdepth 1 | wc -l)"
+expect_eq "per-run workspaces are deleted after a run" 0 "$(find "$PNEUMA_GATE_BASE/work" -mindepth 1 -maxdepth 1 | wc -l)"
 expect_eq "queue entries are removed after a run" 0 "$(find "$PNEUMA_GATE_BASE/queue" -mindepth 1 | wc -l)"
 check "env cache is built once and frozen read-only" test -e "$PNEUMA_GATE_BASE/envs/fake/fakekey1/.ready" -a "$(stat -c %a "$PNEUMA_GATE_BASE/envs/fake/fakekey1/marker")" = 444
 chmod -R u+w "$PNEUMA_GATE_BASE/envs" 2>/dev/null || true
@@ -370,84 +372,39 @@ expect_eq "concurrency: all three finished green" "0 0 0" "$(cat "$work/c1.rc" "
 check "concurrency: the 3rd logged that it queued" grep -q 'queued:' "$work/c3.out"
 check "concurrency: each run used its OWN workspace" bash -c "[ \$(cat '$work'/c?.out | grep -o 'cwd=[^ ]*' | sort -u | wc -l) = 3 ]"
 check "concurrency: runs were isolated HOME/TMPDIR" bash -c "[ \$(cat '$work'/c?.out | grep -o 'home=[^ ]*' | sort -u | wc -l) = 3 ]"
-expect_eq "concurrency: nothing left behind" 0 "$(find "$PNEUMA_GATE_BASE/runs" "$PNEUMA_GATE_BASE/queue" -mindepth 1 | wc -l)"
+expect_eq "concurrency: nothing left behind" 0 "$(find "$PNEUMA_GATE_BASE/work" "$PNEUMA_GATE_BASE/queue" -mindepth 1 | wc -l)"
 rm -f "$work/profiles/sleep"
 
-# ── janitor v3: leftover run directories, decided by systemd unit state only ──
-# A gate is a transient service: systemd kills its cgroup when it ends. The janitor only
-# removes a leftover directory whose unit is not active and that has been idle an hour.
-: > "$SYSTEMCTL_ACTIVE"
-printf 'pneuma-gate-live-1.service 1 512\n' > "$UNITS_FILE"
-printf 'pneuma-gate-live-1.service\n' > "$SYSTEMCTL_ACTIVE"
-export PNEUMA_GATE_SYSTEMCTL="$work/bin/systemctl-stub"
-
-# a runuser stand-in (records the call, runs it as this user): deletion goes through it
-cat > "$work/bin/runuser" <<'STUB'
-#!/usr/bin/env bash
-printf '%s\n' "$*" >> "$RUNUSER_RECORD"
-while [ $# -gt 0 ] && [ "$1" != -- ]; do shift; done; shift
-exec "$@"
-STUB
-chmod +x "$work/bin/runuser"
-export RUNUSER_RECORD="$work/runuser-record.txt"; : > "$RUNUSER_RECORD"
-export PATH="$work/bin:$PATH"
-
+# ── janitor: housekeeping only; systemd owns run directories (#17 acceptance) ───
+export PNEUMA_GATE_RUN_ROOT="$work/run"; mkdir -p "$PNEUMA_GATE_RUN_ROOT"
 old=$(( $(date +%s) - 7200 ))
-# J1. a leftover directory (no active unit, idle an hour) is removed, as the gate user
-mkdir -p "$PNEUMA_GATE_BASE/runs/leftover-1/work"; touch -d "@$old" "$PNEUMA_GATE_BASE/runs/leftover-1"
-PNEUMA_GATE_RUN_AS="$(id -un)" "$RUNNER" janitor >/dev/null 2>&1
-check "janitor: a leftover directory with no active gate unit is removed" not test -e "$PNEUMA_GATE_BASE/runs/leftover-1"
-check "janitor: the removal runs AS THE GATE USER (runuser -u, rm --one-file-system)" grep -q -- "-u $(id -un) -- rm -rf --one-file-system -- $PNEUMA_GATE_BASE/runs/leftover-1" "$RUNUSER_RECORD"
+# A run directory that outlives its unit is never deleted by the janitor: systemd removes them.
+leftover="$PNEUMA_GATE_RUN_ROOT/leftover-1"; mkdir -p "$leftover/work"; touch -d "@$old" "$leftover"
+"$RUNNER" janitor >/dev/null 2>&1
+check "janitor: never deletes a run directory (systemd owns it)" test -d "$leftover"
+check "janitor: never sends a unit a stop (systemd owns the lifetime)" bash -c '! grep -q "^stop " "$1"' _ "$SYSTEMCTL_RECORD"
 
-# J2. ATTACKS A and B are moot: a live unit's directory is never removed, whatever its files say
-live="$PNEUMA_GATE_BASE/runs/live-1"; mkdir -p "$live/pg"
-victim="$work/victim-cluster"; mkdir -p "$victim"; echo victim-data > "$victim/PG_VERSION"
-ln -s "$victim" "$live/pg/data"; printf '%s\n' 999999 > "$live/owner.pid"; printf '%s\n' 999999 > "$live/pid"
-touch -d "@$old" "$live"
-PNEUMA_GATE_RUN_AS="$(id -un)" "$RUNNER" janitor >/dev/null 2>&1
-check "attacks A/B: a directory of an ACTIVE gate unit is kept, despite forged owner.pid and symlinks" test -d "$live"
-check "attacks A/B: the symlink target of a forged postmaster path survives" grep -q victim-data "$victim/PG_VERSION"
+# SLOW START (acceptance): a reservation whose unit has not come up yet, with its workspace,
+# survives every janitor pass. Nothing is deleted on "unit not loaded" alone.
+mkdir -p "$PNEUMA_GATE_STATE_DIR/runs" "$PNEUMA_GATE_BASE/work/slow-1"
+printf 'state=pending\ncores=1\nmem_mb=512\ncreated=%s\n' "$(date +%s)" > "$PNEUMA_GATE_STATE_DIR/runs/slow-1"
+touch -d "@$old" "$PNEUMA_GATE_BASE/work/slow-1"
+"$RUNNER" janitor >/dev/null 2>&1
+check "slow start: the workspace of a reservation whose unit is not up is kept" test -d "$PNEUMA_GATE_BASE/work/slow-1"
+check "slow start: its fresh reservation marker is kept" test -f "$PNEUMA_GATE_STATE_DIR/runs/slow-1"
 
-# J3. a directory younger than an hour is never removed (a run being admitted right now)
-mkdir -p "$PNEUMA_GATE_BASE/runs/fresh-1"
-PNEUMA_GATE_RUN_AS="$(id -un)" "$RUNNER" janitor >/dev/null 2>&1
-check "janitor: a fresh directory is kept even with no active unit (admission window)" test -d "$PNEUMA_GATE_BASE/runs/fresh-1"
-
-# J4. a planted symlink in runs/ is never followed, and never removed as a run
-planted_target="$work/planted-target"; mkdir -p "$planted_target"; : > "$planted_target/keep.txt"
-ln -s "$planted_target" "$PNEUMA_GATE_BASE/runs/planted-link"
-PNEUMA_GATE_RUN_AS="$(id -un)" "$RUNNER" janitor >/dev/null 2>&1
-check "symlink: a planted symlink in runs/ is never followed (its target survives)" test -e "$planted_target/keep.txt"
-
-# J5. the owner check: a leftover directory NOT owned by the gate user is never deleted
-foreign="$PNEUMA_GATE_BASE/runs/foreign-1"; mkdir -p "$foreign"; touch -d "@$old" "$foreign"
-PNEUMA_GATE_RUN_AS="not-the-gate-user" "$RUNNER" janitor >/dev/null 2>&1
-check "owner check: a leftover directory not owned by the gate user is kept" test -d "$foreign"
-
-# J6. admission counts systemd units and their limits, never the files in a run directory
-printf 'pneuma-gate-live-1.service 1 512\n' > "$UNITS_FILE"
-printf '64\n' > "$live/cores"; printf '99999\n' > "$live/mem_mb"
+# Forged cores/mem in a run directory never reach admission: the unit's limits do.
+mkdir -p "$PNEUMA_GATE_RUN_ROOT/live-1"; printf '64\n' > "$PNEUMA_GATE_RUN_ROOT/live-1/cores"
+printf 'pneuma-gate-live-1.service 1 512\n' > "$UNITS_FILE"; printf 'pneuma-gate-live-1.service\n' > "$SYSTEMCTL_ACTIVE"
 live_line="$(bash -c 'source "$1"; live_runs' _ "$RUNNER" | grep '^live-1 ')"
-check "forged cores/mem: admission reads the unit's configured limits (1 core, 512MB), not the run directory" test "$live_line" = "live-1 1 512"
+check "forged cores/mem: admission reads the unit's configured limits (1 core, 512MB)" test "$live_line" = "live-1 1 512"
+: > "$SYSTEMCTL_ACTIVE"
 
-# ACCEPTANCE (review): no grace window and no stop by the janitor. A concurrent janitor
-# acts only on units that are not active, and it never stops a unit at all: systemd does.
-# A slow env build is an active unit, so its directory stays untouched however old it is.
-slow="$PNEUMA_GATE_BASE/runs/live-slow"; mkdir -p "$slow/work"; touch -d "@$old" "$slow"
-printf 'pneuma-gate-live-slow.service\n' >> "$SYSTEMCTL_ACTIVE"
-printf 'pneuma-gate-live-slow.service 1 512\n' >> "$UNITS_FILE"
-PNEUMA_GATE_RUN_AS="$(id -un)" "$RUNNER" janitor >/dev/null 2>&1
-check "acceptance: a slow build (active unit, old directory) is never touched" test -d "$slow/work"
-check "acceptance: the janitor never sends a unit a stop (systemd owns the lifetime)" bash -c '! grep -q "^stop " "$1"' _ "$SYSTEMCTL_RECORD"
-check "acceptance: no root state directory exists for liveness (nothing to be 0755)" bash -c '! grep -qE "STATE_DIR|runner_pid|janitor-state" "$1"' _ "$RUNNER"
-
-# Disk cap (the real cmd_run path): a fresh unrecorded directory counts and is kept.
-cap_run_base="$PNEUMA_GATE_BASE"
-mkdir -p "$cap_run_base/runs/bulk"; head -c 3000000 /dev/zero > "$cap_run_base/runs/bulk/blob"
+# Disk cap (the real cmd_run path): the workspaces past the cap refuse new runs, named.
+mkdir -p "$PNEUMA_GATE_BASE/work/bulk"; head -c 3000000 /dev/zero > "$PNEUMA_GATE_BASE/work/bulk/blob"
 cap_out="$(PNEUMA_GATE_RUNS_CAP_MB=1 "$RUNNER" run --profile fake --repo fakerepo --head "$head" --base "$base" --tree "$tree" 2>&1)" && cap_rc=0 || cap_rc=$?
-check "disk cap: admission refuses past the runs cap (exit 75, named)" bash -c '[ "$1" = 75 ] && grep -q "gate disk over cap" <<<"$2"' _ "$cap_rc" "$cap_out"
-rm -rf "$cap_run_base/runs/bulk"
-unset PNEUMA_GATE_RUN_AS
+check "disk cap: admission refuses past the workspace cap (exit 75, named)" bash -c '[ "$1" = 75 ] && grep -q "gate disk over cap" <<<"$2"' _ "$cap_rc" "$cap_out"
+rm -rf "$PNEUMA_GATE_BASE/work/bulk"
 
 # ── cron and at: only root may schedule work (ITEM 6) ────────────────────────
 check "cron/at: the bootstrap restricts both to root (cron.allow and at.allow)" bash -c '
