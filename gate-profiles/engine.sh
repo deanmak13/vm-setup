@@ -115,24 +115,29 @@ _engine_pg_assert_loopback() {  # <port>
   [ "$bad" = 0 ] || { echo "live-pg: FAILED — the cluster listens beyond 127.0.0.1: $lines" >&2; return 1; }
 }
 
-# A gate killed with SIGKILL never runs its EXIT trap, so its postmaster outlives it.
-# At the start of every gate, stop the clusters whose owner is gone (a live postmaster
-# in another run's directory), and any cluster older than the age limit.
+# A gate killed with SIGKILL never runs its EXIT trap, so its cluster outlives it.
+# Each run records its gate's PID (owner.pid) before it starts a cluster. A cluster is
+# reaped only when its OWNER is dead (kill -0 fails) AND its postmaster has been idle
+# longer than PNEUMA_GATE_PG_ORPHAN_AGE_S. A live owner, a young cluster, this run's
+# own cluster, and anything not in a run directory are never touched: no reaping by
+# pattern, port or age alone.
 _engine_pg_reap_orphans() {  # <base> <current run dir>
-  local pidfile data pid age max="${PNEUMA_GATE_PG_MAX_AGE_S:-21600}" now mtime
+  local owner run gate_pid data pidfile mtime age threshold="${PNEUMA_GATE_PG_ORPHAN_AGE_S:-900}" now
   now="$(date +%s)"
-  for pidfile in "$1"/runs/*/pg/data/postmaster.pid; do
+  for owner in "$1"/runs/*/owner.pid; do
+    [ -f "$owner" ] || continue
+    run="$(dirname "$owner")"
+    [ "$run" = "$2" ] && continue
+    gate_pid="$(head -1 "$owner" 2>/dev/null)"
+    [[ "$gate_pid" =~ ^[0-9]+$ ]] || continue
+    kill -0 "$gate_pid" 2>/dev/null && continue          # a live gate owns it: a concurrent run
+    data="$run/pg/data"; pidfile="$data/postmaster.pid"
     [ -f "$pidfile" ] || continue
-    data="$(dirname "$pidfile")"
-    pid="$(head -1 "$pidfile" 2>/dev/null)"
-    [[ "$pid" =~ ^[0-9]+$ ]] || continue
-    kill -0 "$pid" 2>/dev/null || continue            # already gone: nothing to stop
     mtime="$(stat -c %Y "$pidfile" 2>/dev/null || echo "$now")"
     age=$(( now - mtime ))
-    if [ "$(dirname "$data")" != "$2/pg" ] || [ "$age" -gt "$max" ]; then
-      echo "live-pg: reaping leftover cluster $data (pid $pid, age ${age}s)" >&2
-      "$ENGINE_PG_BIN/pg_ctl" -D "$data" -m immediate -w stop >/dev/null 2>&1 || kill -9 "$pid" 2>/dev/null
-    fi
+    [ "$age" -ge "$threshold" ] || continue
+    echo "live-pg: reaping the cluster of dead gate $gate_pid (run ${run##*/}, idle ${age}s)" >&2
+    "$ENGINE_PG_BIN/pg_ctl" -D "$data" -m immediate -w stop >/dev/null 2>&1 || true
   done
   return 0
 }
@@ -146,6 +151,7 @@ _engine_pg_up() {  # <run dir> — exports INTEGRATION_TEST + PGTEST_DSN; return
   port="$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')" || return 1
   pw="$(head -c 48 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 32)"
   mkdir -p "$root" && printf '%s' "$pw" > "$root/pw" && chmod 600 "$root/pw" || return 1
+  printf '%s\n' "$$" > "$1/owner.pid" || return 1       # the gate PID the reaper keys on
   "$ENGINE_PG_BIN/initdb" -D "$root/data" -U gate --pwfile="$root/pw" -A scram-sha-256 -E UTF8 \
     > "$root/initdb.log" 2>&1 || { echo "live-pg: FAILED — initdb (see $root/initdb.log)" >&2; return 1; }
   "$ENGINE_PG_BIN/pg_ctl" -D "$root/data" -l "$root/server.log" -w \
@@ -159,6 +165,66 @@ _engine_pg_up() {  # <run dir> — exports INTEGRATION_TEST + PGTEST_DSN; return
 
 # Arm teardown without clobbering an EXIT handler the caller already set: ours runs
 # first, then the previous handler (simple one-line handlers are chained verbatim).
+# The live suites are discovered from disk, never listed by hand: every test module
+# that calls require_pgtest_dsn() (tools/ci/pgtest_env.py is the definition itself).
+_engine_live_modules() {
+  git grep -l 'require_pgtest_dsn()' -- '*.py' ':!tools/ci/pgtest_env.py' 2>/dev/null | sort
+}
+
+# The verdict on the live junit report, for the modules discovered on disk. Fails when
+# there are no modules, when the report is missing or unreadable, when a module ran no
+# live test, or when any live test was skipped because the DSN did not arrive.
+_engine_live_verdict() {  # <junit.xml> [<module>...]
+  python3 - "$@" <<'PYEOF'
+import sys
+import xml.etree.ElementTree as ET
+
+report, modules = sys.argv[1], sys.argv[2:]
+if not modules:
+    sys.exit("live-pg: FAILED — no live modules found on disk (no require_pgtest_dsn() callers); "
+             "with the cluster up that is a fail-open, not a pass")
+try:
+    root = ET.parse(report).getroot()
+except (OSError, ET.ParseError) as exc:
+    sys.exit(f"live-pg: FAILED — no readable live junit report at {report}: {exc}")
+dotted = {m: m[: -len(".py")].replace("/", ".") for m in modules}
+ran = {m: 0 for m in modules}
+dsn_skips = []
+for case in root.iter("testcase"):
+    cls = case.get("classname", "")
+    module = next((m for m, d in dotted.items() if cls == d or cls.startswith(d + ".")), None)
+    if module is None:
+        continue
+    skipped = case.find("skipped")
+    if skipped is not None:
+        if "PGTEST_DSN" in (skipped.get("message") or ""):
+            dsn_skips.append(f"{cls}::{case.get('name')}")
+        continue
+    ran[module] += 1
+missing = sorted(m for m, n in ran.items() if n == 0)
+if dsn_skips:
+    sys.exit(f"live-pg: FAILED — {len(dsn_skips)} live test(s) skipped for a missing PGTEST_DSN with the cluster up: {dsn_skips[:5]}")
+if missing:
+    sys.exit(f"live-pg: FAILED — live module(s) ran no live test: {missing[:5]}")
+print(f"live-pg: {len(modules)} live module(s) ran {sum(ran.values())} live test(s), none skipped for the DSN")
+PYEOF
+}
+
+# Run the live suites against this run's cluster and judge the junit report.
+_engine_run_live() {  # <venv>
+  local venv="$1" report="$PNEUMA_GATE_RUN_DIR/live-junit.xml" mods pyrc
+  mods="$(_engine_live_modules)"
+  if [ -z "$mods" ]; then _engine_live_verdict "$report"; return 1; fi
+  # shellcheck disable=SC2086  # the module list is a word list by design
+  "$venv/bin/python" -m pytest $mods -q -p no:cacheprovider --junitxml="$report" \
+    > "$PNEUMA_GATE_RUN_DIR/live.log" 2>&1
+  pyrc=$?
+  cat "$PNEUMA_GATE_RUN_DIR/live.log"
+  [ "$pyrc" = 0 ] || { echo "live-pg: FAILED — the live suites exited $pyrc" >&2; return 1; }
+  # shellcheck disable=SC2086
+  _engine_live_verdict "$report" $mods
+}
+
 _engine_pg_arm_exit() {
   local prev body
   prev="$(trap -p EXIT)"
@@ -172,9 +238,6 @@ profile_gate() {
   _engine_pg_reap_orphans "$PNEUMA_GATE_BASE" "$PNEUMA_GATE_RUN_DIR"
   _engine_pg_up "$PNEUMA_GATE_RUN_DIR" || return 1
   _engine_pg_arm_exit
-  # pytest prints the skip reason in its summary only with -rs. The gate counts the
-  # skips that mean "the DSN did not reach the tests", and fails when there are any.
-  export PYTEST_ADDOPTS="${PYTEST_ADDOPTS:+$PYTEST_ADDOPTS }-rs"
   # The gate pip-installs INTO its interpreter (editable project + per-service
   # extras), so each run gets its own venv: a hard-linked copy of the frozen
   # cache (instant, no extra disk) with writable directories. Files stay
@@ -184,17 +247,15 @@ profile_gate() {
   cp -al "$envdir/venv" "$venv" && find "$venv" -type d -exec chmod u+w {} + || return 1
   # A scratch identity for tests that create commits; the HOME is per run.
   printf '[user]\n\tname = pneuma-gate\n\temail = gate@localhost\n' > "$HOME/.gitconfig"
-  local hook_rc skipped
+  local hook_rc live_rc=0
   printf 'refs/heads/gate %s refs/heads/gate %s\n' "$head" "$base" |
     env PATH="$venv/bin:$PATH" PYTHON="$venv/bin/python" PYTHONDONTWRITEBYTECODE=1 \
         PNEUMA_GATE_LOCK_FILE="$PNEUMA_GATE_RUN_DIR/gate.lock" \
         PNEUMA_PREPUSH_NO_CACHE=1 PNEUMA_PREPUSH_PARALLELISM="$PNEUMA_GATE_CORES" \
-      timeout "$timeout_s" nice -n 10 bash .githooks/pre-push 2>&1 | tee "$PNEUMA_GATE_RUN_DIR/hook.log"
-  hook_rc="${PIPESTATUS[1]}"
-  skipped="$(grep -c 'PGTEST_DSN is not set' "$PNEUMA_GATE_RUN_DIR/hook.log" || true)"
-  if [ "$hook_rc" = 0 ] && [ "${skipped:-0}" -gt 0 ]; then
-    echo "live-pg: FAILED — $skipped live test(s) skipped for a missing PGTEST_DSN although the cluster was up" >&2
-    return 1
-  fi
-  return "$hook_rc"
+      timeout "$timeout_s" nice -n 10 bash .githooks/pre-push
+  hook_rc=$?
+  # The live suites run against THIS run's cluster and their own junit report is judged.
+  _engine_run_live "$venv" || live_rc=1
+  [ "$hook_rc" = 0 ] && [ "$live_rc" = 0 ] && return 0
+  return 1
 }

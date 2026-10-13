@@ -149,36 +149,69 @@ PATH="$pgstub:$PATH" PNEUMA_GATE_PG_BIN="$pgstub" bash -c '
 check "live-pg: a previous EXIT handler still runs (chained, not replaced)" grep -q "previous-exit-handler" "$chain_log"
 check "live-pg: the cluster is stopped by the same EXIT handler" grep -q "pg_ctl -D $PGRUN/pg/data -m immediate -w stop" "$PG_STUB_CALLS"
 
-# ── engine profile: orphan reaping and the live-skip guard (GATE-PG-1) ───
-reap_base="$work/reapbase"
-mkdir -p "$reap_base/runs/dead-owner/pg/data" "$reap_base/runs/current/pg/data"
-sleep 300 & orphan_pid=$!
-echo "$orphan_pid" > "$reap_base/runs/dead-owner/pg/data/postmaster.pid"
-echo "$orphan_pid" > "$reap_base/runs/current/pg/data/postmaster.pid"
-PATH="$pgstub:$PATH" PNEUMA_GATE_PG_BIN="$pgstub" bash -c 'source "$1"; _engine_pg_reap_orphans "$2" "$2/runs/current"' _ "$ENGINE_PROFILE" "$reap_base" 2>/dev/null
-check "reap: a leftover cluster of a dead owner is stopped" grep -q "pg_ctl -D $reap_base/runs/dead-owner/pg/data -m immediate -w stop" "$reap_base/runs/dead-owner/pg/calls"
-check "reap: this run's own cluster is left alone" test ! -e "$reap_base/runs/current/pg/calls"
-touch -d '2 hours ago' "$reap_base/runs/current/pg/data/postmaster.pid"
-PNEUMA_GATE_PG_MAX_AGE_S=60 PATH="$pgstub:$PATH" PNEUMA_GATE_PG_BIN="$pgstub" bash -c 'source "$1"; _engine_pg_reap_orphans "$2" "$2/runs/current"' _ "$ENGINE_PROFILE" "$reap_base" 2>/dev/null
-check "reap: an age sweep stops even this run's cluster when it is older than the limit" grep -q "stop" "$reap_base/runs/current/pg/calls"
-kill "$orphan_pid" 2>/dev/null; wait "$orphan_pid" 2>/dev/null || true
-
-skip_base="$work/skipbase"; mkdir -p "$skip_base/runs" "$work/skiphome" "$work/skipenv/venv"
-mkdir -p "$work/skiprepo/.githooks" "$work/okrepo/.githooks"
-printf '#!/usr/bin/env bash\necho "SKIPPED [1] t.py:1: PGTEST_DSN is not set"\nexit 0\n' > "$work/skiprepo/.githooks/pre-push"
-printf '#!/usr/bin/env bash\necho "1 passed"\nexit 0\n' > "$work/okrepo/.githooks/pre-push"
-chmod +x "$work/skiprepo/.githooks/pre-push" "$work/okrepo/.githooks/pre-push"
-gate_run() {  # <repo> → the profile's own verdict line
-  pg_case "gate-$(basename "$1")"
-  (cd "$1" && HOME="$work/skiphome" PATH="$pgstub:$PATH" PNEUMA_GATE_PG_BIN="$pgstub" PNEUMA_GATE_BASE="$skip_base" \
-    PNEUMA_GATE_RUN_DIR="$PGRUN" PNEUMA_GATE_CORES=1 PG_STUB_SS=loopback \
-    bash -c 'source "$1"; profile_gate "$2" h b 60; echo "rc=$?"' _ "$ENGINE_PROFILE" "$work/skipenv" 2>&1)
+# ── engine profile: owner-keyed reaping and the live junit verdict (GATE-PG-1) ─
+# A cluster belongs to the gate PID that started it (owner.pid). It is reaped only
+# when that owner is dead and the cluster has been idle past the threshold.
+reap_base="$work/reapbase"; mkdir -p "$reap_base/runs"
+mk_run() {  # <name> <owner pid> <idle ago>
+  local d="$reap_base/runs/$1"; mkdir -p "$d/pg/data"; : > "$d/pg/calls"
+  printf '%s\n' "$2" > "$d/owner.pid"; printf '%s\n' "$2" > "$d/pg/data/postmaster.pid"
+  if [ -n "$3" ]; then touch -d "$3 ago" "$d/pg/data/postmaster.pid"; fi
+  return 0
 }
-skip_out="$(gate_run "$work/skiprepo")"
-check "gate: live skips for a missing DSN FAIL the gate when the cluster was up" grep -q "although the cluster was up" <<<"$skip_out"
-check "gate: and its verdict is red (rc=1)" grep -q "rc=1" <<<"$skip_out"
-ok_out="$(gate_run "$work/okrepo")"
-check "gate: a clean hook run is green (rc=0)" grep -q "rc=0" <<<"$ok_out"
+sleep 300 & live_owner=$!
+sleep 300 & other_live_owner=$!
+sleep 0 & dead_owner=$!; wait "$dead_owner" 2>/dev/null || true
+reap_run() {  # <current run name>
+  PNEUMA_GATE_PG_ORPHAN_AGE_S=900 PATH="$pgstub:$PATH" PNEUMA_GATE_PG_BIN="$pgstub" \
+    bash -c 'source "$1"; _engine_pg_reap_orphans "$2" "$2/runs/$3"' _ "$ENGINE_PROFILE" "$reap_base" "$1" 2>/dev/null
+}
+mk_run current "$live_owner" "2 hours"
+mk_run live-concurrent "$other_live_owner" "2 hours"
+mk_run dead-old "$dead_owner" "2 hours"
+mk_run dead-young "$dead_owner" "1 minute"
+mk_run mine-dead-owner "$live_owner" "2 hours"
+reap_run current
+check "reap: a concurrent run's live cluster survives (its owner is alive)" test ! -s "$reap_base/runs/live-concurrent/pg/calls"
+check "reap: a dead run's cluster idle past the threshold is reaped" grep -q "stop" "$reap_base/runs/dead-old/pg/calls"
+check "reap: a dead run's cluster still inside the threshold is left alone" test ! -s "$reap_base/runs/dead-young/pg/calls"
+check "reap: the current run is never reaped" test ! -s "$reap_base/runs/current/pg/calls"
+kill "$live_owner" "$other_live_owner" 2>/dev/null; wait 2>/dev/null || true
+
+# The live verdict on canned junit reports (the same function the gate runs).
+mkdir -p "$work/live"
+cat > "$work/live/ok.xml" <<'XML'
+<testsuites><testsuite><testcase classname="tests.integration.test_a" name="t1"/><testcase classname="tests.integration.test_b" name="t2"/></testsuite></testsuites>
+XML
+cat > "$work/live/dsn-skip.xml" <<'XML'
+<testsuites><testsuite><testcase classname="tests.integration.test_a" name="t1"/><testcase classname="tests.integration.test_b" name="t2"><skipped message="PGTEST_DSN is not set. Run via tools/ci/with_test_postgres.sh"/></testcase></testsuite></testsuites>
+XML
+cat > "$work/live/module-missing.xml" <<'XML'
+<testsuites><testsuite><testcase classname="tests.integration.test_a" name="t1"/></testsuite></testsuites>
+XML
+cat > "$work/live/module-all-skipped.xml" <<'XML'
+<testsuites><testsuite><testcase classname="tests.integration.test_a" name="t1"/><testcase classname="tests.integration.test_b" name="t2"><skipped message="no psycopg"/></testcase></testsuite></testsuites>
+XML
+verdict() {  # <junit> → output, then rc=<n>
+  bash -c 'source "$1"; _engine_live_verdict "$2" tests/integration/test_a.py tests/integration/test_b.py' _ "$ENGINE_PROFILE" "$1" 2>&1; echo "rc=$?"
+}
+check "live verdict: all modules ran, none skipped for the DSN -> green" grep -q "rc=0" <<<"$(verdict "$work/live/ok.xml")"
+check "live verdict: a DSN skip with the cluster up -> RED" grep -q "skipped for a missing PGTEST_DSN" <<<"$(verdict "$work/live/dsn-skip.xml")"
+check "live verdict: a DSN skip -> rc=1" grep -q "rc=1" <<<"$(verdict "$work/live/dsn-skip.xml")"
+check "live verdict: a module whose live tests all skipped -> RED" grep -q "ran no live test" <<<"$(verdict "$work/live/module-all-skipped.xml")"
+check "live verdict: a module absent from the report -> RED" grep -q "ran no live test" <<<"$(verdict "$work/live/module-missing.xml")"
+check "live verdict: an unreadable report -> RED" grep -q "no readable live junit report" <<<"$(verdict "$work/live/absent.xml")"
+check "live verdict: zero live modules on disk -> RED (no fail-open)" bash -c 'source "$1"; _engine_live_verdict "$2" >/dev/null 2>&1; test $? = 1' _ "$ENGINE_PROFILE" "$work/live/ok.xml"
+
+# Discovery is from disk: callers of require_pgtest_dsn(), never the definition itself.
+disc="$work/disc"; mkdir -p "$disc/tests/integration" "$disc/tools/ci"
+git -C "$disc" init -q -b main
+printf 'from tools.ci.pgtest_env import require_pgtest_dsn\nDSN = require_pgtest_dsn()\n' > "$disc/tests/integration/test_a.py"
+printf 'def require_pgtest_dsn() -> str:\n    pass\n' > "$disc/tools/ci/pgtest_env.py"
+printf 'x = 1\n' > "$disc/tests/integration/test_plain.py"
+git -C "$disc" add -A && git -C "$disc" -c user.name=t -c user.email=t@t commit -qm d
+disc_out="$(cd "$disc" && bash -c 'source "$1"; _engine_live_modules' _ "$ENGINE_PROFILE")"
+check "live discovery: finds the caller, not the definition or plain tests" test "$disc_out" = "tests/integration/test_a.py"
 
 # ── client end to end ────────────────────────────────────────────────────────
 out=$("$CLIENT" --repo-dir "$src" --profile fake --head "$head" --base "$base" --log-dir "$work/logs" 2>&1) && rc=0 || rc=$?
