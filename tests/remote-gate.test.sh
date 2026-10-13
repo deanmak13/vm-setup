@@ -92,6 +92,7 @@ exec "$@"
 STUB
 chmod +x "$work/bin/systemd-run-stub"
 export SCOPE_RECORD="$work/scope-record.txt" PNEUMA_GATE_SYSTEMD_RUN="$work/bin/systemd-run-stub"
+export PNEUMA_GATE_STATE_DIR="$work/root-state"
 
 marker_of() { grep '^PNEUMA_GATE_RESULT ' <<<"$1" | tail -1; }
 field_of() { tr ' ' '\n' <<<"$1" | sed -n "s/^$2=//p" | head -1; }
@@ -160,50 +161,7 @@ PATH="$pgstub:$PATH" PNEUMA_GATE_PG_BIN="$pgstub" bash -c '
 check "live-pg: a previous EXIT handler still runs (chained, not replaced)" grep -q "previous-exit-handler" "$chain_log"
 check "live-pg: the cluster is stopped by the same EXIT handler" grep -q "pg_ctl -D $PGRUN/pg/data -m immediate -w stop" "$PG_STUB_CALLS"
 
-# ── engine profile: owner-keyed reaping and the live junit verdict (GATE-PG-1) ─
-# A cluster belongs to the gate PID that started it (owner.pid). It is reaped only
-# when that owner is dead and the cluster has been idle past the threshold.
-reap_base="$work/reapbase"; mkdir -p "$reap_base/runs"
-# a run: owner (gate PID), a cluster, and WAL/log activity <idle_s> seconds ago
-mk_run() {  # <name> <owner pid> <idle_s>
-  local d="$reap_base/runs/$1"; mkdir -p "$d/pg/data/pg_wal"; : > "$d/pg/calls"
-  printf '%s\n' "$2" > "$d/owner.pid"; printf '%s\n' "$2" > "$d/pg/data/postmaster.pid"
-  : > "$d/pg/data/pg_wal/000000010000000000000001"; : > "$d/pg/server.log"
-  if [ -n "$3" ]; then
-    touch -d "@$(( $(date +%s) - $3 ))" "$d/pg/data/pg_wal/000000010000000000000001" "$d/pg/server.log" "$d/pg/data/postmaster.pid"
-  fi
-  return 0
-}
-sleep 300 & live_owner=$!
-sleep 300 & other_live_owner=$!
-sleep 0 & dead_owner=$!; wait "$dead_owner" 2>/dev/null || true
-mk_run current "$live_owner" 7200
-mk_run live-concurrent "$other_live_owner" 7200
-mk_run dead-old "$dead_owner" 7200
-mk_run dead-young "$dead_owner" 60
-mk_run dead-active "$dead_owner" 7200
-touch "$reap_base/runs/dead-active/pg/data/pg_wal/000000010000000000000001"   # WAL just written: active
-# ITEM 1: the production call: env -i, only PNEUMA_GATE_RUN_DIR (no PNEUMA_GATE_BASE)
-env -i PATH="$pgstub:/usr/bin:/bin" PNEUMA_GATE_PG_BIN="$pgstub" PNEUMA_GATE_PG_ORPHAN_AGE_S=900 \
-  PNEUMA_GATE_RUN_DIR="$reap_base/runs/current" bash -c 'source "$1"; _engine_pg_reap_current' _ "$ENGINE_PROFILE" 2>/dev/null
-check "reap (env -i, production path): a dead run's cluster idle past the threshold is reaped" grep -q "stop" "$reap_base/runs/dead-old/pg/calls"
-check "reap (env -i): a concurrent run's live cluster survives (its owner is alive)" test ! -s "$reap_base/runs/live-concurrent/pg/calls"
-check "reap (env -i): a dead run's cluster still inside the threshold is left alone" test ! -s "$reap_base/runs/dead-young/pg/calls"
-check "reap: a dead run with recent WAL activity is left alone (activity, not file age)" test ! -s "$reap_base/runs/dead-active/pg/calls"
-check "reap: the current run is never reaped" test ! -s "$reap_base/runs/current/pg/calls"
-# ITEM 3: symlinks never lead the reaper anywhere
-mkdir -p "$work/outside-lane/pg/data/pg_wal"; : > "$work/outside-lane/pg/calls"
-printf '%s\n' "$dead_owner" > "$work/outside-lane/owner.pid"; printf '%s\n' "$dead_owner" > "$work/outside-lane/pg/data/postmaster.pid"
-touch -d "@$(( $(date +%s) - 7200 ))" "$work/outside-lane/pg/data/postmaster.pid"
-mk_run planted-data "$dead_owner" 7200
-rm -rf "$reap_base/runs/planted-data/pg/data"; ln -s "$work/outside-lane/pg/data" "$reap_base/runs/planted-data/pg/data"
-ln -s "$work/outside-lane" "$reap_base/runs/planted-run"
-PNEUMA_GATE_PG_ORPHAN_AGE_S=900 PATH="$pgstub:$PATH" PNEUMA_GATE_PG_BIN="$pgstub" \
-  bash -c 'source "$1"; _engine_pg_reap_orphans "$2" "$3"' _ "$ENGINE_PROFILE" "$reap_base/runs" "$reap_base/runs/current" 2>/dev/null
-check "symlinks: a run directory that is a symlink into another lane is never touched" test ! -s "$work/outside-lane/pg/calls"
-check "symlinks: a data directory that is a symlink is never stopped" test ! -s "$work/outside-lane/pg/calls"
-kill "$live_owner" "$other_live_owner" 2>/dev/null; wait 2>/dev/null || true
-
+# ── engine profile: the live junit verdict (GATE-PG-1) ──────────────────
 # The live verdict on canned junit reports (the same function the gate runs).
 mkdir -p "$work/live"
 cat > "$work/live/ok.xml" <<'XML'
@@ -342,9 +300,11 @@ admit() {   # admit <nproc> <avail_mb> <load1> <live gates> <cores> <mem_mb>  ->
   rm -rf "$work/cap" && mkdir -p "$work/cap/runs"
   local i
   for ((i = 0; i < $4; i++)); do
-    mkdir "$work/cap/runs/r$i"; echo $$ > "$work/cap/runs/r$i/pid"; echo "$5" > "$work/cap/runs/r$i/cores"; echo "$6" > "$work/cap/runs/r$i/mem_mb"
+    # a live ROOT record for each live gate: its runner is this shell, so it is alive
+    PNEUMA_GATE_STATE_DIR="$work/cap/state" bash -c 'source "$1"; state_init; state_create "r$2" "$3" "$4" "$5" "$6"' \
+      _ "$RUNNER" "$i" "$$" "$5" "$6" "$work/cap/runs/r$i"
   done
-  PNEUMA_GATE_BASE="$work/cap" PNEUMA_GATE_NPROC="$1" PNEUMA_GATE_MEMINFO="$mem" PNEUMA_GATE_LOADAVG="$load" \
+  PNEUMA_GATE_STATE_DIR="$work/cap/state" PNEUMA_GATE_BASE="$work/cap" PNEUMA_GATE_NPROC="$1" PNEUMA_GATE_MEMINFO="$mem" PNEUMA_GATE_LOADAVG="$load" \
     bash -c "source '$RUNNER'; can_admit $5 $6"
 }
 check "capacity: 8 cores, 18G free, idle -> first gate admitted" admit 8 18000 1.0 0 2 3072
@@ -377,33 +337,67 @@ check "concurrency: runs were isolated HOME/TMPDIR" bash -c "[ \$(cat '$work'/c?
 expect_eq "concurrency: nothing left behind" 0 "$(find "$PNEUMA_GATE_BASE/runs" "$PNEUMA_GATE_BASE/queue" -mindepth 1 | wc -l)"
 rm -f "$work/profiles/sleep"
 
-# ── janitor: scope first, then the directory; real run dirs only (GATE-PG-1 review) ─
+# ── janitor v2: decisions from ROOT state only (#17 redesign) ───────────────────
+# Every run-dir file is untrusted (one uid for all runs). These tests forge them.
 cat > "$work/bin/systemctl-stub" <<'STUB'
 #!/usr/bin/env bash
-# records "stop <unit> dir-present=<yes|no>" at the moment of the stop
-unit="$2"; run="${unit#pneuma-gate-}"; run="${run%.scope}"
-present=no; [ -d "$PNEUMA_GATE_BASE/runs/$run" ] && present=yes
-echo "stop $unit dir-present=$present" >> "$SYSTEMCTL_RECORD"
-case "$unit" in *fail-stop*) exit 1;; esac
+case "$1" in
+  is-active)
+    unit="$3"; grep -qx "$unit" "$SYSTEMCTL_ACTIVE" 2>/dev/null && exit 0; exit 3;;
+  stop)
+    unit="$2"; present=no; run="${unit#pneuma-gate-}"; run="${run%.scope}"
+    [ -d "$PNEUMA_GATE_BASE/runs/$run" ] && present=yes
+    echo "stop $unit dir-present=$present" >> "$SYSTEMCTL_RECORD"
+    case "$unit" in *fail-stop*) exit 1;; esac
+    exit 0;;
+esac
 exit 0
 STUB
 chmod +x "$work/bin/systemctl-stub"
-export SYSTEMCTL_RECORD="$work/systemctl-record.txt"; : > "$SYSTEMCTL_RECORD"
-export PNEUMA_GATE_SYSTEMCTL="$work/bin/systemctl-stub"
-export PNEUMA_GATE_STOP_BACKOFF_S=0 PNEUMA_GATE_JANITOR_STATE="$work/janitor-state" PNEUMA_GATE_ALERT_FILE="$work/alerts.log"
-mkdir -p "$PNEUMA_GATE_BASE/runs/dead-1"; echo 999999 > "$PNEUMA_GATE_BASE/runs/dead-1/pid"
-mkdir -p "$PNEUMA_GATE_BASE/runs/fail-stop-1"; echo 999999 > "$PNEUMA_GATE_BASE/runs/fail-stop-1/pid"
-mkdir -p "$work/janitor-outside"; echo 999999 > "$work/janitor-outside/pid"; : > "$work/janitor-outside/keep.txt"
-ln -s "$work/janitor-outside" "$PNEUMA_GATE_BASE/runs/planted-run"
-"$RUNNER" janitor >/dev/null 2>&1
-check "janitor: removes a run whose owner died" not test -e "$PNEUMA_GATE_BASE/runs/dead-1"
-check "janitor: the run's scope is stopped BEFORE its directory is removed" grep -q "stop pneuma-gate-dead-1.scope dir-present=yes" "$SYSTEMCTL_RECORD"
-check "janitor: a planted symlink in runs/ is never followed (its target survives)" test -e "$work/janitor-outside/keep.txt"
-check "janitor: a planted symlink is never sent a scope stop" bash -c '! grep -q "planted-run" "$1"' _ "$SYSTEMCTL_RECORD"
-check "janitor: if the scope cannot be stopped, the directory is kept (fail closed)" test -e "$PNEUMA_GATE_BASE/runs/fail-stop-1"
-check "janitor: a failed stop is retried with backoff (3 attempts per pass)" test "$(grep -c "stop pneuma-gate-fail-stop-1" "$SYSTEMCTL_RECORD")" -ge 3
+export SYSTEMCTL_RECORD="$work/systemctl-record.txt" SYSTEMCTL_ACTIVE="$work/systemctl-active.txt"
+: > "$SYSTEMCTL_RECORD"; printf 'pneuma-gate-victim.scope\n' > "$SYSTEMCTL_ACTIVE"
+export PNEUMA_GATE_SYSTEMCTL="$work/bin/systemctl-stub" PNEUMA_GATE_STOP_BACKOFF_S=0
+export PNEUMA_GATE_JANITOR_STATE="$work/janitor-state" PNEUMA_GATE_ALERT_FILE="$work/alerts.log"
 
-# Deletion AS THE GATE USER: a runuser stand-in records the call and runs it as this user.
+# a root record: <id> <runner pid> <phase> <dir> <created epoch>
+mkrec() {
+  PNEUMA_GATE_STATE_DIR="$PNEUMA_GATE_STATE_DIR" bash -c 'source "$1"; state_init; state_create "$2" "$3" 1 512 "$5"; state_set "$2" phase "$4"; state_set "$2" created "$6"' \
+    _ "$RUNNER" "$1" "$2" "$3" "$4" "$5"
+}
+rm -rf "$PNEUMA_GATE_STATE_DIR"
+DEAD=999999
+ALIVE=$$
+
+# 1. a dead run: stopped by unit name BEFORE its directory goes; record and dir removed
+mkdir -p "$PNEUMA_GATE_BASE/runs/dead-1/work"
+mkrec dead-1 "$DEAD" scoped "$PNEUMA_GATE_BASE/runs/dead-1" 0
+"$RUNNER" janitor >/dev/null 2>&1
+check "janitor: a dead run's record and directory are removed" bash -c 'test ! -e "$1" && test ! -e "$2"' _ "$PNEUMA_GATE_BASE/runs/dead-1" "$PNEUMA_GATE_STATE_DIR/runs/dead-1"
+check "janitor: the run's scope is stopped BEFORE its directory is removed" grep -q "stop pneuma-gate-dead-1.scope dir-present=yes" "$SYSTEMCTL_RECORD"
+
+# 2. ATTACK A: a forged dead owner.pid and a symlinked postmaster dir, with a live victim
+victim="$PNEUMA_GATE_BASE/runs/victim"; mkdir -p "$victim/pg/data/pg_wal"
+echo victim-data > "$victim/pg/data/PG_VERSION"; printf '%s\n' "$DEAD" > "$victim/owner.pid"
+mkrec victim "$ALIVE" scoped "$victim" 0
+attacker="$PNEUMA_GATE_BASE/runs/attacker"; mkdir -p "$attacker/pg"
+ln -s "$victim/pg/data" "$attacker/pg/data"; printf '%s\n' "$DEAD" > "$attacker/owner.pid"
+touch -d "@$(( $(date +%s) - 3 * 86400 ))" "$attacker"
+"$RUNNER" janitor >/dev/null 2>&1
+check "attack A: a forged owner.pid and symlinked postmaster cannot reach a live victim cluster" bash -c 'test -f "$1/pg/data/PG_VERSION" && grep -q victim-data "$1/pg/data/PG_VERSION"' _ "$victim"
+check "attack A: no scope stop was sent for the live victim" bash -c '! grep -q "pneuma-gate-victim" "$1"' _ "$SYSTEMCTL_RECORD"
+
+# 3. ATTACK B: the victim's owner.pid is overwritten with a dead pid; its record is live
+printf '%s\n' "$DEAD" > "$victim/owner.pid"
+"$RUNNER" janitor >/dev/null 2>&1
+check "attack B: an overwritten victim owner.pid does not kill the live victim" test -d "$victim"
+check "attack B: the live victim keeps its record" test -f "$PNEUMA_GATE_STATE_DIR/runs/victim"
+
+# 4. forged cores/mem in a run directory never reach admission: the root record wins
+printf '64\n' > "$victim/cores"; printf '99999\n' > "$victim/mem_mb"
+live_line="$(PNEUMA_GATE_STATE_DIR="$PNEUMA_GATE_STATE_DIR" bash -c 'source "$1"; live_runs' _ "$RUNNER" | grep '^victim ')"
+check "forged cores/mem: admission reads the ROOT record (1 core, 512MB), not the run directory" test "$live_line" = "victim 1 512"
+
+# a runuser stand-in (records the call, runs it as this user): deletion only goes through it
 cat > "$work/bin/runuser" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$RUNUSER_RECORD"
@@ -412,30 +406,56 @@ exec "$@"
 STUB
 chmod +x "$work/bin/runuser"
 export RUNUSER_RECORD="$work/runuser-record.txt"; : > "$RUNUSER_RECORD"
-race_run="$PNEUMA_GATE_BASE/runs/dead-race"; mkdir -p "$race_run/inner"; echo 999999 > "$race_run/pid"
+export PATH="$work/bin:$PATH"
+
+# 5. a dead run whose directory is NOT owned by the gate user is never deleted (owner check)
+foreign="$PNEUMA_GATE_BASE/runs/foreign"; mkdir -p "$foreign"
+mkrec foreign "$DEAD" scoped "$foreign" 0
+PNEUMA_GATE_RUN_AS="not-the-gate-user" "$RUNNER" janitor >/dev/null 2>&1
+check "owner check: a directory not owned by the gate user is kept and named in an alert" test -d "$foreign"
+
+# 6. a failed scope stop is retried with backoff, counted in the root record, and alerts
+mkdir -p "$PNEUMA_GATE_BASE/runs/fail-stop-1"
+mkrec fail-stop-1 "$DEAD" scoped "$PNEUMA_GATE_BASE/runs/fail-stop-1" 0
+"$RUNNER" janitor >/dev/null 2>&1
+check "stop: a failed stop is retried with backoff (3 attempts per pass)" test "$(grep -c "stop pneuma-gate-fail-stop-1" "$SYSTEMCTL_RECORD")" -ge 3
+check "stop: a failed stop keeps the directory (fail closed)" test -e "$PNEUMA_GATE_BASE/runs/fail-stop-1"
+check "stop: the failure count lives in the root record" grep -q "stopfails=1" "$PNEUMA_GATE_STATE_DIR/runs/fail-stop-1"
+PNEUMA_GATE_STOP_ATTEMPTS=2 "$RUNNER" janitor >/dev/null 2>&1
+check "alert: a repeated stop failure raises the ALERT (log file)" grep -q "ALERT gate run fail-stop-1 LEAKED" "$PNEUMA_GATE_ALERT_FILE"
+
+# 7. deletion AS THE GATE USER: a runuser stand-in records the call and runs it as this user
+cat > "$work/bin/runuser" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$RUNUSER_RECORD"
+while [ $# -gt 0 ] && [ "$1" != -- ]; do shift; done; shift
+exec "$@"
+STUB
+chmod +x "$work/bin/runuser"
+export RUNUSER_RECORD="$work/runuser-record.txt"; : > "$RUNUSER_RECORD"
+race_run="$PNEUMA_GATE_BASE/runs/dead-race"; mkdir -p "$race_run/inner"
 race_victim="$work/race-victim"; mkdir -p "$race_victim"; : > "$race_victim/keep.txt"
-ln -s "$race_victim" "$race_run/inner/escape"   # a raced symlink inside the run
+ln -s "$race_victim" "$race_run/inner/escape"
+mkrec dead-race "$DEAD" scoped "$race_run" 0
 PNEUMA_GATE_RUN_AS="$(id -un)" PATH="$work/bin:$PATH" "$RUNNER" janitor >/dev/null 2>&1
 check "delete: the run directory is removed THROUGH the gate user (runuser -u, rm --one-file-system)" grep -q -- "-u $(id -un) -- rm -rf --one-file-system -- $race_run" "$RUNUSER_RECORD"
-check "delete: a symlink raced into the run never takes its target with it" test -e "$race_victim/keep.txt"
-check "delete: the raced run itself is gone" not test -e "$race_run"
+check "delete: a symlink inside the run never takes its target with it" test -e "$race_victim/keep.txt"
 
-# A stop that keeps failing is never silent: ERROR in the journal and the alert log.
-mkdir -p "$PNEUMA_GATE_BASE/runs/fail-stop-alert"; echo 999999 > "$PNEUMA_GATE_BASE/runs/fail-stop-alert/pid"
-PNEUMA_GATE_STOP_ATTEMPTS=2 "$RUNNER" janitor >/dev/null 2>&1
-check "alert: below the limit, no alert yet" bash -c '! grep -q "fail-stop-alert" "$1" 2>/dev/null' _ "$PNEUMA_GATE_ALERT_FILE"
-PNEUMA_GATE_STOP_ATTEMPTS=2 "$RUNNER" janitor >/dev/null 2>&1
-check "alert: a repeated stop failure raises the ALERT (log file)" grep -q "ALERT gate run fail-stop-alert LEAKED" "$PNEUMA_GATE_ALERT_FILE"
-check "alert: the leaked directory is still kept, not deleted" test -e "$PNEUMA_GATE_BASE/runs/fail-stop-alert"
-unset PNEUMA_GATE_SYSTEMCTL
+# 8. no record, no run-dir trust: an old unrecorded directory is removed only as the gate user
+mkdir -p "$PNEUMA_GATE_BASE/runs/old-unrecorded"; touch -d "@$(( $(date +%s) - 3 * 86400 ))" "$PNEUMA_GATE_BASE/runs/old-unrecorded"
+ln -s "$race_victim" "$PNEUMA_GATE_BASE/runs/planted-link"
+"$RUNNER" janitor >/dev/null 2>&1
+check "unrecorded: a planted symlink in runs/ is never followed (its target survives)" test -e "$race_victim/keep.txt"
+check "unrecorded: a planted symlink is never sent a scope stop" bash -c '! grep -q "planted-link" "$1"' _ "$SYSTEMCTL_RECORD"
+unset PNEUMA_GATE_RUN_AS
 
-# Admission refuses past the runs disk cap (tests the real cmd_run path).
+# Disk cap (the real cmd_run path): a fresh unrecorded directory counts and is kept.
 cap_run_base="$PNEUMA_GATE_BASE"
-mkdir -p "$cap_run_base/runs/bulk"; echo "$$" > "$cap_run_base/runs/bulk/pid"   # alive: the janitor keeps it
-head -c 3000000 /dev/zero > "$cap_run_base/runs/bulk/blob"
+mkdir -p "$cap_run_base/runs/bulk"; head -c 3000000 /dev/zero > "$cap_run_base/runs/bulk/blob"
 cap_out="$(PNEUMA_GATE_RUNS_CAP_MB=1 "$RUNNER" run --profile fake --repo fakerepo --head "$head" --base "$base" --tree "$tree" 2>&1)" && cap_rc=0 || cap_rc=$?
 check "disk cap: admission refuses past the runs cap (exit 75, named)" bash -c '[ "$1" = 75 ] && grep -q "gate disk over cap" <<<"$2"' _ "$cap_rc" "$cap_out"
 rm -rf "$cap_run_base/runs/bulk"
+unset PNEUMA_GATE_SYSTEMCTL
 
 # ── cron and at: only root may schedule work (ITEM 6) ────────────────────────
 check "cron/at: the bootstrap restricts both to root (cron.allow and at.allow)" bash -c '

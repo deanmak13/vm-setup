@@ -59,13 +59,55 @@ disk_free_gib() { df -BG --output=avail "$BASE_DIR" 2>/dev/null | tail -1 | tr -
 # ── capacity ─────────────────────────────────────────────────────────────────
 mem_available_mb() { awk '/^MemAvailable:/ {print int($2/1024)}' "$MEMINFO"; }
 load1_x100() { awk '{printf "%d", $1*100}' "$LOADAVG"; }
-live_runs() {   # prints "<id> <cores> <mem_mb>" for each live run
-  local d pid
-  for d in "$BASE_DIR"/runs/*/; do
-    [ -f "$d/pid" ] || continue
-    pid="$(cat "$d/pid" 2>/dev/null)"
-    { [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; } || continue
-    printf '%s %s %s\n' "$(basename "$d")" "$(cat "$d/cores" 2>/dev/null || echo 1)" "$(cat "$d/mem_mb" 2>/dev/null || echo 2048)"
+# ROOT STATE. Every run has a record in $STATE_DIR/runs/<run id>, written by this root
+# runner. The gate user shares one uid across all runs, so nothing inside a run
+# directory is trusted: liveness, cores, memory and ownership come from here only.
+STATE_DIR="${PNEUMA_GATE_STATE_DIR:-/var/lib/pneuma-gate-state}"
+STATE_GRACE_S="${PNEUMA_GATE_STATE_GRACE_S:-120}"   # a scope that has just been requested may take this long to appear
+
+state_init() {  # root-owned, 0700, never a symlink
+  [ -L "$STATE_DIR" ] && return 1
+  mkdir -p "$STATE_DIR/runs" && chmod 0700 "$STATE_DIR" "$STATE_DIR/runs"
+}
+state_get() {  # <run id> <key>
+  local f="$STATE_DIR/runs/$1"
+  [ -f "$f" ] && [ ! -L "$f" ] || return 1
+  sed -n "s/^$2=//p" "$f" | head -1
+}
+state_create() {  # <run id> <runner pid> <cores> <mem_mb> <run dir>
+  local f="$STATE_DIR/runs/$1" tmp="$STATE_DIR/runs/.$1.$$"
+  [ -L "$f" ] && return 1
+  printf 'runner_pid=%s\ncores=%s\nmem_mb=%s\ndir=%s\nunit=pneuma-gate-%s.scope\nphase=admitted\nstopfails=0\ncreated=%s\n' \
+    "$2" "$3" "$4" "$5" "$1" "$(date +%s)" > "$tmp" && mv -f "$tmp" "$f"
+}
+state_set() {  # <run id> <key> <value>
+  local f="$STATE_DIR/runs/$1"
+  [ -f "$f" ] && [ ! -L "$f" ] || return 1
+  sed -i "s/^$2=.*/$2=$3/" "$f"
+}
+state_remove() { [ -L "$STATE_DIR/runs/$1" ] || rm -f "$STATE_DIR/runs/$1"; }
+
+# Live by ROOT state alone: the runner that admitted the run is alive, and the run's
+# scope is active (or the scope was requested so recently that it may not show yet).
+state_live() {  # <run id>
+  local rpid phase created
+  rpid="$(state_get "$1" runner_pid)" || return 1
+  kill -0 "$rpid" 2>/dev/null || return 1
+  phase="$(state_get "$1" phase)"
+  [ "$phase" = admitted ] && return 0
+  "$SYSTEMCTL_BIN" is-active --quiet "$(state_get "$1" unit)" && return 0
+  created="$(state_get "$1" created)"
+  [ $(( $(date +%s) - ${created:-0} )) -lt "$STATE_GRACE_S" ]
+}
+
+live_runs() {   # prints "<id> <cores> <mem_mb>" for each live run, from root state only
+  local f id
+  [ -d "$STATE_DIR/runs" ] || return 0
+  for f in "$STATE_DIR"/runs/*; do
+    [ -f "$f" ] && [ ! -L "$f" ] || continue
+    id="$(basename "$f")"
+    state_live "$id" || continue
+    printf '%s %s %s\n' "$id" "$(state_get "$id" cores)" "$(state_get "$id" mem_mb)"
   done
 }
 # can_admit <cores> <mem_mb> — true when this gate fits beside the live ones
@@ -108,19 +150,17 @@ cmd_have() {
 # ── janitor ──────────────────────────────────────────────────────────────────
 SYSTEMCTL_BIN="${PNEUMA_GATE_SYSTEMCTL:-systemctl}"
 
-# Real run directories only: no symlinks anywhere on the path, inside the runs root,
-# and owned by the gate user. A test that plants a symlink in runs/ gets nothing.
-gate_run_dirs() {
-  local root real_root d real
-  root="$BASE_DIR/runs"
-  [ -d "$root" ] && [ ! -L "$root" ] || return 0
-  real_root="$(realpath -e "$root")" || return 0
-  while IFS= read -r d; do
-    real="$(realpath -e "$d")" || continue
-    case "$real" in "$real_root"/*) ;; *) continue;; esac
-    if [ -n "$RUN_AS" ] && [ "$(stat -c %U "$real")" != "$RUN_AS" ]; then continue; fi
-    printf '%s\n' "$real"
-  done < <(find "$root" -mindepth 1 -maxdepth 1 -type d ! -type l 2>/dev/null)
+# The janitor decides from ROOT state only (state_live, the record's own fields). A
+# run directory is deleted only when it passes safe_run_dir: a real directory under
+# the runs root, not a symlink, owned by the gate user. Defense in depth.
+safe_run_dir() {  # <dir>
+  local real real_root
+  [ -d "$1" ] && [ ! -L "$1" ] || return 1
+  real="$(realpath -e "$1")" || return 1
+  real_root="$(realpath -e "$BASE_DIR/runs")" || return 1
+  case "$real" in "$real_root"/*) ;; *) return 1;; esac
+  if [ -n "$RUN_AS" ] && [ "$(stat -c %U "$real")" != "$RUN_AS" ]; then return 1; fi
+  return 0
 }
 
 # Deletion runs AS THE GATE USER: even a symlink raced into the path can only remove
@@ -130,31 +170,23 @@ gate_rm() {  # <dir>
   else rm -rf --one-file-system -- "$1"; fi
 }
 
-# Stop a run's scope, retrying with doubling backoff within the pass.
-stop_run_scope() {  # <run name>: 0 when stopped (or never there)
-  local unit="pneuma-gate-$1.scope" tries=0 delay="$STOP_BACKOFF_S"
+# Stop a scope by unit name, retrying with doubling backoff within the pass.
+stop_run_scope() {  # <unit>: 0 when stopped (or never there)
+  local tries=0 delay="$STOP_BACKOFF_S"
   while [ "$tries" -lt 3 ]; do
-    "$SYSTEMCTL_BIN" stop "$unit" >/dev/null 2>&1 && return 0
+    "$SYSTEMCTL_BIN" stop "$1" >/dev/null 2>&1 && return 0
     tries=$((tries + 1)); sleep "$delay"; delay=$((delay * 2))
   done
   return 1
 }
 
-# The failure counter lives in a root-only state directory; a planted symlink refuses.
-stop_fail_count() {  # <run name>: the count so far
-  local f="$JANITOR_STATE/$1.stop-fails"
-  if [ -L "$f" ]; then echo "$STOP_ATTEMPTS"; return; fi
-  cat "$f" 2>/dev/null || echo 0
-}
-bump_stop_fail() {  # <run name>: the new count
-  local n f
-  n=$(( $(stop_fail_count "$1") + 1 ))
-  mkdir -p "$JANITOR_STATE" && chmod 0700 "$JANITOR_STATE"
-  f="$JANITOR_STATE/$1.stop-fails"
-  [ -L "$f" ] || printf '%s\n' "$n" > "$f"
+# The failure count is a field of the run's ROOT record.
+bump_stop_fail() {  # <run id>: the new count
+  local n
+  n=$(( $(state_get "$1" stopfails) + 1 ))
+  state_set "$1" stopfails "$n"
   echo "$n"
 }
-clear_stop_fail() { [ -L "$JANITOR_STATE/$1.stop-fails" ] || rm -f "$JANITOR_STATE/$1.stop-fails"; }
 
 # A leaked run is never silent: an ERROR in the journal (priority err) and the alert log.
 janitor_alert() {  # <message>
@@ -164,26 +196,35 @@ janitor_alert() {  # <message>
 }
 
 cmd_janitor() {
-  local d pid store ref ts f run n
-  while IFS= read -r d; do
-    pid="$(cat "$d/pid" 2>/dev/null || true)"
-    if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
-      run="$(basename "$d")"
-      # The run's scope goes FIRST: stopping it kills the run's postmaster, so nothing
-      # is still writing into the directory when it is removed.
-      log "janitor: stopping the scope of dead run $run"
-      if ! stop_run_scope "$run"; then
-        n="$(bump_stop_fail "$run")"
-        log "janitor: cannot stop the scope of $run (failed pass $n of $STOP_ATTEMPTS); keeping its directory"
-        if [ "$n" -ge "$STOP_ATTEMPTS" ]; then
-          janitor_alert "gate run $run LEAKED: its scope cannot be stopped after $n passes; its directory is kept and counts toward the gate disk cap"
-        fi
-        continue
+  local f id dir unit n d
+  for f in "$STATE_DIR"/runs/*; do
+    [ -f "$f" ] && [ ! -L "$f" ] || continue
+    id="$(basename "$f")"
+    state_live "$id" && continue
+    dir="$(state_get "$id" dir)"; unit="$(state_get "$id" unit)"
+    # The scope goes FIRST: stopping it kills whatever the run left, its postmaster included.
+    log "janitor: dead run $id: stopping $unit"
+    if ! stop_run_scope "$unit"; then
+      n="$(bump_stop_fail "$id")"
+      log "janitor: cannot stop $unit (failed pass $n of $STOP_ATTEMPTS); keeping its directory"
+      if [ "$n" -ge "$STOP_ATTEMPTS" ]; then
+        janitor_alert "gate run $id LEAKED: $unit cannot be stopped after $n passes; its directory is kept and counts toward the gate disk cap"
       fi
-      clear_stop_fail "$run"
-      log "janitor: removing dead run $run"; gate_rm "$d"
+      continue
     fi
-  done < <(gate_run_dirs)
+    if [ -z "$dir" ] || ! safe_run_dir "$dir"; then
+      janitor_alert "gate run $id has no safe directory to remove ($dir); record kept for review"
+      continue
+    fi
+    log "janitor: removing dead run $id"; gate_rm "$dir"
+    state_remove "$id"
+  done
+  # Directories with NO root record (a crash between mkdir and the record): removed only
+  # when a day old and safe. Nothing inside them is read.
+  while IFS= read -r d; do
+    [ -f "$STATE_DIR/runs/$(basename "$d")" ] && continue
+    safe_run_dir "$d" && gate_rm "$d"
+  done < <(find "$BASE_DIR/runs" -mindepth 1 -maxdepth 1 -type d ! -type l -mtime +1 2>/dev/null)
   for f in "$BASE_DIR"/queue/*; do
     [ -e "$f" ] || continue
     case "$(basename "$f")" in in-*) [ -n "$(find "$f" -mmin +120 2>/dev/null)" ] && rm -f "$f"; continue;; esac
@@ -215,7 +256,10 @@ result() {   # result <exit> [reason]
 }
 cleanup() {
   [ -n "$QUEUE_FILE" ] && rm -f "$QUEUE_FILE"
-  [ -n "$RUN_DIR" ] && [ -d "$RUN_DIR" ] && rm -rf "$RUN_DIR"
+  if [ -n "$RUN_DIR" ] && [ -d "$RUN_DIR" ]; then
+    state_remove "$(basename "$RUN_DIR")"
+    gate_rm "$RUN_DIR"
+  fi
 }
 refuse() { log "REFUSED: $1"; result 75 "$1"; exit 75; }
 
@@ -237,7 +281,7 @@ admit() {   # admit <cores> <mem_mb> — block until admitted; creates RUN_DIR
     if [ "$(first_live_waiter)" = "$(basename "$QUEUE_FILE")" ] && can_admit "$cores" "$mem"; then
       RUN_DIR="$BASE_DIR/runs/$(date +%Y%m%dT%H%M%S)-$$"
       mkdir -p "$RUN_DIR/work" "$RUN_DIR/tmp" "$RUN_DIR/home"
-      echo $$ > "$RUN_DIR/pid"; echo "$cores" > "$RUN_DIR/cores"; echo "$mem" > "$RUN_DIR/mem_mb"
+      state_create "$(basename "$RUN_DIR")" "$$" "$cores" "$mem" "$RUN_DIR" || refuse "cannot record the run's state"
       if [ -n "$RUN_AS" ]; then chown -R "$RUN_AS" "$RUN_DIR"; fi
       chmod 755 "$RUN_DIR"
       rm -f "$QUEUE_FILE"; QUEUE_FILE=""
@@ -310,6 +354,7 @@ cmd_run() {
     || refuse "cannot create $BASE_DIR"
   if [ -n "$RUN_AS" ]; then chown "$RUN_AS" "$BASE_DIR" "$BASE_DIR"/repos "$BASE_DIR"/envs "$BASE_DIR"/queue 2>/dev/null; fi
 
+  state_init || refuse "cannot create the root run-state directory $STATE_DIR"
   cmd_janitor >/dev/null 2>&1   # reap dead runs first so their space counts
   local free; free="$(disk_free_gib)"
   [ -n "$free" ] || refuse "cannot read disk usage for $BASE_DIR"
@@ -374,6 +419,8 @@ cmd_run() {
   local scope_bin="${PNEUMA_GATE_SYSTEMD_RUN:-systemd-run}" runner_prefix=()
   command -v "$scope_bin" >/dev/null 2>&1 || refuse "no $scope_bin: the gate's resource scope is required"
   [ -n "$RUN_AS" ] && runner_prefix=(runuser -u "$RUN_AS" --)
+  # From here the scope may exist: the root record says so (liveness now needs it active).
+  state_set "$(basename "$RUN_DIR")" phase scoped || refuse "cannot record the run's scope"
   "$scope_bin" --scope --quiet --collect --unit="pneuma-gate-$(basename "$RUN_DIR")" \
     -p MemoryMax="${mem}M" -p CPUQuota="$((cores * 100))%" -p TasksMax=512 -- \
     "${runner_prefix[@]}" env -i PATH=/usr/local/bin:/usr/bin:/bin HOME="$RUN_DIR/home" TMPDIR="$RUN_DIR/tmp" LANG=C.UTF-8 \

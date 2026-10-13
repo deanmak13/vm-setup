@@ -115,53 +115,6 @@ _engine_pg_assert_loopback() {  # <port>
   [ "$bad" = 0 ] || { echo "live-pg: FAILED — the cluster listens beyond 127.0.0.1: $lines" >&2; return 1; }
 }
 
-# A gate killed with SIGKILL never runs its EXIT trap, so its cluster outlives it.
-# A cluster is reaped only when ALL of these hold:
-#   - it sits in a real run directory (no symlinks anywhere on the path) under the
-#     runs root, and is not this run's own;
-#   - its owner (the gate PID in owner.pid, a regular file) is dead: kill -0 fails;
-#   - the cluster has been idle past PNEUMA_GATE_PG_ORPHAN_AGE_S, judged by its WAL
-#     and server log activity, not by the postmaster file's age.
-# Nothing is reaped by pattern, port, or age alone; a live owner is never touched.
-_engine_pg_real_dir() {  # <path> — prints the resolved path when it is a real directory, else fails
-  [ -d "$1" ] && [ ! -L "$1" ] || return 1
-  realpath -e "$1"
-}
-
-_engine_pg_reap_orphans() {  # <runs root> <current run dir>
-  local root real_root run real_run owner gate_pid data pidfile newest now threshold="${PNEUMA_GATE_PG_ORPHAN_AGE_S:-900}"
-  real_root="$(_engine_pg_real_dir "$1")" || return 0
-  real_run="$(_engine_pg_real_dir "$2")" || real_run=""
-  now="$(date +%s)"
-  while IFS= read -r run; do
-    run="$(_engine_pg_real_dir "$run")" || continue                  # real directory, no symlink
-    case "$run" in "$real_root"/*) ;; *) continue;; esac           # under the runs root
-    [ "$run" = "$real_run" ] && continue                             # never this run's own
-    owner="$run/owner.pid"
-    [ -f "$owner" ] && [ ! -L "$owner" ] || continue
-    gate_pid="$(head -1 "$owner" 2>/dev/null)"
-    [[ "$gate_pid" =~ ^[0-9]+$ ]] || continue
-    kill -0 "$gate_pid" 2>/dev/null && continue                     # a live gate owns it: a concurrent run
-    data="$(_engine_pg_real_dir "$run/pg/data")" || continue
-    case "$data" in "$real_root"/*) ;; *) continue;; esac
-    pidfile="$data/postmaster.pid"
-    [ -f "$pidfile" ] && [ ! -L "$pidfile" ] || continue
-    # activity: the newest WAL segment or server log line. Regular files only.
-    newest="$(find "$data/pg_wal" "$run/pg/server.log" -maxdepth 1 -type f ! -type l -printf '%T@\n' 2>/dev/null | sort -n | tail -1)"
-    newest="${newest%%.*}"; newest="${newest:-0}"
-    [ $(( now - newest )) -ge "$threshold" ] || continue
-    echo "live-pg: reaping the cluster of dead gate $gate_pid (run ${run##*/}, idle $(( now - newest ))s)" >&2
-    "$ENGINE_PG_BIN/pg_ctl" -D "$data" -m immediate -w stop >/dev/null 2>&1 || true
-  done < <(find "$real_root" -mindepth 1 -maxdepth 1 -type d ! -type l 2>/dev/null)
-  return 0
-}
-
-# The reaper for this run: the runs root is the parent of this run's own directory.
-# Derived from PNEUMA_GATE_RUN_DIR alone, so it works under the sandbox's env -i.
-_engine_pg_reap_current() {
-  _engine_pg_reap_orphans "$(dirname "$PNEUMA_GATE_RUN_DIR")" "$PNEUMA_GATE_RUN_DIR"
-}
-
 _engine_pg_up() {  # <run dir> — exports INTEGRATION_TEST + PGTEST_DSN; returns 1 on any failure
   local root="$1/pg" port pw
   if [ ! -x "$ENGINE_PG_BIN/initdb" ]; then
@@ -171,7 +124,6 @@ _engine_pg_up() {  # <run dir> — exports INTEGRATION_TEST + PGTEST_DSN; return
   port="$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')" || return 1
   pw="$(head -c 48 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 32)"
   mkdir -p "$root" && printf '%s' "$pw" > "$root/pw" && chmod 600 "$root/pw" || return 1
-  printf '%s\n' "$$" > "$1/owner.pid" || return 1       # the gate PID the reaper keys on
   # The postmaster runs inside the gate's systemd scope (see the runner), so the run's
   # MemoryMax covers it. These caps keep its own footprint small for throwaway tests.
   "$ENGINE_PG_BIN/initdb" -D "$root/data" -U gate --pwfile="$root/pw" -A scram-sha-256 -E UTF8 \
@@ -261,7 +213,6 @@ _engine_pg_arm_exit() {
 
 profile_gate() {
   local envdir="$1" head="$2" base="$3" timeout_s="$4"
-  _engine_pg_reap_current
   _engine_pg_up "$PNEUMA_GATE_RUN_DIR" || return 1
   _engine_pg_arm_exit
   # The gate pip-installs INTO its interpreter (editable project + per-service
