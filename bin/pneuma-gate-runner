@@ -30,6 +30,11 @@ MIN_FREE_GIB="${PNEUMA_GATE_MIN_FREE_GIB:-40}"          # absolute free-space fl
 RESERVE_CORES="${PNEUMA_GATE_RESERVE_CORES:-3}"       # left for runners + k3s
 RESERVE_MEM_MB="${PNEUMA_GATE_RESERVE_MEM_MB:-6144}"
 MAX_CONCURRENT="${PNEUMA_GATE_MAX_CONCURRENT:-4}"
+RUNS_CAP_MB="${PNEUMA_GATE_RUNS_CAP_MB:-61440}"          # admission refuses new runs past this many MB of run directories (60GiB)
+STOP_ATTEMPTS="${PNEUMA_GATE_STOP_ATTEMPTS:-5}"          # janitor passes that fail to stop a dead run's scope before the alert fires
+STOP_BACKOFF_S="${PNEUMA_GATE_STOP_BACKOFF_S:-2}"        # first retry delay within a pass; doubles each retry
+JANITOR_STATE="${PNEUMA_GATE_JANITOR_STATE:-/var/lib/pneuma-gate-janitor}"   # root-only: failure counters
+ALERT_FILE="${PNEUMA_GATE_ALERT_FILE:-/var/log/pneuma-gate-alerts.log}"      # root-owned alert log
 QUEUE_TIMEOUT_S="${PNEUMA_GATE_QUEUE_TIMEOUT_S:-10800}"
 GATE_TIMEOUT_S="${PNEUMA_GATE_TIMEOUT_S:-5400}"
 LOAD_CEILING_PCT="${PNEUMA_GATE_LOAD_CEILING_PCT:-150}" # % of nproc; only blocks stacking a 2nd gate
@@ -118,18 +123,65 @@ gate_run_dirs() {
   done < <(find "$root" -mindepth 1 -maxdepth 1 -type d ! -type l 2>/dev/null)
 }
 
+# Deletion runs AS THE GATE USER: even a symlink raced into the path can only remove
+# what the gate user could remove anyway. Only the scope stop runs as root, by unit name.
+gate_rm() {  # <dir>
+  if [ -n "$RUN_AS" ]; then runuser -u "$RUN_AS" -- rm -rf --one-file-system -- "$1"
+  else rm -rf --one-file-system -- "$1"; fi
+}
+
+# Stop a run's scope, retrying with doubling backoff within the pass.
+stop_run_scope() {  # <run name>: 0 when stopped (or never there)
+  local unit="pneuma-gate-$1.scope" tries=0 delay="$STOP_BACKOFF_S"
+  while [ "$tries" -lt 3 ]; do
+    "$SYSTEMCTL_BIN" stop "$unit" >/dev/null 2>&1 && return 0
+    tries=$((tries + 1)); sleep "$delay"; delay=$((delay * 2))
+  done
+  return 1
+}
+
+# The failure counter lives in a root-only state directory; a planted symlink refuses.
+stop_fail_count() {  # <run name>: the count so far
+  local f="$JANITOR_STATE/$1.stop-fails"
+  if [ -L "$f" ]; then echo "$STOP_ATTEMPTS"; return; fi
+  cat "$f" 2>/dev/null || echo 0
+}
+bump_stop_fail() {  # <run name>: the new count
+  local n f
+  n=$(( $(stop_fail_count "$1") + 1 ))
+  mkdir -p "$JANITOR_STATE" && chmod 0700 "$JANITOR_STATE"
+  f="$JANITOR_STATE/$1.stop-fails"
+  [ -L "$f" ] || printf '%s\n' "$n" > "$f"
+  echo "$n"
+}
+clear_stop_fail() { [ -L "$JANITOR_STATE/$1.stop-fails" ] || rm -f "$JANITOR_STATE/$1.stop-fails"; }
+
+# A leaked run is never silent: an ERROR in the journal (priority err) and the alert log.
+janitor_alert() {  # <message>
+  log "ERROR ALERT $1"
+  logger -t pneuma-gate -p daemon.err -- "ALERT $1" 2>/dev/null || true
+  [ -L "$ALERT_FILE" ] || printf '%s ALERT %s\n' "$(date -u +%FT%TZ)" "$1" >> "$ALERT_FILE"
+}
+
 cmd_janitor() {
-  local d pid store ref ts f
+  local d pid store ref ts f run n
   while IFS= read -r d; do
     pid="$(cat "$d/pid" 2>/dev/null || true)"
     if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+      run="$(basename "$d")"
       # The run's scope goes FIRST: stopping it kills the run's postmaster, so nothing
       # is still writing into the directory when it is removed.
-      log "janitor: stopping the scope of dead run $(basename "$d")"
-      if ! "$SYSTEMCTL_BIN" stop "pneuma-gate-$(basename "$d").scope" >/dev/null 2>&1; then
-        log "janitor: cannot stop the scope of $(basename "$d"); keeping its directory"; continue
+      log "janitor: stopping the scope of dead run $run"
+      if ! stop_run_scope "$run"; then
+        n="$(bump_stop_fail "$run")"
+        log "janitor: cannot stop the scope of $run (failed pass $n of $STOP_ATTEMPTS); keeping its directory"
+        if [ "$n" -ge "$STOP_ATTEMPTS" ]; then
+          janitor_alert "gate run $run LEAKED: its scope cannot be stopped after $n passes; its directory is kept and counts toward the gate disk cap"
+        fi
+        continue
       fi
-      log "janitor: removing dead run $(basename "$d")"; rm -rf -- "$d"
+      clear_stop_fail "$run"
+      log "janitor: removing dead run $run"; gate_rm "$d"
     fi
   done < <(gate_run_dirs)
   for f in "$BASE_DIR"/queue/*; do
@@ -262,6 +314,10 @@ cmd_run() {
   local free; free="$(disk_free_gib)"
   [ -n "$free" ] || refuse "cannot read disk usage for $BASE_DIR"
   [ "$free" -lt "$MIN_FREE_GIB" ] && refuse "disk free ${free}GiB < ${MIN_FREE_GIB}GiB floor — refusing to start"
+  # Leaked or stuck runs fill the gate disk: past the cap, admission refuses until the
+  # janitor frees space (the TST node dies under disk pressure).
+  local used; used="$(du -sm "$BASE_DIR/runs" 2>/dev/null | cut -f1)"
+  [ "${used:-0}" -gt "$RUNS_CAP_MB" ] && refuse "gate disk over cap: run directories use ${used}MB > ${RUNS_CAP_MB}MB — refusing new runs until the janitor frees space"
 
   # shellcheck disable=SC1090
   source "$PROFILE_DIR/$profile.sh" || refuse "profile $profile failed to load"

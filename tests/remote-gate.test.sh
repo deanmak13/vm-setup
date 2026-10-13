@@ -390,6 +390,7 @@ STUB
 chmod +x "$work/bin/systemctl-stub"
 export SYSTEMCTL_RECORD="$work/systemctl-record.txt"; : > "$SYSTEMCTL_RECORD"
 export PNEUMA_GATE_SYSTEMCTL="$work/bin/systemctl-stub"
+export PNEUMA_GATE_STOP_BACKOFF_S=0 PNEUMA_GATE_JANITOR_STATE="$work/janitor-state" PNEUMA_GATE_ALERT_FILE="$work/alerts.log"
 mkdir -p "$PNEUMA_GATE_BASE/runs/dead-1"; echo 999999 > "$PNEUMA_GATE_BASE/runs/dead-1/pid"
 mkdir -p "$PNEUMA_GATE_BASE/runs/fail-stop-1"; echo 999999 > "$PNEUMA_GATE_BASE/runs/fail-stop-1/pid"
 mkdir -p "$work/janitor-outside"; echo 999999 > "$work/janitor-outside/pid"; : > "$work/janitor-outside/keep.txt"
@@ -400,7 +401,41 @@ check "janitor: the run's scope is stopped BEFORE its directory is removed" grep
 check "janitor: a planted symlink in runs/ is never followed (its target survives)" test -e "$work/janitor-outside/keep.txt"
 check "janitor: a planted symlink is never sent a scope stop" bash -c '! grep -q "planted-run" "$1"' _ "$SYSTEMCTL_RECORD"
 check "janitor: if the scope cannot be stopped, the directory is kept (fail closed)" test -e "$PNEUMA_GATE_BASE/runs/fail-stop-1"
+check "janitor: a failed stop is retried with backoff (3 attempts per pass)" test "$(grep -c "stop pneuma-gate-fail-stop-1" "$SYSTEMCTL_RECORD")" -ge 3
+
+# Deletion AS THE GATE USER: a runuser stand-in records the call and runs it as this user.
+cat > "$work/bin/runuser" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$RUNUSER_RECORD"
+while [ $# -gt 0 ] && [ "$1" != -- ]; do shift; done; shift
+exec "$@"
+STUB
+chmod +x "$work/bin/runuser"
+export RUNUSER_RECORD="$work/runuser-record.txt"; : > "$RUNUSER_RECORD"
+race_run="$PNEUMA_GATE_BASE/runs/dead-race"; mkdir -p "$race_run/inner"; echo 999999 > "$race_run/pid"
+race_victim="$work/race-victim"; mkdir -p "$race_victim"; : > "$race_victim/keep.txt"
+ln -s "$race_victim" "$race_run/inner/escape"   # a raced symlink inside the run
+PNEUMA_GATE_RUN_AS="$(id -un)" PATH="$work/bin:$PATH" "$RUNNER" janitor >/dev/null 2>&1
+check "delete: the run directory is removed THROUGH the gate user (runuser -u, rm --one-file-system)" grep -q -- "-u $(id -un) -- rm -rf --one-file-system -- $race_run" "$RUNUSER_RECORD"
+check "delete: a symlink raced into the run never takes its target with it" test -e "$race_victim/keep.txt"
+check "delete: the raced run itself is gone" not test -e "$race_run"
+
+# A stop that keeps failing is never silent: ERROR in the journal and the alert log.
+mkdir -p "$PNEUMA_GATE_BASE/runs/fail-stop-alert"; echo 999999 > "$PNEUMA_GATE_BASE/runs/fail-stop-alert/pid"
+PNEUMA_GATE_STOP_ATTEMPTS=2 "$RUNNER" janitor >/dev/null 2>&1
+check "alert: below the limit, no alert yet" bash -c '! grep -q "fail-stop-alert" "$1" 2>/dev/null' _ "$PNEUMA_GATE_ALERT_FILE"
+PNEUMA_GATE_STOP_ATTEMPTS=2 "$RUNNER" janitor >/dev/null 2>&1
+check "alert: a repeated stop failure raises the ALERT (log file)" grep -q "ALERT gate run fail-stop-alert LEAKED" "$PNEUMA_GATE_ALERT_FILE"
+check "alert: the leaked directory is still kept, not deleted" test -e "$PNEUMA_GATE_BASE/runs/fail-stop-alert"
 unset PNEUMA_GATE_SYSTEMCTL
+
+# Admission refuses past the runs disk cap (tests the real cmd_run path).
+cap_run_base="$PNEUMA_GATE_BASE"
+mkdir -p "$cap_run_base/runs/bulk"; echo "$$" > "$cap_run_base/runs/bulk/pid"   # alive: the janitor keeps it
+head -c 3000000 /dev/zero > "$cap_run_base/runs/bulk/blob"
+cap_out="$(PNEUMA_GATE_RUNS_CAP_MB=1 "$RUNNER" run --profile fake --repo fakerepo --head "$head" --base "$base" --tree "$tree" 2>&1)" && cap_rc=0 || cap_rc=$?
+check "disk cap: admission refuses past the runs cap (exit 75, named)" bash -c '[ "$1" = 75 ] && grep -q "gate disk over cap" <<<"$2"' _ "$cap_rc" "$cap_out"
+rm -rf "$cap_run_base/runs/bulk"
 
 # ── cron and at: only root may schedule work (ITEM 6) ────────────────────────
 check "cron/at: the bootstrap restricts both to root (cron.allow and at.allow)" bash -c '
