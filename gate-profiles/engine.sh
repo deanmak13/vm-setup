@@ -6,6 +6,8 @@
 #   profile_env_key                  (cwd = checkout) key of the dependency env; same key = same env
 #   profile_stage_root <base>        OPTIONAL, runs as root once per env build (assets needing docker)
 #   profile_env_build <dir>          (as the gate user) build the env at <dir>; it is frozen read-only after
+#   profile_scope_report <base> <head>  OPTIONAL, runs in the checkout; prints the scoping decision
+#                                    (diff size, selected services) at the top of the log
 #   profile_gate <env> <head> <base> <timeout_s>
 #                                    run the repo's OWN pre-push hook for that range; exit code = verdict
 #
@@ -89,6 +91,17 @@ except Exception:
 PYEOF
 )
   return 0
+}
+
+profile_scope_report() {
+  # The head's selector is PR code: run it under the same scrub and time limit as
+  # the gate itself (no ambient credentials, bounded), never in the runner's env.
+  local base="$1" head="$2" files
+  files="$(git diff --name-only "$base" "$head")"
+  echo "$(printf '%s\n' "$files" | grep -c .) changed file(s) vs base ${base:0:12} (head ${head:0:12})"
+  printf '%s\n' "$files" | env -i PATH=/usr/local/bin:/usr/bin:/bin HOME="$HOME" LANG=C.UTF-8 \
+      timeout 120 python3 tools/ci/detect_changed_services.py explain 2>&1 |
+    grep -E "services selected|services: FULL|connectors selected|connectors: FULL|always-on guards"
 }
 
 profile_gate() {
