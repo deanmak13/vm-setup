@@ -115,7 +115,7 @@ _engine_pg_assert_loopback() {  # <port>
   [ "$bad" = 0 ] || { echo "live-pg: FAILED — the cluster listens beyond 127.0.0.1: $lines" >&2; return 1; }
 }
 
-_engine_pg_up() {  # <run dir> — exports INTEGRATION_TEST + PNEUMA_TEST_PG_DSN; returns 1 on any failure
+_engine_pg_up() {  # <run dir> — exports INTEGRATION_TEST + PGTEST_DSN; returns 1 on any failure
   local root="$1/pg" port pw
   if [ ! -x "$ENGINE_PG_BIN/initdb" ]; then
     echo "live-pg: FAILED — no PostgreSQL 16 binaries at $ENGINE_PG_BIN; the live suites cannot run, so this gate cannot be green" >&2
@@ -131,7 +131,7 @@ _engine_pg_up() {  # <run dir> — exports INTEGRATION_TEST + PNEUMA_TEST_PG_DSN
     || { echo "live-pg: FAILED — server did not start (see $root/server.log)" >&2; return 1; }
   _ENGINE_PG_ROOT="$root"
   if ! _engine_pg_assert_loopback "$port"; then _engine_pg_down; return 1; fi
-  export INTEGRATION_TEST=1 PNEUMA_TEST_PG_DSN="postgresql://gate:$pw@127.0.0.1:$port/postgres"
+  export INTEGRATION_TEST=1 PGTEST_DSN="postgresql://gate:$pw@127.0.0.1:$port/postgres"
   echo "live-pg: native PostgreSQL 16 on 127.0.0.1:$port (per-run cluster, stopped on exit)"
 }
 

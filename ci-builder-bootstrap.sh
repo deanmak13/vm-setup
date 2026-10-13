@@ -197,6 +197,21 @@ log "installing base packages"
 apt-get update -qq
 apt-get install -y -qq curl unzip jq git ufw
 
+# ── 1b. PostgreSQL 16 server, for the engine gate's per-run clusters only ─
+# The gate starts its own loopback clusters from these binaries (gate-profiles/
+# engine.sh). Ubuntu's default cluster (16/main, port 5432) is dropped and its
+# service disabled, so no host-wide PostgreSQL listens: the per-run clusters are
+# the only servers on this host.
+if ! dpkg -s postgresql-16 >/dev/null 2>&1; then
+    log "installing PostgreSQL 16 server (gate clusters)"
+    apt-get install -y -qq postgresql-16
+fi
+if pg_lsclusters 2>/dev/null | awk 'NR>1 && $1=="16" && $2=="main"{f=1} END{exit !f}'; then
+    log "dropping the default PostgreSQL 16 cluster (no host-wide server)"
+    pg_dropcluster --stop 16 main
+fi
+systemctl disable --now postgresql 2>/dev/null || true
+
 # ── 2. Docker ────────────────────────────────────────────────────────────
 if ! command -v docker &>/dev/null; then
     log "installing Docker CE"
