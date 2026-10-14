@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Tests for docker-user-firewall.sh: rule generation and every fail-closed path.
 # No root or real iptables needed: iptables/ip6tables/docker are stubbed.
-# The kernel-level behaviour is covered by tests/docker-user-firewall-netns.test.sh.
+# The kernel-level behaviour is covered by tests/docker-user-firewall-netns.sh.
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SCRIPT="$ROOT/docker-user-firewall.sh"

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Kernel-level test of docker-user-firewall.sh in a throwaway user+net+mount namespace:
+# Kernel-level test (run by hand and in review; not in tests/coverage.sh, which only runs *.test.sh) of docker-user-firewall.sh in a throwaway user+net+mount namespace:
 # real netfilter/conntrack/DNAT, no host state touched. Skips (exit 0) where unshare,
 # iptables or the conntrack match are unavailable (e.g. inside the kcov container).
 #
