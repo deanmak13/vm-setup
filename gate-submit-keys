@@ -1,4 +1,7 @@
 # Gate submitters: one line per authorized key. <stable-id> <key type> <base64 key>.
-# The installer renders each as a forced-command authorized_keys entry for the pneuma-submit account.
+# The key is DEDICATED to the gate: it is authorized here and nowhere else (not in root's authorized_keys).
+# The private half lives only on the dev box at ~/.ssh/pneuma_gate_submit_ed25519; the lanes' gate client
+# connects with it (ssh config: IdentityFile ~/.ssh/pneuma_gate_submit_ed25519, User pneuma-submit).
+# The installer renders each line as a restrict + forced-command authorized_keys entry (root-owned file).
 # The id is the identity the gate records and caps; a client cannot choose it.
-dean-devbox ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOeVMTcCGkY0NN1DvIIMh6t7PKeBDOpaLEiZ1gYpgRsj
+dean-devbox ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBM4gZv7s37tAvy+l+gKP9TOV7fVIyVKI3ulSOx9krrT

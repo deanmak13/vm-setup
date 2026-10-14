@@ -444,6 +444,11 @@ cmd_run() {
 main() {
   local sub="${1:-}"
   [ $# -gt 0 ] && shift
+  # Elevated only through pneuma-gate-entry: sudo sets SUDO_USER (env_reset makes it unforgeable by a
+  # non-root caller). Any other sudo user is refused. A root shell without sudo is an operator.
+  if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != pneuma-submit ]; then
+    echo "pneuma-gate-runner: refused: elevation by '$SUDO_USER' (only pneuma-submit may run the gate)" >&2; exit 75
+  fi
   # `--submitter <id>` is placed by pneuma-gate-entry (sshd's forced command), never by a client.
   SUBMITTER=""
   if [ "${1:-}" = --submitter ]; then SUBMITTER="${2:-}"; shift 2; fi

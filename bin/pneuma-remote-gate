@@ -45,8 +45,14 @@ G() { env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_OBJECT_DIRECTORY 
 # the file a lane tails. A silent refusal is how gates looked "queued" for hours.
 nogate() {
   echo "pneuma-remote-gate: REFUSED: $*" >&2
-  local dir; dir="$(git -C "${repo_dir:-.}" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" && \
-    { mkdir -p "$dir/pneuma-remote-gate" && printf '%s REFUSED %s\n' "$(date -u +%FT%TZ)" "$*" >> "$dir/pneuma-remote-gate/refusals.log"; } 2>/dev/null || true
+  # one record per line (newlines escaped), and never through a symlink: a planted link must not
+  # make the client append to some other file
+  local dir msg file; dir="$(git -C "${repo_dir:-.}" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || dir=""
+  msg="$(printf '%s' "$*" | tr '\n\r\t' '   ')"
+  if [ -n "$dir" ] && [ ! -L "$dir/pneuma-remote-gate" ]; then
+    file="$dir/pneuma-remote-gate/refusals.log"
+    { mkdir -p "$dir/pneuma-remote-gate" && [ ! -L "$file" ] && printf '%s REFUSED %s\n' "$(date -u +%FT%TZ)" "$msg" >> "$file"; } 2>/dev/null || true
+  fi
   exit 75
 }
 

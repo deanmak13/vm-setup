@@ -57,7 +57,13 @@ while [ "$i" -lt "${#words[@]}" ]; do
   val="${words[$((i + 1))]-}"
   [ -n "$val" ] || die "option '$opt' has no value"
   [[ "$val" =~ $pat ]] || die "the value of '$opt' is not in the grammar"
+  # no path traversal and no option-looking values, in any value (the runner does not rely on this)
+  [[ "$val" != *..* && "$val" != -* ]] || die "the value of '$opt' contains '..' or starts with '-'"
   args+=("$opt" "$val"); i=$((i + 2))
 done
 
-exec "$RUNNER" "$verb" --submitter "$submitter" "${args[@]:1}"
+# Elevation: pneuma-submit is unprivileged; the runner needs root. ONE sudoers rule allows exactly
+# this binary (see the installer's sudoers file), NOPASSWD, env_reset. sudo sets SUDO_USER, which
+# the runner checks. The arguments are the ones validated above.
+SUDO_BIN="${PNEUMA_GATE_SUDO:-/usr/bin/sudo}"
+exec "$SUDO_BIN" -n -- "$RUNNER" "$verb" --submitter "$submitter" "${args[@]:1}"

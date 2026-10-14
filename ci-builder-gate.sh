@@ -39,16 +39,24 @@ if [ "$do_host" = 1 ]; then
   # submitter is the id the key line forces, never something the client sends.
   rsync -a "$REPO_DIR/bin/pneuma-gate-entry" "$HOST:/usr/local/bin/pneuma-gate-entry"
   rsync -a "$REPO_DIR/gate-submit-keys" "$HOST:/tmp/pneuma-gate-submit-keys"
+  # STAGED MIGRATION (PR #20): stage 1 installs the account, the entry, the sudoers rule and the
+  # keys; the old root path keeps working until the lanes' ssh config switches (stage 2); then the
+  # strict runner is deployed (stage 3). See the PR body for the steps.
   ssh "$HOST" 'set -euo pipefail
     chmod 0755 /usr/local/bin/pneuma-gate-entry
     id pneuma-submit >/dev/null 2>&1 || useradd --system --create-home --home-dir /var/lib/pneuma-submit --shell /bin/bash pneuma-submit
-    install -d -o pneuma-submit -g pneuma-submit -m 0700 /var/lib/pneuma-submit/.ssh
+    # the keys are root-owned: the submitter account cannot change its own authorized keys
+    install -d -o root -g root -m 0755 /var/lib/pneuma-submit/.ssh
     grep -v "^#" /tmp/pneuma-gate-submit-keys | while read -r id type key; do
-      printf "command=\"/usr/local/bin/pneuma-gate-entry --submitter %s\",no-port-forwarding,no-agent-forwarding,no-pty,no-user-rc %s %s\n" "$id" "$type" "$key"
+      printf "restrict,command=\"/usr/local/bin/pneuma-gate-entry --submitter %s\" %s %s\n" "$id" "$type" "$key"
     done > /var/lib/pneuma-submit/.ssh/authorized_keys
-    chown pneuma-submit:pneuma-submit /var/lib/pneuma-submit/.ssh/authorized_keys
-    chmod 0600 /var/lib/pneuma-submit/.ssh/authorized_keys
-    rm -f /tmp/pneuma-gate-submit-keys'
+    chown root:root /var/lib/pneuma-submit/.ssh/authorized_keys
+    chmod 0644 /var/lib/pneuma-submit/.ssh/authorized_keys
+    # the ONE elevation: the entry may run exactly this binary as root, NOPASSWD, env reset
+    printf "Defaults!/usr/local/bin/pneuma-gate-runner env_reset\npneuma-submit ALL=(root) NOPASSWD: /usr/local/bin/pneuma-gate-runner\n" > /tmp/pneuma-submit.sudoers
+    visudo -cf /tmp/pneuma-submit.sudoers >/dev/null
+    install -o root -g root -m 0440 /tmp/pneuma-submit.sudoers /etc/sudoers.d/pneuma-submit
+    rm -f /tmp/pneuma-submit.sudoers /tmp/pneuma-gate-submit-keys'
   ssh "$HOST" 'mkdir -p /usr/local/lib/pneuma-gate/profiles'
   rsync -a --delete "$REPO_DIR/gate-profiles/" "$HOST:/usr/local/lib/pneuma-gate/profiles/"
   rsync -a "$REPO_DIR/bin/pneuma-gate-runner" "$HOST:/usr/local/bin/pneuma-gate-runner"

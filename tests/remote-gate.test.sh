@@ -102,7 +102,14 @@ cat > "$work/bin/argv-recorder" <<'STUB'
 printf '%s\n' "$*" > "$ARGV_RECORD"
 exit 0
 STUB
-chmod +x "$work/bin/gate-as-forced-command" "$work/bin/argv-recorder"
+cat > "$work/bin/sudo-stub" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" > "$SUDO_RECORD"
+while [ $# -gt 0 ] && [ "$1" != -- ]; do shift; done; shift
+exec "$@"
+STUB
+chmod +x "$work/bin/gate-as-forced-command" "$work/bin/argv-recorder" "$work/bin/sudo-stub"
+export SUDO_RECORD="$work/sudo-recorded.txt" PNEUMA_GATE_SUDO="$work/bin/sudo-stub"
 export ARGV_RECORD="$work/argv-recorded.txt"
 export PATH="$work/bin:$PATH" PNEUMA_GATE_RUNNER="$work/bin/gate-as-forced-command" PNEUMA_GATE_RUNNER_BIN="$RUNNER" PNEUMA_GATE_HOST=fakehost
 export PNEUMA_GATE_DEDUP_DIR="$work/dedup"   # GATE-DEDUP-1 state: never under /var/lib in tests
@@ -138,6 +145,12 @@ evil_out=$("$CLIENT" --repo-dir "$src" --head "$head" --base "$base" --scope-onl
 check "scope: a foreign origin is refused" bash -c '[ "$1" = 75 ] && grep -q "is not a deanmak13 repository" <<<"$2"' _ "$evil_rc" "$evil_out"
 check "scope: a refusal is also written to the refusals log under the git dir (loud, never silent)" \
   bash -c 'grep -q "REFUSED" "$1/.git/pneuma-remote-gate/refusals.log"' _ "$src"
+# a planted symlink must not make the client append to another file
+victim_log="$work/victim-file"; : > "$victim_log"
+rm -f "$src/.git/pneuma-remote-gate/refusals.log"; ln -s "$victim_log" "$src/.git/pneuma-remote-gate/refusals.log"
+"$CLIENT" --repo-dir "$src" --head "$head" --base "$base" --scope-only >/dev/null 2>&1 || true
+check "refusals log: a symlink is never followed (the victim file stays empty)" test ! -s "$victim_log"
+rm -f "$src/.git/pneuma-remote-gate/refusals.log"
 git -C "$src" config remote.origin.url https://github.com/deanmak13/fakerepo.git
 wt_dir="$work/wt-named-anything"
 git -C "$src" worktree add -q --detach "$wt_dir" "$head" 2>/dev/null
@@ -415,6 +428,14 @@ check "grammar: an option outside the allowlist is refused" \
   bash -c 'SSH_ORIGINAL_COMMAND="run --profile fake --evil yes" "$1" --submitter test-lane >/dev/null 2>&1; test $? = 75' _ "$ENTRY"
 check "grammar: a value outside its pattern is refused (a non-hex head)" \
   bash -c 'SSH_ORIGINAL_COMMAND="run --profile fake --head notahash" "$1" --submitter test-lane >/dev/null 2>&1; test $? = 75' _ "$ENTRY"
+check "elevation: the entry runs EXACTLY the runner as root (sudo -n -- <runner> ...), nothing else" \
+  bash -c 'SSH_ORIGINAL_COMMAND="status" PNEUMA_GATE_RUNNER_BIN="$2" "$1" --submitter test-lane >/dev/null 2>&1; grep -q "^-n -- $2 status --submitter test-lane$" "$3"' _ "$ENTRY" "$work/bin/argv-recorder" "$SUDO_RECORD"
+check "traversal: the entry itself refuses '..' in --repo (its own message, not the pattern's)" \
+  bash -c 'out=$(SSH_ORIGINAL_COMMAND="have --repo a..b" "$1" --submitter test-lane 2>&1); test $? = 75; grep -q "contains .\.\.." <<<"$out"' _ "$ENTRY"
+check "traversal: the entry itself refuses '..' in --branch (its own message)" \
+  bash -c 'out=$(SSH_ORIGINAL_COMMAND="run --profile fake --branch a..b" "$1" --submitter test-lane 2>&1); test $? = 75; grep -q "contains .\.\.." <<<"$out"' _ "$ENTRY"
+check "elevation: the runner refuses a sudo caller other than pneuma-submit" \
+  bash -c 'SUDO_USER=mallory "$1" status >/dev/null 2>&1; test $? = 75' _ "$RUNNER"
 check "identity: an unknown entry argument is refused" \
   bash -c 'SSH_ORIGINAL_COMMAND="status" "$1" --evil yes >/dev/null 2>&1; test $? = 75' _ "$ENTRY"
 check "grammar: the runner's bare name as the first word is accepted and stripped" \
