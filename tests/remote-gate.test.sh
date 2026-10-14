@@ -364,6 +364,15 @@ sleep 2
 check "runner: a submission waits while another decision holds the root lock" kill -0 "$lock_pid"
 flock -u 7; exec 7>&-; wait "$lock_pid" 2>/dev/null || true
 
+# fairness: submitter A at its cap is refused; submitter B is still admitted; neither cancels the other
+fresh
+rec2 a-1 repoA/q1 "$C1" "$SUB_A"; rec2 a-2 repoA/q2 "$C1" "$SUB_A"; rec2 a-3 repoA/q3 "$C1" "$SUB_A"
+rc_capped=0; ddo dedup_admit flood-a "$dstore" repoA main "$C2" "$SUB_A" || rc_capped=$?
+check "fairness: a submitter at its cap is refused (exit 2), not queued" test "$rc_capped" = 2
+rc_b=0; ddo dedup_admit b-1 "$dstore" repoA main "$C2" "$SUB_B" || rc_b=$?
+check "fairness: another submitter is still admitted while A is at its cap" test "$rc_b" = 0
+check "fairness: A's flood cancels none of B's gates, and B's gate is recorded" \
+  bash -c 'test -f "$1/b-1" && ! grep -q "^superseded=." "$1/b-1"' _ "$PNEUMA_GATE_DEDUP_DIR"
 check "runner: submitter = fingerprint of the authenticated key (sshd SSH_USER_AUTH), not a client field" \
   bash -c '[[ "$1" =~ ^[0-9a-f]{64}$ ]] && [ "$1" != "$2" ]' _ "$SUB_A" "$SUB_B"
 check "runner: no authenticated key means no submitter, so nothing is ever cancelled" \
@@ -377,6 +386,9 @@ check "bundle: a bundle carrying the claimed repo and branch at the head binds" 
   ddo bundle_binds "$work/bind.bundle" repoA main "$C2"
 check "bundle: a bundle whose branch is not the claimed one does NOT bind" \
   bash -c '! bash -c "source \"$1\"; bundle_binds \"$2\" repoA other \"$3\"" _ "$RUNNER" "$work/bind.bundle" "$C2"'
+mkdir -p "$work/brokenwt" && echo "gitdir: $work/nonexistent/worktrees/x" > "$work/brokenwt/.git"
+check "bundle: it binds from ANY working directory, even one with a broken worktree .git (the container case)" \
+  bash -c 'cd "$3" && bash -c "source \"$1\"; bundle_binds \"$2\" repoA main \"$4\""' _ "$RUNNER" "$work/bind.bundle" "$work/brokenwt" "$C2"
 check "bundle: a claimed head the bundle does not carry does NOT bind" \
   bash -c '! bash -c "source \"$1\"; bundle_binds \"$2\" repoA main \"$3\"" _ "$RUNNER" "$work/bind.bundle" "$C3"'
 

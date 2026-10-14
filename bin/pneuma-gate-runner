@@ -157,6 +157,7 @@ refuse() { log "REFUSED: $1"; result 75 "$1"; exit 75; }
 # sshd's own auth record (ExposeAuthInfo). It is never a field the client supplies. When it is
 # unknown, the run neither supersedes nor is superseded: the fail-safe is to cancel nothing.
 DEDUP_DIR="${PNEUMA_GATE_DEDUP_DIR:-/var/lib/pneuma-gate-dedup}"
+PER_SUBMITTER_CAP="${PNEUMA_GATE_PER_SUBMITTER_CAP:-3}"   # live gates one submitter may hold at once (queued + running)
 SYSTEMCTL_BIN="${PNEUMA_GATE_SYSTEMCTL:-systemctl}"
 submitter_principal() {   # prints sha256 of the authenticated key's blob, or nothing
   local f="${SSH_USER_AUTH:-}" kind keytype blob
@@ -215,11 +216,25 @@ dedup_supersede() {  # <id> <store> <key> <head> <submitter>
 # The admission decision for a submission: record it and supersede under ONE root lock, so
 # two simultaneous submissions cannot each miss the other (the later one wins). The lock lives
 # in a subshell whose fd dies with it, so no gate code ever runs while it is open.
-dedup_admit() {  # <id> <store> <repo> <branch> <head> <submitter>
+dedup_count_submitter() {  # <submitter>: live gates (queued or running) that submitter holds
+  local f other n=0
+  for f in "$DEDUP_DIR"/*; do
+    [ -f "$f" ] && [ ! -L "$f" ] || continue
+    other="$(basename "$f")"
+    [ "$(dedup_field "$other" submitter)" = "$1" ] || continue
+    if kill -0 "$(dedup_field "$other" pid)" 2>/dev/null || "$SYSTEMCTL_BIN" is-active --quiet "$(dedup_field "$other" unit)" 2>/dev/null; then
+      n=$((n + 1))
+    fi
+  done
+  echo "$n"
+}
+dedup_admit() {  # <id> <store> <repo> <branch> <head> <submitter>: 0 recorded, 2 over the submitter's cap
   (
     mkdir -p "$DEDUP_DIR" && chmod 0700 "$DEDUP_DIR" || exit 1
     exec 8>"$DEDUP_DIR/.lock"
     flock 8 || exit 1
+    # Fairness: one submitter cannot fill the queue or the slots for the others.
+    [ "$(dedup_count_submitter "$6")" -lt "$PER_SUBMITTER_CAP" ] || exit 2
     dedup_register "$1" "$3/$4" "$5" "$6" "pneuma-gate-$1.service" || exit 1
     dedup_supersede "$1" "$2" "$3/$4" "$5" "$6"
   )
@@ -230,7 +245,8 @@ dedup_admit() {  # <id> <store> <repo> <branch> <head> <submitter>
 # naming its branch: the head it ships must be the head it claims.
 bundle_binds() {  # <bundle file> <repo> <branch> <head>
   local heads
-  heads="$(git bundle list-heads "$1" 2>/dev/null)" || return 1
+  # from /, never the caller's directory: a stray .git there (a worktree's, say) must not decide
+  heads="$(cd / && git bundle list-heads "$1" 2>/dev/null)" || return 1
   grep -qx "$4 refs/pneuma-gate/repo/$2" <<< "$heads" && grep -qx "$4 refs/pneuma-gate/branch/$3" <<< "$heads"
 }
 dedup_remove() { [ -L "$DEDUP_DIR/$1" ] || rm -f "$DEDUP_DIR/$1"; }
@@ -371,7 +387,12 @@ cmd_run() {
     [[ "$branch" =~ ^[A-Za-z0-9._/-]{1,200}$ ]] && [[ "$branch" != *..* ]] || refuse "bad branch name"
     local submitter; submitter="$(submitter_principal)"
     log "gate for $repo branch $branch head ${head:0:12} submitter ${submitter:0:12}"
-    dedup_admit "$DEDUP_ID" "$store" "$repo" "$branch" "$head" "$submitter" || refuse "cannot record the gate"
+    dedup_admit "$DEDUP_ID" "$store" "$repo" "$branch" "$head" "$submitter"
+    case $? in
+      0) ;;
+      2) refuse "submitter already holds $PER_SUBMITTER_CAP queued or running gates; wait for them";;
+      *) refuse "cannot record the gate";;
+    esac
   fi
   admit "$cores" "$mem"
 
