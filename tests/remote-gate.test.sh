@@ -92,6 +92,19 @@ SSH
 chmod +x "$work/bin/ssh"
 export PATH="$work/bin:$PATH" PNEUMA_GATE_RUNNER="$RUNNER" PNEUMA_GATE_HOST=fakehost
 export PNEUMA_GATE_DEDUP_DIR="$work/dedup"   # GATE-DEDUP-1 state: never under /var/lib in tests
+# the gate runs as a unit: stand-ins for systemd-run (runs the command inline) and systemctl
+cat > "$work/bin/systemd-run-stub" <<'STUB'
+#!/usr/bin/env bash
+while [ $# -gt 0 ] && [ "$1" != -- ]; do shift; done; shift
+exec "$@"
+STUB
+cat > "$work/bin/systemctl-dedup-stub" <<'STUB'
+#!/usr/bin/env bash
+case "$1" in is-active) exit 1;; stop) echo "stop $2" >> "$WORK_STOPS"; exit 0;; esac
+exit 0
+STUB
+chmod +x "$work/bin/systemd-run-stub" "$work/bin/systemctl-dedup-stub"
+export WORK_STOPS="$work/stops.txt" PNEUMA_GATE_SYSTEMD_RUN="$work/bin/systemd-run-stub" PNEUMA_GATE_SYSTEMCTL="$work/bin/systemctl-dedup-stub"
 
 marker_of() { grep '^PNEUMA_GATE_RESULT ' <<<"$1" | tail -1; }
 field_of() { tr ' ' '\n' <<<"$1" | sed -n "s/^$2=//p" | head -1; }
@@ -291,36 +304,80 @@ check "engine profile: never installs the project editable" not grep -q 'pip.*in
 check "engine profile: per-run gate lock, not the dev box's" grep -q 'PNEUMA_GATE_LOCK_FILE="\$PNEUMA_GATE_RUN_DIR' "$ENGINE_PROFILE"
 check "no credentials in the shipped programs" not grep -qiE '(token|secret|password|ghp_)[a-z_]*=[^ ]' "$RUNNER" "$CLIENT"
 
-# ── GATE-DEDUP-1: a newer head of a branch supersedes its older heads (acceptance) ─
-mkdir -p "$PNEUMA_GATE_DEDUP_DIR"
-dedup_do() {  # <runner function and args>: run one function of the runner, alone
-  bash -c 'source "$1"; shift; "$@"' _ "$RUNNER" "$@"
+# ── GATE-DEDUP-1 at RUNNER level (#20 review): key, ordering, race, submitter, binding ──
+# The runner's own functions, sourced alone. Records are written as the runner writes them.
+dstore="$work/dwork/.git"
+git init -q "$work/dwork"
+dgit() { git -C "$work/dwork" -c user.name=t -c user.email=t@t "$@"; }
+dgit commit -q --allow-empty -m c1; C1=$(dgit rev-parse HEAD)
+dgit commit -q --allow-empty -m c2; C2=$(dgit rev-parse HEAD)
+dgit commit -q --allow-empty -m c3; C3=$(dgit rev-parse HEAD)
+dgit checkout -q -b diverged "$C1"; dgit commit -q --allow-empty -m x; CX=$(dgit rev-parse HEAD)
+dgit checkout -q -
+dgit reset -q --hard "$C3"
+ddo() { bash -c 'source "$1"; shift; "$@"' _ "$RUNNER" "$@"; }   # one runner function, alone
+rec2() {  # <id> <key> <head> <submitter>: a live run record (its pid is this test shell)
+  mkdir -p "$PNEUMA_GATE_DEDUP_DIR"
+  printf 'key=%s\nhead=%s\npid=%s\nsubmitter=%s\nunit=pneuma-gate-%s.service\nsuperseded=\n' \
+    "$2" "$3" "$$" "$4" "$1" > "$PNEUMA_GATE_DEDUP_DIR/$1"
 }
-rec() {  # <id> <key> <head> <pid> [gate pid]: a run record as a live runner leaves it
-  printf 'key=%s\nhead=%s\npid=%s\nsuperseded=\ngate_pid=%s\n' "$2" "$3" "$4" "${5:-}" > "$PNEUMA_GATE_DEDUP_DIR/$1"
-}
-rec old-feat repo/feat aaaa "$$"
-rec old-other repo/other aaaa "$$"
-rec same-head repo/feat bbbb "$$"
-rec stale-feat repo/feat cccc 999999
-dedup_do dedup_supersede new-feat repo/feat bbbb
-check "dedup: an older head of the SAME branch is superseded by the newer head" \
-  grep -qx "superseded=bbbb" "$PNEUMA_GATE_DEDUP_DIR/old-feat"
-check "dedup: a run of ANOTHER branch in the same repo is untouched (key is repo+branch)" \
-  grep -qx "superseded=" "$PNEUMA_GATE_DEDUP_DIR/old-other"
-check "dedup: a run already on the newer head is not superseded" grep -qx "superseded=" "$PNEUMA_GATE_DEDUP_DIR/same-head"
-check "dedup: a record of a dead runner is dropped, not superseded" test ! -e "$PNEUMA_GATE_DEDUP_DIR/stale-feat"
-python3 -c 'import os, time; os.setsid(); time.sleep(300)' & dedup_gate=$!   # its own session; the pid is the session leader
-rec gate-feat repo/feat dddd "$$" "$dedup_gate"
-dedup_do dedup_supersede newer-feat repo/feat eeee
-sleep 1
-check "dedup: a superseded RUNNING gate has its session killed" bash -c '! kill -0 "$1" 2>/dev/null || [ "$(ps -o stat= -p "$1" | cut -c1)" = Z ]' _ "$dedup_gate"
-check "dedup: the superseded gate's verdict is marked, so it cannot gate" grep -qx "superseded=eeee" "$PNEUMA_GATE_DEDUP_DIR/gate-feat"
-kill "$dedup_gate" 2>/dev/null || true; wait "$dedup_gate" 2>/dev/null || true
-# the client sends the branch, validated, to the runner
-args_runner="$work/bin/args-runner"
-printf '#!/usr/bin/env bash\n[ "$1" = have ] && exit 0\necho "$*" > "%s"\nexit 75\n' "$work/runner-args.txt" > "$args_runner"; chmod +x "$args_runner"
-PNEUMA_GATE_RUNNER="$args_runner" "$CLIENT" --repo-dir "$src" --profile fake --head "$head" --base "$base" --log-dir "$work/logs" >/dev/null 2>&1 || true
-check "dedup: the client sends the branch name to the runner" grep -q -- "--branch main" "$work/runner-args.txt"
+fresh() { rm -rf "$PNEUMA_GATE_DEDUP_DIR"; mkdir -p "$PNEUMA_GATE_DEDUP_DIR"; }
+SUB_A=$(printf 'publickey ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabl9K\n' > "$work/auth-a"; PNEUMA_TEST=1 SSH_USER_AUTH="$work/auth-a" ddo submitter_principal)
+SUB_B=$(printf 'publickey ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n' > "$work/auth-b"; SSH_USER_AUTH="$work/auth-b" ddo submitter_principal)
+
+fresh; rec2 other-repo repoB/main "$C1" "$SUB_A"
+ddo dedup_admit n1 "$dstore" repoA main "$C2" "$SUB_A"
+check "runner: the same branch name in ANOTHER repo is never cancelled (key is repo + branch)" \
+  grep -qx "superseded=" "$PNEUMA_GATE_DEDUP_DIR/other-repo"
+
+fresh; rec2 newer repoA/main "$C3" "$SUB_A"
+ddo dedup_admit n2 "$dstore" repoA main "$C2" "$SUB_A"
+check "runner: an OLDER commit (after a newer one) never cancels the newer gate" \
+  grep -qx "superseded=" "$PNEUMA_GATE_DEDUP_DIR/newer"
+
+fresh; rec2 older repoA/main "$C1" "$SUB_A"
+ddo dedup_admit n3 "$dstore" repoA main "$C2" "$SUB_A"
+check "runner: a DESCENDANT supersedes the older gate of the same branch and submitter" \
+  grep -qx "superseded=$C2" "$PNEUMA_GATE_DEDUP_DIR/older"
+
+fresh; rec2 diverged repoA/main "$CX" "$SUB_A"
+div_out="$(ddo dedup_admit n4 "$dstore" repoA main "$C3" "$SUB_A" 2>&1)"
+check "runner: diverged heads (a force-push): the newest wins, and it is logged" \
+  bash -c 'grep -qx "superseded=$1" "$2/diverged" && grep -q DIVERGE <<<"$3"' _ "$C3" "$PNEUMA_GATE_DEDUP_DIR" "$div_out"
+
+fresh; rec2 theirs repoA/main "$C1" "$SUB_B"
+ddo dedup_admit n5 "$dstore" repoA main "$C2" "$SUB_A"
+check "runner: a DIFFERENT submitter's same-branch gate is never cancelled" \
+  grep -qx "superseded=" "$PNEUMA_GATE_DEDUP_DIR/theirs"
+
+# the race: two simultaneous submissions (C2 and C3) cannot cancel each other; C3 is never cancelled by C2
+fresh
+ddo dedup_admit race-c2 "$dstore" repoA main "$C2" "$SUB_A" & ddo dedup_admit race-c3 "$dstore" repoA main "$C3" "$SUB_A" &
+wait
+check "runner: a race between two submissions never cancels the newer head" \
+  bash -c 'test -z "$(sed -n "s/^superseded=//p" "$1/race-c3")"' _ "$PNEUMA_GATE_DEDUP_DIR"
+# the decision is serialized: while another decision holds the lock, this one waits
+fresh
+exec 7>"$PNEUMA_GATE_DEDUP_DIR/.lock"; flock 7
+ddo dedup_admit lock-test "$dstore" repoA main "$C2" "$SUB_A" & lock_pid=$!
+sleep 2
+check "runner: a submission waits while another decision holds the root lock" kill -0 "$lock_pid"
+flock -u 7; exec 7>&-; wait "$lock_pid" 2>/dev/null || true
+
+check "runner: submitter = fingerprint of the authenticated key (sshd SSH_USER_AUTH), not a client field" \
+  bash -c '[[ "$1" =~ ^[0-9a-f]{64}$ ]] && [ "$1" != "$2" ]' _ "$SUB_A" "$SUB_B"
+check "runner: no authenticated key means no submitter, so nothing is ever cancelled" \
+  bash -c '[ -z "$(SSH_USER_AUTH=/nonexistent ddo submitter_principal)" ]'
+
+# the bundle binds the claim: it must carry the repo and branch at the head being gated
+dgit update-ref refs/pneuma-gate/repo/repoA "$C2"
+dgit update-ref refs/pneuma-gate/branch/main "$C2"
+dgit bundle create "$work/bind.bundle" refs/pneuma-gate/repo/repoA refs/pneuma-gate/branch/main >/dev/null 2>&1
+check "bundle: a bundle carrying the claimed repo and branch at the head binds" \
+  ddo bundle_binds "$work/bind.bundle" repoA main "$C2"
+check "bundle: a bundle whose branch is not the claimed one does NOT bind" \
+  bash -c '! bash -c "source \"$1\"; bundle_binds \"$2\" repoA other \"$3\"" _ "$RUNNER" "$work/bind.bundle" "$C2"'
+check "bundle: a claimed head the bundle does not carry does NOT bind" \
+  bash -c '! bash -c "source \"$1\"; bundle_binds \"$2\" repoA main \"$3\"" _ "$RUNNER" "$work/bind.bundle" "$C3"'
 
 exit "$fail"

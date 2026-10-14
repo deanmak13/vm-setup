@@ -146,16 +146,30 @@ cleanup() {
 }
 refuse() { log "REFUSED: $1"; result 75 "$1"; exit 75; }
 
-# GATE-DEDUP-1. A gate for a repo and branch makes every older gate of that branch
-# (another head) unusable: its verdict can no longer gate anything. Each run records
-# its key (repo/branch), its head, its runner pid and its gate's session in a root-only
-# directory. A newer head marks the older live runs "superseded by <sha>"; a queued
-# run refuses at its next poll, a running one has its session killed. Keys are never
-# SHA prefixes: the key is the repo and the branch name.
+# GATE-DEDUP-1. A gate for a repo and branch makes every older gate of that branch unusable.
+# Each run is recorded under a root-only directory with its key (repo/branch, never a SHA
+# prefix), its head, its SUBMITTER, its runner pid and its unit. A newer head supersedes the
+# older live runs of the SAME submitter and the SAME key:
+#   - a queued run refuses at its next admission poll;
+#   - a running run is cancelled by its UNIT NAME (systemctl stop). No stored pid is ever
+#     signalled: a pid can be reused by an unrelated process.
+# The submitter is the SSH key the client authenticated with, read by this ROOT runner from
+# sshd's own auth record (ExposeAuthInfo). It is never a field the client supplies. When it is
+# unknown, the run neither supersedes nor is superseded: the fail-safe is to cancel nothing.
 DEDUP_DIR="${PNEUMA_GATE_DEDUP_DIR:-/var/lib/pneuma-gate-dedup}"
-dedup_register() {  # <id> <key> <head>
+SYSTEMCTL_BIN="${PNEUMA_GATE_SYSTEMCTL:-systemctl}"
+submitter_principal() {   # prints sha256 of the authenticated key's blob, or nothing
+  local f="${SSH_USER_AUTH:-}" kind keytype blob
+  [ -n "$f" ] && [ -r "$f" ] && [ ! -L "$f" ] || return 0
+  while read -r kind keytype blob _; do
+    [ "$kind" = publickey ] && [ -n "$blob" ] || continue
+    printf '%s' "$blob" | base64 -d 2>/dev/null | sha256sum | cut -c1-64
+    return 0
+  done < "$f"
+}
+dedup_register() {  # <id> <key> <head> <submitter> <unit>
   mkdir -p "$DEDUP_DIR" && chmod 0700 "$DEDUP_DIR" || return 1
-  printf 'key=%s\nhead=%s\npid=%s\nsuperseded=\ngate_pid=\n' "$2" "$3" "$$" > "$DEDUP_DIR/$1"
+  printf 'key=%s\nhead=%s\npid=%s\nsubmitter=%s\nunit=%s\nsuperseded=\n' "$2" "$3" "$$" "$4" "$5" > "$DEDUP_DIR/$1"
 }
 dedup_field() {  # <id> <field>
   local f="$DEDUP_DIR/$1"
@@ -163,20 +177,61 @@ dedup_field() {  # <id> <field>
   sed -n "s/^$2=//p" "$f" | head -1
 }
 dedup_set() { [ -f "$DEDUP_DIR/$1" ] && [ ! -L "$DEDUP_DIR/$1" ] && sed -i "s/^$2=.*/$2=$3/" "$DEDUP_DIR/$1"; }
-dedup_supersede() {  # <id> <key> <head>: every other live run of this key on another head is superseded
-  local f other gp
+dedup_supersede() {  # <id> <store> <key> <head> <submitter>
+  # Supersede the live runs of THIS key that the SAME submitter sent, when this head is a
+  # DESCENDANT of theirs (or the two diverge: a force-push, the newest wins, and it is logged).
+  # An older commit never cancels a newer one. Unknown ancestry, or an unknown submitter, cancels nothing.
+  local store="$2" f other old unit
+  [ -n "$5" ] || return 0
   for f in "$DEDUP_DIR"/*; do
     [ -f "$f" ] && [ ! -L "$f" ] || continue
     other="$(basename "$f")"
     [ "$other" = "$1" ] && continue
-    [ "$(dedup_field "$other" key)" = "$2" ] || continue
-    [ "$(dedup_field "$other" head)" = "$3" ] && continue
-    if ! kill -0 "$(dedup_field "$other" pid)" 2>/dev/null; then rm -f "$f"; continue; fi
-    dedup_set "$other" superseded "$3"
-    gp="$(dedup_field "$other" gate_pid)"
-    if [ -n "$gp" ] && kill -0 "$gp" 2>/dev/null; then kill -TERM -- "-$gp" 2>/dev/null || true; fi
-    log "superseded run $other (head $(dedup_field "$other" head | cut -c1-12)) by $3"
+    [ "$(dedup_field "$other" key)" = "$3" ] || continue           # the repo AND the branch
+    [ "$(dedup_field "$other" submitter)" = "$5" ] || continue     # never another submitter's gate
+    old="$(dedup_field "$other" head)"
+    [ "$old" = "$4" ] && continue
+    if ! kill -0 "$(dedup_field "$other" pid)" 2>/dev/null && ! "$SYSTEMCTL_BIN" is-active --quiet "$(dedup_field "$other" unit)" 2>/dev/null; then
+      rm -f "$f"; continue                     # neither its runner nor its unit exists any more
+    fi
+    if git --git-dir="$store" merge-base --is-ancestor "$4" "$old" 2>/dev/null; then
+      log "not superseding run $other: head ${4:0:12} is older than its head ${old:0:12}"
+      continue                                  # an older commit never cancels a newer gate
+    fi
+    if git --git-dir="$store" merge-base --is-ancestor "$old" "$4" 2>/dev/null; then
+      log "superseded run $other (head ${old:0:12}) by descendant ${4:0:12}"
+    elif git --git-dir="$store" cat-file -e "$old^{commit}" 2>/dev/null; then
+      log "superseded run $other (head ${old:0:12}) by ${4:0:12}: the heads DIVERGE (force-push); the newest submission wins"
+    else
+      log "not superseding run $other: its head ${old:0:12} is unknown to the store"
+      continue                                  # unknown ancestry: fail safe, cancel nothing
+    fi
+    dedup_set "$other" superseded "$4"
+    unit="$(dedup_field "$other" unit)"
+    if [ -n "$unit" ]; then "$SYSTEMCTL_BIN" stop "$unit" >/dev/null 2>&1 || true; fi
   done
+}
+
+# The admission decision for a submission: record it and supersede under ONE root lock, so
+# two simultaneous submissions cannot each miss the other (the later one wins). The lock lives
+# in a subshell whose fd dies with it, so no gate code ever runs while it is open.
+dedup_admit() {  # <id> <store> <repo> <branch> <head> <submitter>
+  (
+    mkdir -p "$DEDUP_DIR" && chmod 0700 "$DEDUP_DIR" || exit 1
+    exec 8>"$DEDUP_DIR/.lock"
+    flock 8 || exit 1
+    dedup_register "$1" "$3/$4" "$5" "$6" "pneuma-gate-$1.service" || exit 1
+    dedup_supersede "$1" "$2" "$3/$4" "$5" "$6"
+  )
+}
+
+# The bundle must carry the claimed repo and branch, at the head being gated. The runner
+# decides supersession by these names, so a client cannot cancel another lane's gate by
+# naming its branch: the head it ships must be the head it claims.
+bundle_binds() {  # <bundle file> <repo> <branch> <head>
+  local heads
+  heads="$(git bundle list-heads "$1" 2>/dev/null)" || return 1
+  grep -qx "$4 refs/pneuma-gate/repo/$2" <<< "$heads" && grep -qx "$4 refs/pneuma-gate/branch/$3" <<< "$heads"
 }
 dedup_remove() { [ -L "$DEDUP_DIR/$1" ] || rm -f "$DEDUP_DIR/$1"; }
 
@@ -295,6 +350,9 @@ cmd_run() {
   if [ "$bundle" = 1 ]; then
     local bf="$BASE_DIR/queue/in-$$.bundle"
     cat > "$bf"
+    if [ -n "$branch" ]; then
+      bundle_binds "$bf" "$repo" "$branch" "$head" || refuse "bundle does not carry $repo branch $branch at $head"
+    fi
     if [ -n "$RUN_AS" ]; then chown "$RUN_AS" "$bf"; fi
     log "received bundle ($(du -h "$bf" | cut -f1))"
     as_gate git --git-dir="$store" fetch -q "$bf" "refs/pneuma-gate/*:refs/gate-keep/*" 2>&1 | sed 's/^/  fetch: /'
@@ -308,14 +366,12 @@ cmd_run() {
   done
   [ "$(as_gate git --git-dir="$store" rev-parse "${head}^{tree}")" = "$tree" ] || refuse "tree mismatch for $head"
 
-  DEDUP_ID="$(date +%s%N)-$$"
+  DEDUP_ID="$(date +%s%N)-$$"          # also the gate's unit name: pneuma-gate-<id>
   if [ -n "$branch" ]; then
     [[ "$branch" =~ ^[A-Za-z0-9._/-]{1,200}$ ]] && [[ "$branch" != *..* ]] || refuse "bad branch name"
-    log "gate for $repo branch $branch head ${head:0:12}"
-    dedup_register "$DEDUP_ID" "$repo/$branch" "$head" || refuse "cannot register the gate"
-    dedup_supersede "$DEDUP_ID" "$repo/$branch" "$head"
-  else
-    DEDUP_ID=""
+    local submitter; submitter="$(submitter_principal)"
+    log "gate for $repo branch $branch head ${head:0:12} submitter ${submitter:0:12}"
+    dedup_admit "$DEDUP_ID" "$store" "$repo" "$branch" "$head" "$submitter" || refuse "cannot record the gate"
   fi
   admit "$cores" "$mem"
 
@@ -343,18 +399,21 @@ cmd_run() {
   ensure_env "$profile" "$work"
 
   # ── the gate itself, in a scrubbed environment (no ambient credentials) ────
-  local rc gate_pid
+  local rc scope_bin="${PNEUMA_GATE_SYSTEMD_RUN:-systemd-run}"
   if [ -n "$DEDUP_ID" ] && [ -n "$(dedup_field "$DEDUP_ID" superseded)" ]; then
     result 75 "superseded by $(dedup_field "$DEDUP_ID" superseded)"; return 75
   fi
-  # The gate runs in its own session, so a newer head can kill it as a group (GATE-DEDUP-1).
-  setsid ${RUN_AS:+runuser -u "$RUN_AS" --} env -i PATH=/usr/local/bin:/usr/bin:/bin HOME="$RUN_DIR/home" TMPDIR="$RUN_DIR/tmp" LANG=C.UTF-8 \
+  # The gate runs as a transient UNIT named by this runner. A newer head cancels it by that
+  # name (systemctl stop); no pid is stored or signalled (GATE-DEDUP-1, pid reuse).
+  command -v "$scope_bin" >/dev/null 2>&1 || refuse "no $scope_bin: the gate's unit is required"
+  "$scope_bin" --unit="pneuma-gate-$DEDUP_ID" --wait --collect --quiet -- \
+    ${RUN_AS:+runuser -u "$RUN_AS" --} env -i PATH=/usr/local/bin:/usr/bin:/bin HOME="$RUN_DIR/home" TMPDIR="$RUN_DIR/tmp" LANG=C.UTF-8 \
     PNEUMA_GATE_REMOTE_RUN=1 PNEUMA_GATE_RUN_DIR="$RUN_DIR" PNEUMA_GATE_CORES="$cores" "${fwd_env[@]}" \
     bash -c 'source "$1"; cd "$2"; shift 2; profile_gate "$@"' _ \
-    "$PROFILE_DIR/$profile.sh" "$work" "$ENV_DIR" "$head" "$base" "$GATE_TIMEOUT_S" 2>&1 &
-  gate_pid=$!
-  [ -n "$DEDUP_ID" ] && dedup_set "$DEDUP_ID" gate_pid "$gate_pid"
-  wait "$gate_pid"; rc=$?
+    "$PROFILE_DIR/$profile.sh" "$work" "$ENV_DIR" "$head" "$base" "$GATE_TIMEOUT_S" 2>&1
+  rc=$?
+  # the unit's output went to the journal under its unit name: keep it in this verdict's log
+  "${JOURNALCTL_BIN:-journalctl}" -u "pneuma-gate-$DEDUP_ID.service" --no-pager -o cat 2>/dev/null | sed 's/^/  gate: /' || true
   if [ -n "$DEDUP_ID" ] && [ -n "$(dedup_field "$DEDUP_ID" superseded)" ]; then
     log "gate superseded by $(dedup_field "$DEDUP_ID" superseded): verdict discarded"
     result 75 "superseded by $(dedup_field "$DEDUP_ID" superseded)"; return 75
