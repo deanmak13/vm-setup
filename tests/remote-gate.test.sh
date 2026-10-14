@@ -150,6 +150,15 @@ victim_log="$work/victim-file"; : > "$victim_log"
 rm -f "$src/.git/pneuma-remote-gate/refusals.log"; ln -s "$victim_log" "$src/.git/pneuma-remote-gate/refusals.log"
 "$CLIENT" --repo-dir "$src" --head "$head" --base "$base" --scope-only >/dev/null 2>&1 || true
 check "refusals log: a symlink is never followed (the victim file stays empty)" test ! -s "$victim_log"
+# ASCII-printable only: a refusal that carries a high byte and an ESC sequence logs neither (both become '?').
+rm -f "$src/.git/pneuma-remote-gate/refusals.log"
+git -C "$src" config remote.origin.url "$(printf 'https://github.com/evil/caf\303\251\033[31m.git')"
+"$CLIENT" --repo-dir "$src" --head "$head" --base "$base" --scope-only >/dev/null 2>&1 || true
+check "refusals log: a refusal is written, with no byte >= 0x80 and no ESC" bash -c '
+  f="$1/.git/pneuma-remote-gate/refusals.log"
+  grep -q "REFUSED" "$f" && ! LC_ALL=C grep -q "[^[:print:][:space:]]" "$f"' _ "$src"
+git -C "$src" config remote.origin.url https://github.com/deanmak13/fakerepo.git
+rm -f "$src/.git/pneuma-remote-gate/refusals.log"
 rm -f "$src/.git/pneuma-remote-gate/refusals.log"
 git -C "$src" config remote.origin.url https://github.com/deanmak13/fakerepo.git
 wt_dir="$work/wt-named-anything"
