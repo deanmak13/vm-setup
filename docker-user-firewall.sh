@@ -83,30 +83,12 @@ role() {
 # validate_allowlist ROLE: strict parse; any doubt is an error.
 validate_allowlist() {
     [[ -r "$ALLOWLIST" && -s "$ALLOWLIST" ]] || { warn "allowlist missing or empty: $ALLOWLIST"; return 1; }
-    awk -v role="$1" -v trust="$TRUST_SET" -v pass="$PASS_SET" '
-        BEGIN { n = split(trust, a, " "); for (i = 1; i <= n; i++) T[a[i]] = 1
-                n = split(pass, a, " ");  for (i = 1; i <= n; i++) P[a[i]] = 1 }
-        { sub(/#.*/, "") }
-        NF == 0 { next }
-        NR == FNR { if ($2 == "role" && $1 == "all" && NF == 3 && $3 ~ /^[a-z][a-z0-9-]*$/) R[$3] = 1; next }
-        function bad(m) { print "invalid allowlist line " FNR ": " m > "/dev/stderr"; err = 1 }
-        {
-            if ($2 == "role") { if (NF != 3 || $1 != "all" || $3 !~ /^[a-z][a-z0-9-]*$/) bad($0); next }
-            if ($1 != "all" && !($1 in R)) { bad("undeclared role: " $0); next }
-            if ($2 == "trust-iface") { if (NF != 3 || !($3 in T)) bad("trust-iface not in the explicit set: " $0); next }
-            if ($2 == "passthrough-iface") { if (NF != 3 || !($3 in P)) bad("passthrough-iface not allowed: " $0); next }
-            if ($2 == "allow") { if (NF != 4 || ($3 != "tcp" && $3 != "udp") || $4 !~ /^[0-9]+$/ || $4 < 1 || $4 > 65535) bad($0); next }
-            bad("unknown kind: " $0)
-        }
-        END { if (!(role in R)) { print "role not declared in allowlist: " role > "/dev/stderr"; err = 1 }
-              exit err }' "$ALLOWLIST" "$ALLOWLIST"
+    awk -v role="$1" -v trust="$TRUST_SET" -v pass="$PASS_SET" -f "$HERE/docker-user-firewall.validate.awk" "$ALLOWLIST" "$ALLOWLIST"
 }
 
 # entries ROLE KIND -> remaining fields, one entry per line
 entries() {
-    awk -v role="$1" -v kind="$2" '
-        { sub(/#.*/, "") } NF >= 3 && ($1 == "all" || $1 == role) && $2 == kind { $1 = $2 = ""; sub(/^ +/, ""); print }
-    ' "$ALLOWLIST"
+    awk -v role="$1" -v kind="$2" -f "$HERE/docker-user-firewall.entries.awk" "$ALLOWLIST"
 }
 
 # Docker networks with a custom bridge name (com.docker.network.bridge.name) are trusted as
@@ -159,7 +141,7 @@ check_load() {   # name restore rules : iptables-restore --test
     local name="$1" restore="$2" rules="$3"
     if printf '%s\n' "$rules" | "$restore" -w --test --noflush 2>/dev/null; then
         echo "# $name: rules load OK (restore --test)"
-    elif [[ $EUID -ne 0 ]]; then
+    elif [[ "${DOCKER_FW_TEST_EUID:-$EUID}" -ne 0 ]]; then
         echo "# $name: loadability NOT verified (needs root); rerun with sudo"
     else
         warn "$name: rules would NOT load"; return 1
@@ -286,6 +268,7 @@ install_all() {
     install -d -m 0755 "$INSTALL_DIR" "$(dirname "$ROLE_FILE")" /etc/systemd/system/docker.service.d
     install -m 0755 "$SELF" "$INSTALL_DIR/docker-user-firewall.sh"
     install -m 0644 "$ALLOWLIST" "$INSTALL_DIR/docker-user-firewall.allowlist"
+    install -m 0644 "$HERE/docker-user-firewall.validate.awk" "$HERE/docker-user-firewall.entries.awk" "$INSTALL_DIR/"
     install -m 0644 "$src/docker-user-firewall.service" "$src/docker-user-firewall-reconcile.service" \
         "$src/docker-user-firewall-reconcile.timer" /etc/systemd/system/
     install -m 0644 "$src/docker.service.d/10-pneuma-docker-fw.conf" /etc/systemd/system/docker.service.d/

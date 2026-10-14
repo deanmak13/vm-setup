@@ -9,6 +9,9 @@
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
+# Everything below runs only inside a user namespace (kcov's container cannot create one), so it is
+# marked non-code for the coverage report like the host-only sections of ci-builder-bootstrap.sh.
+# [host-only-begin]
 if [[ "${1:-}" != "--inside" ]]; then
     command -v unshare >/dev/null && command -v iptables >/dev/null && command -v nc >/dev/null || { echo "SKIP: unshare/iptables/nc missing"; exit 0; }
     unshare -Urnm true 2>/dev/null || { echo "SKIP: unprivileged namespaces unavailable"; exit 0; }
@@ -76,3 +79,4 @@ reach $EXT 172.30.0.2 3000 && bad "baseline left container IP open" || ok "basel
 ! iptables -S DOCKER-USER | grep -q PNEUMA && ok "remove left no jump behind" || bad "jump left behind"
 
 echo; [[ $fails -eq 0 ]] && echo "ALL PASSED" || { echo "$fails FAILED"; exit 1; }
+# [host-only-end]

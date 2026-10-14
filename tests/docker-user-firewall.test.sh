@@ -193,7 +193,8 @@ reset; dry="$("$SCRIPT" --role dev-box --dry-run)"
 has "$dry" "iptables-restore --noflush" && has "$dry" "rules load OK" && has "$dry" "--ctorigdstport 3000" && ok "dry-run shows rules and validates loadability" || bad "dry-run output"
 grep -q -- '--test' "$W/log" && ok "dry-run ran restore --test" || bad "dry-run did not run restore --test"
 [[ "$("$SCRIPT" --role dev-box)" == "$dry" ]] && ok "dry-run is the default" || bad "default mode"
-o="$(FAKE_TEST_FAIL=1 "$SCRIPT" --role dev-box --dry-run 2>&1)"; has "$o" 'NOT verified' && ok "dry-run says so when it cannot verify" || bad "dry-run overclaims"
+o="$(DOCKER_FW_TEST_EUID=1000 FAKE_TEST_FAIL=1 "$SCRIPT" --role dev-box --dry-run 2>&1)"; has "$o" 'NOT verified' && ok "dry-run says so when it cannot verify" || bad "dry-run overclaims"
+DOCKER_FW_TEST_EUID=0 FAKE_TEST_FAIL=1 "$SCRIPT" --role dev-box --dry-run >/dev/null 2>&1 && bad "root dry-run ignored an unloadable ruleset" || ok "root dry-run fails when the rules would not load"
 "$SCRIPT" --role bogus --dry-run >/dev/null 2>&1 && bad "dry-run of unknown role succeeded" || ok "dry-run of unknown role fails"
 
 # ---- --remove reports accurately
