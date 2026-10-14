@@ -47,6 +47,11 @@ PATH="$stub:$PATH" env -u DOCKER_FW_ROLE "$ROOT/docker-user-firewall.sh" --rende
 bash "$ROOT/docker-user-firewall.sh" --role dev-box --apply --rollback-timer 300 >/dev/null 2>&1 \
     && bad "non-root apply succeeded" || ok "non-root apply refused"
 rm -rf "$stub"
+# dry-run prints the exact commands plus the rules, and changes nothing
+dry="$("$ROOT/docker-user-firewall.sh" --role dev-box --dry-run)"
+has "$dry" "iptables-restore --noflush" && has "$dry" "iptables -I DOCKER-USER 1 -j PNEUMA-DOCKER-FW" \
+    && has "$dry" "--ctorigdstport 3000" && ok "dry-run shows commands and rules" || bad "dry-run output"
+[[ "$("$ROOT/docker-user-firewall.sh" --role dev-box)" == "$dry" ]] && ok "dry-run is the default mode" || bad "default mode"
 # idempotent render
 [[ "$(render dev-box)" == "$(render dev-box)" ]] && ok "render deterministic" || bad "render nondeterministic"
 
