@@ -1,0 +1,16 @@
+[Unit]
+Description=Block public inbound to Docker-published ports (DOCKER-USER policy)
+Documentation=https://github.com/deanmak13/vm-setup
+After=docker.service network-online.target
+Wants=network-online.target
+# PartOf: a docker restart (which rewrites its chains) restarts this unit, re-applying the policy.
+PartOf=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/lib/pneuma-docker-fw/docker-user-firewall.sh --apply
+ExecStop=/bin/true
+
+[Install]
+WantedBy=multi-user.target docker.service

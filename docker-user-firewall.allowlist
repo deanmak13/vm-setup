@@ -1,0 +1,42 @@
+# docker-user-firewall.allowlist -- the ONE source of truth for the DOCKER-USER policy.
+#
+# Format (whitespace separated):  <role>  <kind>  <value> [proto-for-allow]
+#   role  : host role (dev-box | ci-builder | <third host, once named>) or "all"
+#   kind  : trust-iface   interface (iptables '+' wildcard ok) whose traffic is never filtered
+#           trust-cidr    private source range, trusted unless it arrives on the external iface
+#           docker-egress bridge interface patterns that carry published-container traffic;
+#                         external->these is DROPPED unless allowlisted. k3s/CNI traffic
+#                         (cni0, flannel.1) is deliberately NOT here, so it is never touched.
+#           detect        <role> container <name>: this host has role <role> if that container
+#                         exists (role = all only); lets a bare `--apply` find its role
+#           allow         <tcp|udp> <host-port>: public inbound to a published HOST port
+#                         (matched on the conntrack ORIGINAL destination port)
+# Policy: everything published by Docker is non-public unless listed as `allow` below.
+# NEVER add RabbitMQ (15692, 32770, 32771) here; tests/docker-user-firewall-test.sh enforces it.
+
+all         trust-iface    lo
+all         trust-iface    docker0
+all         trust-iface    br-+
+all         trust-iface    cni0
+all         trust-iface    flannel.1
+all         trust-cidr     10.42.0.0/16
+all         trust-cidr     10.43.0.0/16
+all         trust-cidr     172.16.0.0/12
+all         docker-egress  docker0
+all         docker-egress  br-+
+
+all         detect         dev-box container kodus-web-prod
+all         detect         ci-builder container kodus-fwd-3000
+
+# ci-builder: WireGuard peer network (wg0 10.13.13.1/32, peer 10.13.13.2)
+ci-builder  trust-iface    wg0
+ci-builder  trust-cidr     10.13.13.0/24
+
+# Kodus stays public (Dean, 2026-10-14)
+dev-box     allow          tcp 3000     # kodus-web-prod
+ci-builder  allow          tcp 3000     # kodus-fwd-3000
+ci-builder  allow          tcp 3001     # kodus-fwd-3001
+ci-builder  allow          tcp 3101     # kodus-fwd-3101
+ci-builder  allow          tcp 3332     # kodus-fwd-3332
+
+# Third host: placeholder -- add its detect + allow lines here once Dean names it.
