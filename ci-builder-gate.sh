@@ -41,10 +41,9 @@ if [ "$do_host" = 1 ]; then
   # Every file for the host goes through ONE root-owned 0700 staging dir made by mktemp on the host
   # (never a predictable name). The path is validated before use and removed on exit.
   STAGE="$(ssh -o BatchMode=yes "$HOST" 'set -euo pipefail; install -d -o root -g root -m 0700 /var/lib/pneuma-gate-install && mktemp -d /var/lib/pneuma-gate-install/stage.XXXXXX')"
-  case "$STAGE" in
-    /var/lib/pneuma-gate-install/stage.??????) ;;
-    *) echo "refusing: unexpected staging path from $HOST: '$STAGE'" >&2; exit 1;;
-  esac
+  # exactly one mktemp name under the root dir: six alphanumerics, no slash, no dots
+  [[ "$STAGE" =~ ^/var/lib/pneuma-gate-install/stage\.[A-Za-z0-9]{6}$ ]] \
+    || { echo "refusing: unexpected staging path from $HOST: '$STAGE'" >&2; exit 1; }
   trap 'ssh -o BatchMode=yes "$HOST" "rm -rf -- $STAGE" >/dev/null 2>&1 || true' EXIT
 
   # Stage everything. Ownership on the staged copies does not matter: the root-side steps set it.
@@ -62,7 +61,7 @@ if [ "$do_host" = 1 ]; then
   ssh "$HOST" "bash -s -- '$STAGE'" <<'REMOTE'
 set -euo pipefail
 STAGE="$1"
-case "$STAGE" in /var/lib/pneuma-gate-install/stage.??????) ;; *) echo "refusing: bad stage $STAGE" >&2; exit 1;; esac
+[[ "$STAGE" =~ ^/var/lib/pneuma-gate-install/stage\.[A-Za-z0-9]{6}$ ]] || { echo "refusing: bad stage $STAGE" >&2; exit 1; }
 id pneuma-gate >/dev/null 2>&1 || useradd --system --home-dir /var/lib/pneuma-gate --shell /usr/sbin/nologin pneuma-gate
 install -d -o pneuma-gate -g pneuma-gate -m 0755 /var/lib/pneuma-gate
 # They run as root (the runner sources the profiles as root): root owns everything, dirs 0755, files 0644,
@@ -71,7 +70,23 @@ chown -R root:root "$STAGE/profiles"
 find "$STAGE/profiles" -type d -exec chmod 0755 {} +
 find "$STAGE/profiles" -type f -exec chmod 0644 {} +
 install -d -o root -g root -m 0755 /usr/local/lib/pneuma-gate
-rsync -a --delete "$STAGE/profiles/" /usr/local/lib/pneuma-gate/profiles/
+# Atomic profiles sync: the full new tree is built beside the live one (never into it), then swapped in by two
+# renames. If the second rename fails, the old tree is put back and the run fails loudly.
+new_profiles="$(mktemp -d /usr/local/lib/pneuma-gate/.profiles-new.XXXXXX)"
+rsync -a "$STAGE/profiles/" "$new_profiles/"
+old_profiles="$(mktemp -u /usr/local/lib/pneuma-gate/.profiles-old.XXXXXX)"
+had_live=0
+if [ -e /usr/local/lib/pneuma-gate/profiles ]; then
+  mv -T -- /usr/local/lib/pneuma-gate/profiles "$old_profiles"
+  had_live=1
+fi
+if ! mv -T -- "$new_profiles" /usr/local/lib/pneuma-gate/profiles; then
+  [ "$had_live" = 1 ] && mv -T -- "$old_profiles" /usr/local/lib/pneuma-gate/profiles
+  rm -rf -- "$new_profiles"
+  echo "refused: profiles swap failed; the previous profiles were put back" >&2
+  exit 1
+fi
+[ "$had_live" = 1 ] && rm -rf -- "$old_profiles"
 # The runner: atomic replace, mktemp beside the target.
 runner_tmp="$(mktemp /usr/local/bin/.pneuma-gate-runner.XXXXXX)"
 install -o root -g root -m 0755 "$STAGE/pneuma-gate-runner" "$runner_tmp"

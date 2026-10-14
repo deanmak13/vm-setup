@@ -60,6 +60,19 @@ if [ "$rc" != 0 ] && ! grep -q 'bash -s' "$LOG" && grep -q "rm -rf -- $stage" "$
   pass "a failed submit-path install stops the run and still removes the staging dir"
 else bad "failure path (rc $rc): $(cat "$LOG")"; fi
 
+# 3b. the staging path glob is strict: a slash or a dot inside the six-character name is refused before any upload
+run SHIM_STAGE=/var/lib/pneuma-gate-install/stage.ab/cde; rc=$?
+if [ "$rc" != 0 ] && ! grep -q '^rsync' "$LOG"; then pass "a staging path with a slash inside the name is refused before any upload"
+else bad "slash in stage name accepted (rc $rc)"; fi
+run SHIM_STAGE=/var/lib/pneuma-gate-install/stage.ab.cd; rc=$?
+if [ "$rc" != 0 ] && ! grep -q '^rsync' "$LOG"; then pass "a staging path with a dot inside the name is refused before any upload"
+else bad "dot in stage name accepted (rc $rc)"; fi
+
+# 3c. the profiles sync is a stage-then-rename: no rsync straight into the live profiles dir
+if grep -q 'rsync -a --delete "\$STAGE/profiles/" /usr/local/lib' "$REPO/ci-builder-gate.sh"; then bad "profiles still synced straight into the live dir"
+elif grep -q 'mv -T -- "\$new_profiles" /usr/local/lib/pneuma-gate/profiles' "$REPO/ci-builder-gate.sh"; then pass "profiles are built beside the live dir and swapped in by rename"
+else bad "profiles swap not found"; fi
+
 # 4. no predictable /tmp names in the install scripts (mktemp in a root-owned dir or beside the target only)
 if ! grep -n '/tmp/pneuma' "$REPO/ci-builder-gate.sh" "$REPO/host/pneuma-submit-install.sh" >/dev/null; then
   pass "no predictable /tmp/pneuma names in the install scripts"

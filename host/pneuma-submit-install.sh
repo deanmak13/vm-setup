@@ -37,11 +37,21 @@ render_sudoers() {
 
 # A from-address must be one IPv4/IPv6 address or CIDR from a strict allowlist. Anything else (a quote, a comma,
 # a space, a newline, a hostname) could change the key options, so it is refused, never escaped.
+# A prefix shorter than /16 (IPv4) or /32 (IPv6) is refused: that admits most of the internet, including
+# 0.0.0.0/0 and ::/0. A single address (no prefix) is always fine.
 valid_addr() {
-  local a="$1" oct='(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])' v4 v6
+  local a="$1" oct='(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])' v4 v6 prefix
   v4="^$oct\.$oct\.$oct\.$oct(/(3[0-2]|[12]?[0-9]))?$"
   v6='^[0-9A-Fa-f]{0,4}(:[0-9A-Fa-f]{0,4}){2,7}(/(12[0-8]|1[01][0-9]|[1-9]?[0-9]))?$'
-  [[ "$a" =~ $v4 || "$a" =~ $v6 ]]
+  if [[ "$a" =~ $v4 ]]; then
+    prefix="${a#*/}"; [ "$prefix" = "$a" ] && return 0
+    [ "$prefix" -ge 16 ]
+  elif [[ "$a" =~ $v6 ]]; then
+    prefix="${a#*/}"; [ "$prefix" = "$a" ] && return 0
+    [ "$prefix" -ge 32 ]
+  else
+    return 1
+  fi
 }
 
 # --render-sudoers OUT: write the candidate rule and exit. Touches nothing live; needs no staging dir.
@@ -63,7 +73,8 @@ done
 bash -n "$STAGE/pneuma-gate-entry" || die "staged entry does not parse"
 
 WORK="$(mktemp -d "$STAGE/work.XXXXXX")"
-trap 'rm -rf -- "$WORK"' EXIT
+KEEP_WORK=0
+trap '[ "$KEEP_WORK" = 1 ] || rm -rf -- "$WORK"' EXIT
 SAVED="$WORK/saved"
 mkdir "$SAVED"
 
@@ -116,13 +127,14 @@ save() {
   if [ -e "$dest" ]; then cp -p -- "$dest" "$SAVED/$name"; : > "$SAVED/$name.exists"; fi
 }
 # Put a saved copy back (or remove the file if it did not exist before). Atomic where it writes.
+# Returns non-zero when the restore itself fails: the caller then keeps the saved copies.
 restore() {
   local dest="$1" name="$2" tmp
   if [ -e "$SAVED/$name.exists" ]; then
     tmp="$(mktemp "$(dirname "$dest")/.restore.XXXXXX")" || return 1
     cp -p -- "$SAVED/$name" "$tmp" && mv -f -- "$tmp" "$dest" || { rm -f -- "$tmp"; return 1; }
   else
-    rm -f -- "$dest"
+    rm -f -- "$dest" || return 1
   fi
 }
 # Write a candidate to its live path via a same-directory temp file and rename (never a partial file).
@@ -133,11 +145,19 @@ install_atomic() {
 }
 
 rollback() {
+  local failed=0
   echo "pneuma-submit-install: FAILED: $1; restoring the previous state" >&2
-  restore "$ENTRY" entry || echo "pneuma-submit-install: could not restore $ENTRY" >&2
-  restore "$KEYS" keys || echo "pneuma-submit-install: could not restore $KEYS" >&2
-  restore "$DROPIN" dropin || echo "pneuma-submit-install: could not restore $DROPIN" >&2
-  restore "$SUDOERS" sudoers || echo "pneuma-submit-install: could not restore $SUDOERS" >&2
+  restore "$ENTRY" entry || { failed=1; echo "pneuma-submit-install: RESTORE FAILED for $ENTRY" >&2; }
+  restore "$KEYS" keys || { failed=1; echo "pneuma-submit-install: RESTORE FAILED for $KEYS" >&2; }
+  restore "$DROPIN" dropin || { failed=1; echo "pneuma-submit-install: RESTORE FAILED for $DROPIN" >&2; }
+  restore "$SUDOERS" sudoers || { failed=1; echo "pneuma-submit-install: RESTORE FAILED for $SUDOERS" >&2; }
+  if [ "$failed" = 1 ]; then
+    # the saved copies are the only good record of the previous state: keep them, say where, and fail loudly
+    KEEP_WORK=1
+    echo "pneuma-submit-install: the previous state is NOT fully restored. Saved copies kept at $SAVED - restore them by hand before anything else" >&2
+  else
+    echo "pneuma-submit-install: previous state restored" >&2
+  fi
   exit 1
 }
 
