@@ -82,6 +82,13 @@ if [ "$scope_only" = 1 ]; then
 fi
 tree="$(G rev-parse "${head}^{tree}")"
 repo="$(basename "$(G rev-parse --show-toplevel)")"
+# The branch keys GATE-DEDUP-1 (a newer head of the same branch supersedes this gate).
+# A detached HEAD has no branch: no dedup for it.
+branch="$(G symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+# it is spliced into the builder's shell command: only a plain branch name may cross the wire
+if [ -n "$branch" ] && { ! [[ "$branch" =~ ^[A-Za-z0-9._/-]{1,200}$ ]] || [[ "$branch" == *..* ]]; }; then
+  nogate "branch name '$branch' has characters the builder does not accept"
+fi
 [ -n "$profile" ] || profile="$repo"
 common="$(G rev-parse --path-format=absolute --git-common-dir)"
 [ -n "$log_dir" ] || log_dir="$common/pneuma-remote-gate"
@@ -132,7 +139,7 @@ fi
 echo "remote-gate: shipping $(du -h "$bundle" | cut -f1) bundle (builder already has ${prereq:+${prereq:0:12}}${prereq:+ and older}${prereq:-nothing yet})" >&2
 
 # 3) Run. Output streams back live; the verdict is the PNEUMA_GATE_RESULT marker.
-ssh "${SSH_OPTS[@]}" "$HOST" "$RUNNER run --profile $profile --repo $repo --head $head --base $base --tree $tree --bundle ${shallow_args[*]:-} ${fwd_args[*]:-}" \
+ssh "${SSH_OPTS[@]}" "$HOST" "$RUNNER run --profile $profile --repo $repo --head $head --base $base --tree $tree --bundle ${branch:+--branch $branch} ${shallow_args[*]:-} ${fwd_args[*]:-}" \
   < "$bundle" 2>&1 | tee "$log" >&2
 ssh_rc=${PIPESTATUS[0]}
 

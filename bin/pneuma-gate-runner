@@ -142,8 +142,43 @@ result() {   # result <exit> [reason]
 cleanup() {
   [ -n "$QUEUE_FILE" ] && rm -f "$QUEUE_FILE"
   [ -n "$RUN_DIR" ] && [ -d "$RUN_DIR" ] && rm -rf "$RUN_DIR"
+  [ -n "$DEDUP_ID" ] && dedup_remove "$DEDUP_ID"
 }
 refuse() { log "REFUSED: $1"; result 75 "$1"; exit 75; }
+
+# GATE-DEDUP-1. A gate for a repo and branch makes every older gate of that branch
+# (another head) unusable: its verdict can no longer gate anything. Each run records
+# its key (repo/branch), its head, its runner pid and its gate's session in a root-only
+# directory. A newer head marks the older live runs "superseded by <sha>"; a queued
+# run refuses at its next poll, a running one has its session killed. Keys are never
+# SHA prefixes: the key is the repo and the branch name.
+DEDUP_DIR="${PNEUMA_GATE_DEDUP_DIR:-/var/lib/pneuma-gate-dedup}"
+dedup_register() {  # <id> <key> <head>
+  mkdir -p "$DEDUP_DIR" && chmod 0700 "$DEDUP_DIR" || return 1
+  printf 'key=%s\nhead=%s\npid=%s\nsuperseded=\ngate_pid=\n' "$2" "$3" "$$" > "$DEDUP_DIR/$1"
+}
+dedup_field() {  # <id> <field>
+  local f="$DEDUP_DIR/$1"
+  [ -f "$f" ] && [ ! -L "$f" ] || return 0
+  sed -n "s/^$2=//p" "$f" | head -1
+}
+dedup_set() { [ -f "$DEDUP_DIR/$1" ] && [ ! -L "$DEDUP_DIR/$1" ] && sed -i "s/^$2=.*/$2=$3/" "$DEDUP_DIR/$1"; }
+dedup_supersede() {  # <id> <key> <head>: every other live run of this key on another head is superseded
+  local f other gp
+  for f in "$DEDUP_DIR"/*; do
+    [ -f "$f" ] && [ ! -L "$f" ] || continue
+    other="$(basename "$f")"
+    [ "$other" = "$1" ] && continue
+    [ "$(dedup_field "$other" key)" = "$2" ] || continue
+    [ "$(dedup_field "$other" head)" = "$3" ] && continue
+    if ! kill -0 "$(dedup_field "$other" pid)" 2>/dev/null; then rm -f "$f"; continue; fi
+    dedup_set "$other" superseded "$3"
+    gp="$(dedup_field "$other" gate_pid)"
+    if [ -n "$gp" ] && kill -0 "$gp" 2>/dev/null; then kill -TERM -- "-$gp" 2>/dev/null || true; fi
+    log "superseded run $other (head $(dedup_field "$other" head | cut -c1-12)) by $3"
+  done
+}
+dedup_remove() { [ -L "$DEDUP_DIR/$1" ] || rm -f "$DEDUP_DIR/$1"; }
 
 # first live waiter in the FIFO queue (dead waiters are dropped as we go)
 first_live_waiter() {
@@ -160,6 +195,9 @@ admit() {   # admit <cores> <mem_mb> — block until admitted; creates RUN_DIR
   exec 9>"$BASE_DIR/admit.lock"
   while :; do
     flock 9
+    if [ -n "$DEDUP_ID" ] && [ -n "$(dedup_field "$DEDUP_ID" superseded)" ]; then
+      flock -u 9; refuse "superseded by $(dedup_field "$DEDUP_ID" superseded)"
+    fi
     if [ "$(first_live_waiter)" = "$(basename "$QUEUE_FILE")" ] && can_admit "$cores" "$mem"; then
       RUN_DIR="$BASE_DIR/runs/$(date +%Y%m%dT%H%M%S)-$$"
       mkdir -p "$RUN_DIR/work" "$RUN_DIR/tmp" "$RUN_DIR/home"
@@ -212,7 +250,7 @@ ensure_env() {   # ensure_env <profile> <work> → sets ENV_DIR (immutable share
 }
 
 cmd_run() {
-  local profile="" repo="" head="" base="" tree="" bundle=0 shallow="" origin_main="" fwd_env=()
+  local profile="" repo="" head="" base="" tree="" bundle=0 shallow="" origin_main="" branch="" fwd_env=()
   while [ $# -gt 0 ]; do
     case "$1" in
       --shallow) shallow="$2"; shift 2;;
@@ -223,6 +261,7 @@ cmd_run() {
       --profile) profile="$2"; shift 2;; --repo) repo="$2"; shift 2;;
       --head) head="$2"; shift 2;; --base) base="$2"; shift 2;;
       --tree) tree="$2"; shift 2;; --bundle) bundle=1; shift;;
+      --branch) branch="$2"; shift 2;;
       *) echo "unknown arg $1" >&2; return 2;;
     esac
   done
@@ -269,6 +308,15 @@ cmd_run() {
   done
   [ "$(as_gate git --git-dir="$store" rev-parse "${head}^{tree}")" = "$tree" ] || refuse "tree mismatch for $head"
 
+  DEDUP_ID="$(date +%s%N)-$$"
+  if [ -n "$branch" ]; then
+    [[ "$branch" =~ ^[A-Za-z0-9._/-]{1,200}$ ]] && [[ "$branch" != *..* ]] || refuse "bad branch name"
+    log "gate for $repo branch $branch head ${head:0:12}"
+    dedup_register "$DEDUP_ID" "$repo/$branch" "$head" || refuse "cannot register the gate"
+    dedup_supersede "$DEDUP_ID" "$repo/$branch" "$head"
+  else
+    DEDUP_ID=""
+  fi
   admit "$cores" "$mem"
 
   # ── per-run workspace: its own .git, objects via alternates to the store ───
@@ -295,12 +343,22 @@ cmd_run() {
   ensure_env "$profile" "$work"
 
   # ── the gate itself, in a scrubbed environment (no ambient credentials) ────
-  local rc
-  as_gate env -i PATH=/usr/local/bin:/usr/bin:/bin HOME="$RUN_DIR/home" TMPDIR="$RUN_DIR/tmp" LANG=C.UTF-8 \
+  local rc gate_pid
+  if [ -n "$DEDUP_ID" ] && [ -n "$(dedup_field "$DEDUP_ID" superseded)" ]; then
+    result 75 "superseded by $(dedup_field "$DEDUP_ID" superseded)"; return 75
+  fi
+  # The gate runs in its own session, so a newer head can kill it as a group (GATE-DEDUP-1).
+  setsid ${RUN_AS:+runuser -u "$RUN_AS" --} env -i PATH=/usr/local/bin:/usr/bin:/bin HOME="$RUN_DIR/home" TMPDIR="$RUN_DIR/tmp" LANG=C.UTF-8 \
     PNEUMA_GATE_REMOTE_RUN=1 PNEUMA_GATE_RUN_DIR="$RUN_DIR" PNEUMA_GATE_CORES="$cores" "${fwd_env[@]}" \
     bash -c 'source "$1"; cd "$2"; shift 2; profile_gate "$@"' _ \
-    "$PROFILE_DIR/$profile.sh" "$work" "$ENV_DIR" "$head" "$base" "$GATE_TIMEOUT_S" 2>&1
-  rc=$?
+    "$PROFILE_DIR/$profile.sh" "$work" "$ENV_DIR" "$head" "$base" "$GATE_TIMEOUT_S" 2>&1 &
+  gate_pid=$!
+  [ -n "$DEDUP_ID" ] && dedup_set "$DEDUP_ID" gate_pid "$gate_pid"
+  wait "$gate_pid"; rc=$?
+  if [ -n "$DEDUP_ID" ] && [ -n "$(dedup_field "$DEDUP_ID" superseded)" ]; then
+    log "gate superseded by $(dedup_field "$DEDUP_ID" superseded): verdict discarded"
+    result 75 "superseded by $(dedup_field "$DEDUP_ID" superseded)"; return 75
+  fi
   if [ "$rc" -eq 0 ]; then
     log "gate GREEN"; result 0; return 0
   elif [ "$rc" -eq 124 ]; then

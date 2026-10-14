@@ -91,6 +91,7 @@ exec bash -c "$*"
 SSH
 chmod +x "$work/bin/ssh"
 export PATH="$work/bin:$PATH" PNEUMA_GATE_RUNNER="$RUNNER" PNEUMA_GATE_HOST=fakehost
+export PNEUMA_GATE_DEDUP_DIR="$work/dedup"   # GATE-DEDUP-1 state: never under /var/lib in tests
 
 marker_of() { grep '^PNEUMA_GATE_RESULT ' <<<"$1" | tail -1; }
 field_of() { tr ' ' '\n' <<<"$1" | sed -n "s/^$2=//p" | head -1; }
@@ -289,5 +290,37 @@ check "engine profile: gate is the repo's own pre-push fed the pushed range" gre
 check "engine profile: never installs the project editable" not grep -q 'pip.*install.* -e ' "$ENGINE_PROFILE"
 check "engine profile: per-run gate lock, not the dev box's" grep -q 'PNEUMA_GATE_LOCK_FILE="\$PNEUMA_GATE_RUN_DIR' "$ENGINE_PROFILE"
 check "no credentials in the shipped programs" not grep -qiE '(token|secret|password|ghp_)[a-z_]*=[^ ]' "$RUNNER" "$CLIENT"
+
+# ── GATE-DEDUP-1: a newer head of a branch supersedes its older heads (acceptance) ─
+mkdir -p "$PNEUMA_GATE_DEDUP_DIR"
+dedup_do() {  # <runner function and args>: run one function of the runner, alone
+  bash -c 'source "$1"; shift; "$@"' _ "$RUNNER" "$@"
+}
+rec() {  # <id> <key> <head> <pid> [gate pid]: a run record as a live runner leaves it
+  printf 'key=%s\nhead=%s\npid=%s\nsuperseded=\ngate_pid=%s\n' "$2" "$3" "$4" "${5:-}" > "$PNEUMA_GATE_DEDUP_DIR/$1"
+}
+rec old-feat repo/feat aaaa "$$"
+rec old-other repo/other aaaa "$$"
+rec same-head repo/feat bbbb "$$"
+rec stale-feat repo/feat cccc 999999
+dedup_do dedup_supersede new-feat repo/feat bbbb
+check "dedup: an older head of the SAME branch is superseded by the newer head" \
+  grep -qx "superseded=bbbb" "$PNEUMA_GATE_DEDUP_DIR/old-feat"
+check "dedup: a run of ANOTHER branch in the same repo is untouched (key is repo+branch)" \
+  grep -qx "superseded=" "$PNEUMA_GATE_DEDUP_DIR/old-other"
+check "dedup: a run already on the newer head is not superseded" grep -qx "superseded=" "$PNEUMA_GATE_DEDUP_DIR/same-head"
+check "dedup: a record of a dead runner is dropped, not superseded" test ! -e "$PNEUMA_GATE_DEDUP_DIR/stale-feat"
+python3 -c 'import os, time; os.setsid(); time.sleep(300)' & dedup_gate=$!   # its own session; the pid is the session leader
+rec gate-feat repo/feat dddd "$$" "$dedup_gate"
+dedup_do dedup_supersede newer-feat repo/feat eeee
+sleep 1
+check "dedup: a superseded RUNNING gate has its session killed" bash -c '! kill -0 "$1" 2>/dev/null || [ "$(ps -o stat= -p "$1" | cut -c1)" = Z ]' _ "$dedup_gate"
+check "dedup: the superseded gate's verdict is marked, so it cannot gate" grep -qx "superseded=eeee" "$PNEUMA_GATE_DEDUP_DIR/gate-feat"
+kill "$dedup_gate" 2>/dev/null || true; wait "$dedup_gate" 2>/dev/null || true
+# the client sends the branch, validated, to the runner
+args_runner="$work/bin/args-runner"
+printf '#!/usr/bin/env bash\n[ "$1" = have ] && exit 0\necho "$*" > "%s"\nexit 75\n' "$work/runner-args.txt" > "$args_runner"; chmod +x "$args_runner"
+PNEUMA_GATE_RUNNER="$args_runner" "$CLIENT" --repo-dir "$src" --profile fake --head "$head" --base "$base" --log-dir "$work/logs" >/dev/null 2>&1 || true
+check "dedup: the client sends the branch name to the runner" grep -q -- "--branch main" "$work/runner-args.txt"
 
 exit "$fail"
