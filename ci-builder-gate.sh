@@ -27,7 +27,10 @@ done
 
 if [ "$do_client" = 1 ]; then
   mkdir -p "$CLIENT_DEST"
-  install -m 0755 "$REPO_DIR/bin/pneuma-remote-gate" "$CLIENT_DEST/pneuma-remote-gate"
+  # atomic: a temp file in the destination dir, then a rename (never a partially written client)
+  client_tmp="$(mktemp "$CLIENT_DEST/.pneuma-remote-gate.XXXXXX")"
+  install -m 0755 "$REPO_DIR/bin/pneuma-remote-gate" "$client_tmp"
+  mv -f -- "$client_tmp" "$CLIENT_DEST/pneuma-remote-gate"
   printf 'client: %s/pneuma-remote-gate\n' "$CLIENT_DEST"
 fi
 
@@ -35,24 +38,51 @@ if [ "$do_host" = 1 ]; then
   actual="$(ssh -o BatchMode=yes "$HOST" hostname)"
   [ "$actual" = "$APPROVED_HOST" ] || { echo "refusing: $HOST is '$actual', not the approved builder $APPROVED_HOST" >&2; exit 1; }
   # [host-only-begin]
-  ssh "$HOST" 'mkdir -p /usr/local/lib/pneuma-gate/profiles'
-  rsync -a --delete "$REPO_DIR/gate-profiles/" "$HOST:/usr/local/lib/pneuma-gate/profiles/"
-  rsync -a "$REPO_DIR/bin/pneuma-gate-runner" "$HOST:/usr/local/bin/pneuma-gate-runner"
-  ssh "$HOST" 'bash -s' <<'REMOTE'
+  # Every file for the host goes through ONE root-owned 0700 staging dir made by mktemp on the host
+  # (never a predictable name). The path is validated before use and removed on exit.
+  STAGE="$(ssh -o BatchMode=yes "$HOST" 'set -euo pipefail; install -d -o root -g root -m 0700 /var/lib/pneuma-gate-install && mktemp -d /var/lib/pneuma-gate-install/stage.XXXXXX')"
+  case "$STAGE" in
+    /var/lib/pneuma-gate-install/stage.??????) ;;
+    *) echo "refusing: unexpected staging path from $HOST: '$STAGE'" >&2; exit 1;;
+  esac
+  trap 'ssh -o BatchMode=yes "$HOST" "rm -rf -- $STAGE" >/dev/null 2>&1 || true' EXIT
+
+  # Stage everything. Ownership on the staged copies does not matter: the root-side steps set it.
+  rsync -a "$REPO_DIR/bin/pneuma-gate-entry" "$REPO_DIR/gate-submit-keys" \
+    "$REPO_DIR/host/pneuma-submit-install.sh" "$HOST:$STAGE/"
+  rsync -a "$REPO_DIR/bin/pneuma-gate-runner" "$HOST:$STAGE/pneuma-gate-runner"
+  rsync -a "$REPO_DIR/gate-profiles/" "$HOST:$STAGE/profiles/"
+
+  # STAGED MIGRATION (PR #20): stage 1 installs the account, the entry, the keys, the sudoers rule and the
+  # sshd Match block, all validated and rolled back as one unit (host/pneuma-submit-install.sh). The old
+  # root path keeps working until the lanes' ssh config switches (stage 2); then the strict runner is
+  # deployed (stage 3). See the PR body for the steps.
+  ssh "$HOST" "bash '$STAGE/pneuma-submit-install.sh' '$STAGE'"
+
+  ssh "$HOST" "bash -s -- '$STAGE'" <<'REMOTE'
 set -euo pipefail
+STAGE="$1"
+case "$STAGE" in /var/lib/pneuma-gate-install/stage.??????) ;; *) echo "refusing: bad stage $STAGE" >&2; exit 1;; esac
 id pneuma-gate >/dev/null 2>&1 || useradd --system --home-dir /var/lib/pneuma-gate --shell /usr/sbin/nologin pneuma-gate
 install -d -o pneuma-gate -g pneuma-gate -m 0755 /var/lib/pneuma-gate
-chmod 0755 /usr/local/bin/pneuma-gate-runner
-# They run as root (the runner sources the profiles as root), so nothing the
-# unprivileged gate user can write may ever be on that path: root owns everything,
-# directories 0755, files 0644.
-chown root:root /usr/local/bin/pneuma-gate-runner && chmod 0755 /usr/local/bin/pneuma-gate-runner
-chown -R root:root /usr/local/lib/pneuma-gate
-find /usr/local/lib/pneuma-gate -type d -exec chmod 0755 {} +
-find /usr/local/lib/pneuma-gate -type f -exec chmod 0644 {} +
-# Janitor: reap dead runs / stale keep-refs even when no gate is starting.
-printf '*/30 * * * * root /usr/local/bin/pneuma-gate-runner janitor >/dev/null 2>&1\n' > /etc/cron.d/pneuma-gate-janitor
-chmod 0644 /etc/cron.d/pneuma-gate-janitor
+# They run as root (the runner sources the profiles as root): root owns everything, dirs 0755, files 0644,
+# set in the root-owned staging copy BEFORE anything reaches the live path.
+chown -R root:root "$STAGE/profiles"
+find "$STAGE/profiles" -type d -exec chmod 0755 {} +
+find "$STAGE/profiles" -type f -exec chmod 0644 {} +
+install -d -o root -g root -m 0755 /usr/local/lib/pneuma-gate
+rsync -a --delete "$STAGE/profiles/" /usr/local/lib/pneuma-gate/profiles/
+# The runner: atomic replace, mktemp beside the target.
+runner_tmp="$(mktemp /usr/local/bin/.pneuma-gate-runner.XXXXXX)"
+install -o root -g root -m 0755 "$STAGE/pneuma-gate-runner" "$runner_tmp"
+mv -f -- "$runner_tmp" /usr/local/bin/pneuma-gate-runner
+# Janitor: reap dead runs / stale keep-refs even when no gate is starting. Atomic; the dot-named temp file
+# is ignored by cron.d while it exists.
+cron_tmp="$(mktemp /etc/cron.d/.pneuma-gate-janitor.XXXXXX)"
+printf '*/30 * * * * root /usr/local/bin/pneuma-gate-runner janitor >/dev/null 2>&1\n' > "$cron_tmp"
+chown root:root "$cron_tmp"
+chmod 0644 "$cron_tmp"
+mv -f -- "$cron_tmp" /etc/cron.d/pneuma-gate-janitor
 /usr/local/bin/pneuma-gate-runner status
 REMOTE
   # [host-only-end]

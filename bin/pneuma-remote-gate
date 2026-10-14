@@ -41,7 +41,21 @@ done
 # The caller's git hook exports GIT_DIR & friends; resolve everything explicitly.
 G() { env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_OBJECT_DIRECTORY \
         -u GIT_ALTERNATE_OBJECT_DIRECTORIES -u GIT_COMMON_DIR -u GIT_PREFIX git -C "$repo_dir" "$@"; }
-nogate() { echo "pneuma-remote-gate: $*" >&2; exit 75; }
+# A refusal is loud: one line on stderr AND appended to the refusals log under the repo's git dir,
+# the file a lane tails. A silent refusal is how gates looked "queued" for hours.
+nogate() {
+  echo "pneuma-remote-gate: REFUSED: $*" >&2
+  # one record per line (newlines escaped), and never through a symlink: a planted link must not
+  # make the client append to some other file
+  local dir msg file; dir="$(git -C "${repo_dir:-.}" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || dir=""
+  # ASCII-printable only: every control character (newline, tab, ESC) AND every byte >= 0x80 becomes '?'
+  msg="$(printf '%s' "$*" | LC_ALL=C tr '\000-\037\177-\377' '?')"
+  if [ -n "$dir" ] && [ ! -L "$dir/pneuma-remote-gate" ]; then
+    file="$dir/pneuma-remote-gate/refusals.log"
+    { mkdir -p "$dir/pneuma-remote-gate" && [ ! -L "$file" ] && printf '%s REFUSED %s\n' "$(date -u +%FT%TZ)" "$msg" >> "$file"; } 2>/dev/null || true
+  fi
+  exit 75
+}
 
 [ -n "$repo_dir" ] || repo_dir="$(git rev-parse --show-toplevel 2>/dev/null)" || nogate "not inside a git repo (use --repo-dir)"
 head="$(G rev-parse --verify --quiet "${head}^{commit}")" || nogate "--head is not a commit in $repo_dir"
@@ -51,11 +65,12 @@ head="$(G rev-parse --verify --quiet "${head}^{commit}")" || nogate "--head is n
 # (measured: P2-07 7bef90046 selected 17 services on a stale base, 2 on a fresh
 # one, and FULL fan-out on another). Fetch, recompute, and say so when we differ.
 # The origin must be this repo on GitHub, or the fetched main is someone else's.
-repo_name="$(basename "$(G rev-parse --show-toplevel)")"
+# The repo is the origin's name, not the directory's: a worktree can be named anything.
 origin_url="$(G config --get remote.origin.url 2>/dev/null)" || nogate "no origin remote in $repo_dir"
+repo_name="$(basename "$origin_url" .git)"
 case "$origin_url" in
   *github.com[:/]deanmak13/"$repo_name"|*github.com[:/]deanmak13/"$repo_name".git) ;;
-  *) nogate "origin '$origin_url' is not deanmak13/$repo_name — refusing to scope on it" ;;
+  *) nogate "origin '$origin_url' is not a deanmak13 repository — refusing to scope on it" ;;
 esac
 fetch_err="$(mktemp)"
 G fetch -q origin main 2>"$fetch_err" || nogate "cannot fetch origin/main: $(head -1 "$fetch_err") — refusing to scope on a stale base"
@@ -81,7 +96,14 @@ if [ "$scope_only" = 1 ]; then
   exit 0
 fi
 tree="$(G rev-parse "${head}^{tree}")"
-repo="$(basename "$(G rev-parse --show-toplevel)")"
+repo="$repo_name"
+# The branch keys GATE-DEDUP-1 (a newer head of the same branch supersedes this gate).
+# A detached HEAD has no branch: no dedup for it.
+branch="$(G symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+# it is spliced into the builder's shell command: only a plain branch name may cross the wire
+if [ -n "$branch" ] && { ! [[ "$branch" =~ ^[A-Za-z0-9._/-]{1,200}$ ]] || [[ "$branch" == *..* ]]; }; then
+  nogate "branch name '$branch' has characters the builder does not accept"
+fi
 [ -n "$profile" ] || profile="$repo"
 common="$(G rev-parse --path-format=absolute --git-common-dir)"
 [ -n "$log_dir" ] || log_dir="$common/pneuma-remote-gate"
@@ -100,13 +122,18 @@ prereq=$(printf '%s\n' "$cands" | grep -Fx -f <(printf '%s\n' "$have") | grep -v
 # 2) Bundle: head (+ base) minus what the builder has. Temp refs name the tips.
 tmpref_head="refs/pneuma-gate/head-${head:0:12}"; tmpref_base="refs/pneuma-gate/base-${base:0:12}"
 bundle="$(mktemp "${TMPDIR:-/tmp}/pneuma-gate-bundle.XXXXXX")"
-cleanup() { G update-ref -d "$tmpref_head" 2>/dev/null; G update-ref -d "$tmpref_base" 2>/dev/null; [ -n "${origin_main:-}" ] && G update-ref -d "$tmpref_om" 2>/dev/null; rm -f "$bundle" "$log.err"; }
+# The bundle BINDS the claim: the runner reads the repo and branch from these ref names and
+# refuses a bundle whose refs do not match what it was told (GATE-DEDUP-1 binding).
+tmpref_repo="refs/pneuma-gate/repo/$repo"; tmpref_branch="refs/pneuma-gate/branch/${branch:-detached}"
+cleanup() { G update-ref -d "$tmpref_head" 2>/dev/null; G update-ref -d "$tmpref_base" 2>/dev/null; G update-ref -d "$tmpref_repo" 2>/dev/null; G update-ref -d "$tmpref_branch" 2>/dev/null; [ -n "${origin_main:-}" ] && G update-ref -d "$tmpref_om" 2>/dev/null; rm -f "$bundle" "$log.err"; }
 trap cleanup EXIT
 G update-ref "$tmpref_head" "$head" && G update-ref "$tmpref_base" "$base" || nogate "cannot name bundle tips"
 # origin/main as this checkout last fetched it: guards resolve it, so it travels too.
 origin_main="$(G rev-parse --verify --quiet 'refs/remotes/origin/main^{commit}' || true)"
 tmpref_om="refs/pneuma-gate/om-${origin_main:0:12}"
 refs=("$tmpref_head")
+G update-ref "$tmpref_repo" "$head" && refs+=("$tmpref_repo") || nogate "cannot name the repo in the bundle"
+if [ -n "$branch" ]; then G update-ref "$tmpref_branch" "$head" && refs+=("$tmpref_branch") || nogate "cannot name the branch in the bundle"; fi
 if [ -n "$origin_main" ]; then G update-ref "$tmpref_om" "$origin_main"; refs+=("$tmpref_om"); fi
 [ "$base" != "$head" ] && refs+=("$tmpref_base")
 if [ -n "$prereq" ] && [ "$prereq" != "$head" ]; then
@@ -132,7 +159,7 @@ fi
 echo "remote-gate: shipping $(du -h "$bundle" | cut -f1) bundle (builder already has ${prereq:+${prereq:0:12}}${prereq:+ and older}${prereq:-nothing yet})" >&2
 
 # 3) Run. Output streams back live; the verdict is the PNEUMA_GATE_RESULT marker.
-ssh "${SSH_OPTS[@]}" "$HOST" "$RUNNER run --profile $profile --repo $repo --head $head --base $base --tree $tree --bundle ${shallow_args[*]:-} ${fwd_args[*]:-}" \
+ssh "${SSH_OPTS[@]}" "$HOST" "$RUNNER run --profile $profile --repo $repo --head $head --base $base --tree $tree --bundle ${branch:+--branch $branch} ${shallow_args[*]:-} ${fwd_args[*]:-}" \
   < "$bundle" 2>&1 | tee "$log" >&2
 ssh_rc=${PIPESTATUS[0]}
 
