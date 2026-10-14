@@ -1,0 +1,7 @@
+[Unit]
+Description=Verify the DOCKER-USER policy is first and enforced; re-apply if not
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/pneuma-docker-fw/docker-user-firewall.sh --reconcile

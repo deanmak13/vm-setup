@@ -1,30 +1,31 @@
 # docker-user-firewall.allowlist -- the ONE source of truth for the DOCKER-USER policy.
 #
-# Format (whitespace separated):  <role>  <kind>  <value> [proto-for-allow]
-#   role  : host role (dev-box | ci-builder | <third host, once named>) or "all"
-#   kind  : trust-iface   interface (iptables '+' wildcard ok) whose traffic is never filtered
-#           docker-egress bridge interface patterns that carry published-container traffic;
-#                         traffic forwarded to these from any non-trusted interface is DROPPED
-#                         unless allowlisted. k3s/CNI egress (cni0, flannel.1) is deliberately
-#                         NOT here, so k3s ingress is never matched.
-#           detect        <role> container <name>: this host has role <role> if that container
-#                         exists (role = all only); lets a bare `--apply` find its role
-#           allow         <tcp|udp> <host-port>: public inbound to a published HOST port
-#                         (matched on the conntrack ORIGINAL destination port)
-# Policy (fail closed: an invalid file/unknown role installs a no-public-ports baseline):
-# everything published by Docker is non-public unless listed as `allow` below.
+# Format (whitespace separated):  <role>  <kind>  <value...>   -- strict grammar, any other line
+# is an error and makes --apply install the no-public-ports baseline (fail closed).
+#   role  : `all` or a role declared with `all role <name>`
+#   kind  : role              declare a host role (role field must be `all`)
+#           trust-iface       one of: lo docker0 br-+ docker_gwbridge cni0 flannel.1 wg0
+#                             (no other wildcard; traffic arriving on it is never filtered)
+#           passthrough-iface cni0 | flannel.1: traffic LEAVING through it is k3s's, never filtered
+#           allow             <tcp|udp> <host-port>: public inbound to a published HOST port,
+#                             matched only for DNAT'd traffic on the conntrack original dst port
+# Everything else forwarded toward Docker (any bridge, custom/gateway networks) is DROPPED.
+# The host's role is NOT detected: it is read from /etc/pneuma/host-role (root:root 0644).
 # NEVER add RabbitMQ (15692, 32770, 32771) here; tests/docker-user-firewall.test.sh enforces it.
+
+all         role           dev-box
+all         role           ci-builder
+# Third host: add `all role <name>` plus its allow lines here once Dean names it.
 
 all         trust-iface    lo
 all         trust-iface    docker0
 all         trust-iface    br-+
 all         trust-iface    cni0
 all         trust-iface    flannel.1
-all         docker-egress  docker0
-all         docker-egress  br-+
+all         trust-iface    docker_gwbridge
+all         passthrough-iface cni0
+all         passthrough-iface flannel.1
 
-all         detect         dev-box container kodus-web-prod
-all         detect         ci-builder container kodus-fwd-3000
 
 # ci-builder: WireGuard peer network (wg0 10.13.13.1/32, peer 10.13.13.2). Trust is by
 # interface, not source CIDR: a CIDR rule could be spoofed from a public interface.
@@ -37,4 +38,3 @@ ci-builder  allow          tcp 3001     # kodus-fwd-3001
 ci-builder  allow          tcp 3101     # kodus-fwd-3101
 ci-builder  allow          tcp 3332     # kodus-fwd-3332
 
-# Third host: placeholder -- add its detect + allow lines here once Dean names it.

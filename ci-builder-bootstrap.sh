@@ -339,6 +339,11 @@ else
     log "OPEN ITEM: /etc/cloudflared/openbao-access.env missing — OpenBao CI access proxy NOT installed. See ci-builder-openbao-access.md."
 fi
 
+# --- DOCKER-USER policy (SEC-DOCKERFW-1): role file + units; applying is a separate, timer-guarded step ---
+# Writes /etc/pneuma/host-role (root:root 0644) and installs the boot/reconcile units; it does NOT
+# change live rules. Apply with: sudo bash docker-user-firewall.sh --apply --rollback-timer 300
+bash "$REPO_DIR/docker-user-firewall.sh" --role ci-builder --install
+
 log "bootstrap complete. Verify with:"
 log "  systemctl list-units 'actions.runner.*' --no-legend"
 log "  kubectl get all -A"

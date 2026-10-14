@@ -1,0 +1,10 @@
+[Unit]
+Description=Periodic DOCKER-USER policy reconcile (covers Docker crash-restarts and rewritten chains)
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target
