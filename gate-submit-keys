@@ -1,4 +1,6 @@
-# Gate submitters: one line per authorized key. <stable-id> <key type> <base64 key>.
+# Gate submitters: one line per authorized key. <stable-id> <key type> <base64 key> [from-name].
+# The optional from-name is a NAME, looked up on the host in /etc/pneuma-gate/from.conf ("name address" per
+# line) and rendered as from="<address>" at install time. No host address is ever written in this repo.
 # The key is DEDICATED to the gate: it is authorized here and nowhere else (not in root's authorized_keys).
 # The private half lives only on the dev box at ~/.ssh/pneuma_gate_submit_ed25519; the lanes' gate client
 # connects with it (ssh config: IdentityFile ~/.ssh/pneuma_gate_submit_ed25519, User pneuma-submit).

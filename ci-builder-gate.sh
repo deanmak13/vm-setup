@@ -37,26 +37,48 @@ if [ "$do_host" = 1 ]; then
   # [host-only-begin]
   # The submission entry point and its forced-command keys (GATE-DEDUP-1 identity): the
   # submitter is the id the key line forces, never something the client sends.
-  rsync -a "$REPO_DIR/bin/pneuma-gate-entry" "$HOST:/usr/local/bin/pneuma-gate-entry"
+  # The entry is root-owned, whatever the dev box's uid is: rsync -a would carry the local owner.
+  rsync -a "$REPO_DIR/bin/pneuma-gate-entry" "$HOST:/tmp/pneuma-gate-entry.new"
   rsync -a "$REPO_DIR/gate-submit-keys" "$HOST:/tmp/pneuma-gate-submit-keys"
-  # STAGED MIGRATION (PR #20): stage 1 installs the account, the entry, the sudoers rule and the
-  # keys; the old root path keeps working until the lanes' ssh config switches (stage 2); then the
-  # strict runner is deployed (stage 3). See the PR body for the steps.
+  # STAGED MIGRATION (PR #20): stage 1 installs the account, the entry, the keys, the sudoers rule and
+  # the sshd Match block; the old root path keeps working until the lanes' ssh config switches (stage 2);
+  # then the strict runner is deployed (stage 3). See the PR body for the steps.
   ssh "$HOST" 'set -euo pipefail
-    chmod 0755 /usr/local/bin/pneuma-gate-entry
+    install -o root -g root -m 0755 /tmp/pneuma-gate-entry.new /usr/local/bin/pneuma-gate-entry
+    rm -f /tmp/pneuma-gate-entry.new
     id pneuma-submit >/dev/null 2>&1 || useradd --system --create-home --home-dir /var/lib/pneuma-submit --shell /bin/bash pneuma-submit
-    # the keys are root-owned: the submitter account cannot change its own authorized keys
-    install -d -o root -g root -m 0755 /var/lib/pneuma-submit/.ssh
-    grep -v "^#" /tmp/pneuma-gate-submit-keys | while read -r id type key; do
-      printf "restrict,command=\"/usr/local/bin/pneuma-gate-entry --submitter %s\" %s %s\n" "$id" "$type" "$key"
-    done > /var/lib/pneuma-submit/.ssh/authorized_keys
-    chown root:root /var/lib/pneuma-submit/.ssh/authorized_keys
-    chmod 0644 /var/lib/pneuma-submit/.ssh/authorized_keys
-    # the ONE elevation: the entry may run exactly this binary as root, NOPASSWD, env reset
-    printf "Defaults!/usr/local/bin/pneuma-gate-runner env_reset\npneuma-submit ALL=(root) NOPASSWD: /usr/local/bin/pneuma-gate-runner\n" > /tmp/pneuma-submit.sudoers
+    # Authorized keys live OUTSIDE the submitter home, root-owned: sshd reads them via the Match block below.
+    install -d -o root -g root -m 0755 /etc/ssh/authorized_keys
+    # from= comes from a HOST-LOCAL file (name address), never from the repo: a key line names it in its 4th field.
+    FROM_CONF=/etc/pneuma-gate/from.conf
+    : > /tmp/pneuma-submit-authorized.new
+    while read -r id type key fromname; do
+      [ -n "$id" ] || continue
+      from=""
+      if [ -n "${fromname:-}" ]; then
+        addr="$(awk -v n="$fromname" "\$1 == n { print \$2 }" "$FROM_CONF" 2>/dev/null || true)"
+        [ -n "$addr" ] || { echo "refused: from-name $fromname has no address in $FROM_CONF" >&2; rm -f /tmp/pneuma-submit-authorized.new /tmp/pneuma-gate-submit-keys; exit 1; }
+        from="from=\"$addr\","
+      fi
+      printf "%srestrict,command=\"/usr/local/bin/pneuma-gate-entry --submitter %s\" %s %s\n" "$from" "$id" "$type" "$key" >> /tmp/pneuma-submit-authorized.new
+    done < <(grep -v "^#" /tmp/pneuma-gate-submit-keys)
+    install -o root -g root -m 0644 /tmp/pneuma-submit-authorized.new /etc/ssh/authorized_keys/pneuma-submit
+    rm -f /tmp/pneuma-submit-authorized.new /tmp/pneuma-gate-submit-keys
+    # sshd: the submitter reads keys from /etc/ssh/authorized_keys/%u. Validated (sshd -t, and the effective
+    # value by sshd -T) before any reload; reload, never restart; removed again if validation fails.
+    printf "Match User pneuma-submit\n    AuthorizedKeysFile /etc/ssh/authorized_keys/%%u\n" > /etc/ssh/sshd_config.d/50-pneuma-submit.conf
+    chmod 0644 /etc/ssh/sshd_config.d/50-pneuma-submit.conf
+    if sshd -t && sshd -T -C user=pneuma-submit,host=localhost,addr=127.0.0.1 2>/dev/null | grep -qx "authorizedkeysfile /etc/ssh/authorized_keys/%u"; then
+      systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || echo "sshd reload failed: the Match block applies at the next reload" >&2
+    else
+      rm -f /etc/ssh/sshd_config.d/50-pneuma-submit.conf
+      echo "refused: sshd does not take the submitter Match block; not applied" >&2; exit 1
+    fi
+    # the ONE elevation, restricted to the three verbs the gate client sends (entry validates the rest)
+    printf "Defaults!/usr/local/bin/pneuma-gate-runner env_reset\npneuma-submit ALL=(root) NOPASSWD: /usr/local/bin/pneuma-gate-runner status *, /usr/local/bin/pneuma-gate-runner have *, /usr/local/bin/pneuma-gate-runner run *\n" > /tmp/pneuma-submit.sudoers
     visudo -cf /tmp/pneuma-submit.sudoers >/dev/null
     install -o root -g root -m 0440 /tmp/pneuma-submit.sudoers /etc/sudoers.d/pneuma-submit
-    rm -f /tmp/pneuma-submit.sudoers /tmp/pneuma-gate-submit-keys'
+    rm -f /tmp/pneuma-submit.sudoers'
   ssh "$HOST" 'mkdir -p /usr/local/lib/pneuma-gate/profiles'
   rsync -a --delete "$REPO_DIR/gate-profiles/" "$HOST:/usr/local/lib/pneuma-gate/profiles/"
   rsync -a "$REPO_DIR/bin/pneuma-gate-runner" "$HOST:/usr/local/bin/pneuma-gate-runner"
