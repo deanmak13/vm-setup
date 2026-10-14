@@ -41,7 +41,14 @@ done
 # The caller's git hook exports GIT_DIR & friends; resolve everything explicitly.
 G() { env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_OBJECT_DIRECTORY \
         -u GIT_ALTERNATE_OBJECT_DIRECTORIES -u GIT_COMMON_DIR -u GIT_PREFIX git -C "$repo_dir" "$@"; }
-nogate() { echo "pneuma-remote-gate: $*" >&2; exit 75; }
+# A refusal is loud: one line on stderr AND appended to the refusals log under the repo's git dir,
+# the file a lane tails. A silent refusal is how gates looked "queued" for hours.
+nogate() {
+  echo "pneuma-remote-gate: REFUSED: $*" >&2
+  local dir; dir="$(git -C "${repo_dir:-.}" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" && \
+    { mkdir -p "$dir/pneuma-remote-gate" && printf '%s REFUSED %s\n' "$(date -u +%FT%TZ)" "$*" >> "$dir/pneuma-remote-gate/refusals.log"; } 2>/dev/null || true
+  exit 75
+}
 
 [ -n "$repo_dir" ] || repo_dir="$(git rev-parse --show-toplevel 2>/dev/null)" || nogate "not inside a git repo (use --repo-dir)"
 head="$(G rev-parse --verify --quiet "${head}^{commit}")" || nogate "--head is not a commit in $repo_dir"
@@ -51,11 +58,12 @@ head="$(G rev-parse --verify --quiet "${head}^{commit}")" || nogate "--head is n
 # (measured: P2-07 7bef90046 selected 17 services on a stale base, 2 on a fresh
 # one, and FULL fan-out on another). Fetch, recompute, and say so when we differ.
 # The origin must be this repo on GitHub, or the fetched main is someone else's.
-repo_name="$(basename "$(G rev-parse --show-toplevel)")"
+# The repo is the origin's name, not the directory's: a worktree can be named anything.
 origin_url="$(G config --get remote.origin.url 2>/dev/null)" || nogate "no origin remote in $repo_dir"
+repo_name="$(basename "$origin_url" .git)"
 case "$origin_url" in
   *github.com[:/]deanmak13/"$repo_name"|*github.com[:/]deanmak13/"$repo_name".git) ;;
-  *) nogate "origin '$origin_url' is not deanmak13/$repo_name — refusing to scope on it" ;;
+  *) nogate "origin '$origin_url' is not a deanmak13 repository — refusing to scope on it" ;;
 esac
 fetch_err="$(mktemp)"
 G fetch -q origin main 2>"$fetch_err" || nogate "cannot fetch origin/main: $(head -1 "$fetch_err") — refusing to scope on a stale base"
@@ -81,7 +89,7 @@ if [ "$scope_only" = 1 ]; then
   exit 0
 fi
 tree="$(G rev-parse "${head}^{tree}")"
-repo="$(basename "$(G rev-parse --show-toplevel)")"
+repo="$repo_name"
 # The branch keys GATE-DEDUP-1 (a newer head of the same branch supersedes this gate).
 # A detached HEAD has no branch: no dedup for it.
 branch="$(G symbolic-ref --quiet --short HEAD 2>/dev/null || true)"

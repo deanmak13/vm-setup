@@ -135,7 +135,16 @@ check "scope-only: the scoped base is the merge-base" grep -q "base ${base:0:12}
 # selector runs scrubbed (no ambient secrets reach PR code).
 git -C "$src" config remote.origin.url https://github.com/evil/fakerepo.git
 evil_out=$("$CLIENT" --repo-dir "$src" --head "$head" --base "$base" --scope-only 2>&1) && evil_rc=0 || evil_rc=$?
-check "scope: a foreign origin is refused" bash -c '[ "$1" = 75 ] && grep -q "is not deanmak13/fakerepo" <<<"$2"' _ "$evil_rc" "$evil_out"
+check "scope: a foreign origin is refused" bash -c '[ "$1" = 75 ] && grep -q "is not a deanmak13 repository" <<<"$2"' _ "$evil_rc" "$evil_out"
+check "scope: a refusal is also written to the refusals log under the git dir (loud, never silent)" \
+  bash -c 'grep -q "REFUSED" "$1/.git/pneuma-remote-gate/refusals.log"' _ "$src"
+git -C "$src" config remote.origin.url https://github.com/deanmak13/fakerepo.git
+wt_dir="$work/wt-named-anything"
+git -C "$src" worktree add -q --detach "$wt_dir" "$head" 2>/dev/null
+wt_out=$("$CLIENT" --repo-dir "$wt_dir" --head "$head" --base "$base" --scope-only 2>&1) && wt_rc=0 || wt_rc=$?
+check "name: a worktree named anything works: the repo name comes from the origin remote" \
+  bash -c '[ "$1" = 0 ] && grep -q "scope-only head" <<<"$2"' _ "$wt_rc" "$wt_out"
+git -C "$src" worktree remove --force "$wt_dir" 2>/dev/null || true
 git -C "$src" config remote.origin.url https://github.com/deanmak13/fakerepo.git
 done_out=$("$CLIENT" --repo-dir "$src" --head "$base" --base "$base" --scope-only 2>&1) && done_rc=0 || done_rc=$?
 check "scope: a head already on origin/main is NOTHING TO GATE (exit 3, not 0)" bash -c '[ "$1" = 3 ] && grep -q "NOTHING TO GATE" <<<"$2"' _ "$done_rc" "$done_out"
