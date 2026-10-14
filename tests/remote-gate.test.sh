@@ -382,6 +382,9 @@ old=$(( $(date +%s) - 7200 ))
 leftover="$PNEUMA_GATE_RUN_ROOT/leftover-1"; mkdir -p "$leftover/work"; touch -d "@$old" "$leftover"
 "$RUNNER" janitor >/dev/null 2>&1
 check "janitor: never deletes a run directory (systemd owns it)" test -d "$leftover"
+# FRESH HOST (review): the workspace base is created by the root runner; the gate user must
+# own it, or every run fails. Structural check here; the real-user install test runs on the builder.
+check "fresh host: the gate user is handed its workspace base (work/)" grep -q '"$BASE_DIR"/work 2>/dev/null' "$RUNNER"
 check "janitor: never sends a unit a stop (systemd owns the lifetime)" bash -c '! grep -q "^stop " "$1"' _ "$SYSTEMCTL_RECORD"
 
 # SLOW START (acceptance): a reservation whose unit has not come up yet, with its workspace,

@@ -301,7 +301,9 @@ cmd_run() {
   [ -r "$PROFILE_DIR/$profile.sh" ] || refuse "no gate profile '$profile' in $PROFILE_DIR"
   mkdir -p "$BASE_DIR/work" "$BASE_DIR/repos" "$BASE_DIR/envs" "$BASE_DIR/wheels" "$BASE_DIR/queue" 2>/dev/null \
     || refuse "cannot create $BASE_DIR"
-  if [ -n "$RUN_AS" ]; then chown "$RUN_AS" "$BASE_DIR" "$BASE_DIR"/repos "$BASE_DIR"/envs "$BASE_DIR"/queue 2>/dev/null; fi
+  # Every directory the gate user writes must be its own, on a fresh host too: the workspace
+  # base was created by this root runner and was never handed over, so every run failed.
+  if [ -n "$RUN_AS" ]; then chown "$RUN_AS" "$BASE_DIR" "$BASE_DIR"/repos "$BASE_DIR"/envs "$BASE_DIR"/queue "$BASE_DIR"/work 2>/dev/null || refuse "cannot hand the gate's directories to $RUN_AS"; fi
 
   cmd_janitor >/dev/null 2>&1   # housekeeping: stale queue entries, expired keep-refs, stale markers
   local free; free="$(disk_free_gib)"
