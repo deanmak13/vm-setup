@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# pneuma-gate-entry — the FORCED COMMAND of every gate submitter's authorized_keys line:
+#
+#   command="/usr/local/bin/pneuma-gate-entry --submitter <stable-id>",no-port-forwarding,
+#   no-agent-forwarding,no-pty,no-user-rc <key>
+#
+# sshd fixes --submitter (server-side authority, from the key's own line). The client's requested
+# command arrives ONLY in SSH_ORIGINAL_COMMAND and is parsed here with a strict grammar: an
+# allowlisted verb and allowlisted options, each value checked by its own pattern. It is never run
+# through a shell. Environment variables are never identity: SSH_USER_AUTH and friends are ignored.
+set -uo pipefail
+
+RUNNER="${PNEUMA_GATE_RUNNER_BIN:-/usr/local/bin/pneuma-gate-runner}"
+die() { echo "pneuma-gate-entry: refused: $*" >&2; exit 75; }
+
+submitter=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --submitter) submitter="${2:-}"; shift 2;;
+    *) die "unknown entry argument";;
+  esac
+done
+[[ "$submitter" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] || die "no valid submitter identity was forced on this key"
+
+cmd="${SSH_ORIGINAL_COMMAND:-}"
+[ -n "$cmd" ] || die "no command requested (interactive use is not a gate)"
+# no shell metacharacters at all: the command is words, read by this script, never by a shell
+[[ "$cmd" != *[\;\|\&\`\$\<\>\(\)\{\}\\\'\"\*\?\[\]\!\#]* ]] || die "the requested command contains characters the gate grammar does not allow"
+read -r -a words <<< "$cmd"
+[ "${#words[@]}" -ge 1 ] || die "empty command"
+case "${words[0]}" in
+  "$RUNNER"|pneuma-gate-runner) words=("${words[@]:1}");;
+esac
+[ "${#words[@]}" -ge 1 ] || die "no verb"
+verb="${words[0]}"; words=("${words[@]:1}")
+
+# every option: name -> its value pattern. A value-less option is listed with an empty pattern.
+declare -A allowed=(
+  [--profile]='^[a-z0-9][a-z0-9-]{0,62}$'
+  [--repo]='^[A-Za-z0-9._-]{1,100}$'
+  [--head]='^[0-9a-f]{40}$'
+  [--base]='^[0-9a-f]{40}$'
+  [--tree]='^[0-9a-f]{40}$'
+  [--origin-main]='^[0-9a-f]{40}$'
+  [--shallow]='^([0-9a-f]{40},?)+$'
+  [--branch]='^[A-Za-z0-9._/-]{1,200}$'
+  [--env]='^PNEUMA_PREPUSH_(FULL|NO_CACHE)=[01]$'
+  [--bundle]=''
+)
+case "$verb" in
+  run) ;;
+  have) allowed=([--repo]="${allowed[--repo]}");;
+  status) allowed=();;
+  *) die "verb '$verb' is not allowed";;
+esac
+
+args=("$verb")
+i=0
+while [ "$i" -lt "${#words[@]}" ]; do
+  opt="${words[$i]}"
+  # `have` takes a bare list of commit SHAs (the client appends them): nothing else is positional
+  if [ "$verb" = have ] && [[ "$opt" =~ ^[0-9a-f]{40}$ ]]; then args+=("$opt"); i=$((i + 1)); continue; fi
+  pat="${allowed[$opt]-__none__}"
+  [ "$pat" != "__none__" ] || die "option '$opt' is not allowed for '$verb'"
+  if [ -z "$pat" ]; then
+    args+=("$opt"); i=$((i + 1)); continue
+  fi
+  val="${words[$((i + 1))]-}"
+  [ -n "$val" ] || die "option '$opt' has no value"
+  [[ "$val" =~ $pat ]] || die "the value of '$opt' is not in the grammar"
+  args+=("$opt" "$val"); i=$((i + 2))
+done
+
+exec "$RUNNER" "$verb" --submitter "$submitter" "${args[@]:1}"

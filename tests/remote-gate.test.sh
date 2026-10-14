@@ -90,7 +90,21 @@ shift   # host
 exec bash -c "$*"
 SSH
 chmod +x "$work/bin/ssh"
-export PATH="$work/bin:$PATH" PNEUMA_GATE_RUNNER="$RUNNER" PNEUMA_GATE_HOST=fakehost
+ENTRY="$REPO_DIR/bin/pneuma-gate-entry"
+# sshd's forced command, played here: the client's command arrives as SSH_ORIGINAL_COMMAND and the
+# entry point runs it with the submitter it was forced with (test-lane)
+cat > "$work/bin/gate-as-forced-command" <<STUB
+#!/usr/bin/env bash
+SSH_ORIGINAL_COMMAND="\$*" exec "$ENTRY" --submitter test-lane
+STUB
+cat > "$work/bin/argv-recorder" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" > "$ARGV_RECORD"
+exit 0
+STUB
+chmod +x "$work/bin/gate-as-forced-command" "$work/bin/argv-recorder"
+export ARGV_RECORD="$work/argv-recorded.txt"
+export PATH="$work/bin:$PATH" PNEUMA_GATE_RUNNER="$work/bin/gate-as-forced-command" PNEUMA_GATE_RUNNER_BIN="$RUNNER" PNEUMA_GATE_HOST=fakehost
 export PNEUMA_GATE_DEDUP_DIR="$work/dedup"   # GATE-DEDUP-1 state: never under /var/lib in tests
 # the gate runs as a unit: stand-ins for systemd-run (runs the command inline) and systemctl
 cat > "$work/bin/systemd-run-stub" <<'STUB'
@@ -199,7 +213,7 @@ chmod -R u+w "$PNEUMA_GATE_BASE/envs" 2>/dev/null || true
 out=$("$RUNNER" status 2>&1)
 check "status reports the free-space floor" grep -q 'disk_free>=40GiB' <<<"$out"
 
-out=$(PNEUMA_GATE_EXPECT_HOST=not-the-builder "$RUNNER" run --profile fake --repo fakerepo --head "$head" --base "$base" --tree "$tree" 2>&1) && rc=0 || rc=$?
+out=$(PNEUMA_GATE_EXPECT_HOST=not-the-builder "$RUNNER" run --submitter test-lane --profile fake --repo fakerepo --head "$head" --base "$base" --tree "$tree" 2>&1) && rc=0 || rc=$?
 expect_eq "runner: wrong host identity exits 75" 75 "$rc"
 out=$("$CLIENT" --repo-dir "$src" --profile nosuchprofile --head "$head" --base "$base" --log-dir "$work/logs" 2>&1) && rc=0 || rc=$?
 expect_eq "client: unknown profile exits 75" 75 "$rc"
@@ -219,11 +233,11 @@ out=$(PNEUMA_GATE_RUNNER="$work/bin/dropped-runner" "$CLIENT" --repo-dir "$src" 
 expect_eq "client: no marker (dropped connection) is NOT green" 75 "$rc"
 
 # ── runner: tree mismatch, shallow boundary, have ────────────────────────────
-out=$("$RUNNER" run --profile fake --repo fakerepo --head "$head" --base "$base" --tree "$base" 2>&1) && rc=0 || rc=$?
+out=$("$RUNNER" run --submitter test-lane --profile fake --repo fakerepo --head "$head" --base "$base" --tree "$base" 2>&1) && rc=0 || rc=$?
 expect_eq "runner: tree mismatch exits 75" 75 "$rc"
 check "have: reports commits the store holds" bash -c "[ \"\$('$RUNNER' have --repo fakerepo '$head' 1111111111111111111111111111111111111111)\" = '$head' ]"
 check "have: rejects a hostile repo name" not "$RUNNER" have --repo '../x' "$head"
-out=$("$RUNNER" run --profile 'a/b' --repo fakerepo --head "$head" --base "$base" --tree "$tree" 2>&1) && rc=0 || rc=$?
+out=$("$RUNNER" run --submitter test-lane --profile 'a/b' --repo fakerepo --head "$head" --base "$base" --tree "$tree" 2>&1) && rc=0 || rc=$?
 expect_eq "runner: hostile profile name exits 75" 75 "$rc"
 
 shallow_src="$work/shallow-src"
@@ -273,7 +287,7 @@ export PNEUMA_GATE_NPROC=8 PNEUMA_GATE_RESERVE_CORES=3 PNEUMA_GATE_RESERVE_MEM_M
 printf 'MemAvailable: %d kB\n' $((64 * 1024 * 1024)) > "$mem"; printf '0.1 1 1 1/1 1\n' > "$load"
 export PNEUMA_GATE_MEMINFO="$mem" PNEUMA_GATE_LOADAVG="$load"
 for i in 1 2 3; do
-  ( "$RUNNER" run --profile fake --repo fakerepo --head "$head" --base "$base" --tree "$tree" > "$work/c$i.out" 2>&1; echo $? > "$work/c$i.rc" ) &
+  ( "$RUNNER" run --submitter test-lane --profile fake --repo fakerepo --head "$head" --base "$base" --tree "$tree" > "$work/c$i.out" 2>&1; echo $? > "$work/c$i.rc" ) &
   sleep 1
 done
 sleep 3
@@ -322,8 +336,8 @@ rec2() {  # <id> <key> <head> <submitter>: a live run record (its pid is this te
     "$2" "$3" "$$" "$4" "$1" > "$PNEUMA_GATE_DEDUP_DIR/$1"
 }
 fresh() { rm -rf "$PNEUMA_GATE_DEDUP_DIR"; mkdir -p "$PNEUMA_GATE_DEDUP_DIR"; }
-SUB_A=$(printf 'publickey ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabl9K\n' > "$work/auth-a"; PNEUMA_TEST=1 SSH_USER_AUTH="$work/auth-a" ddo submitter_principal)
-SUB_B=$(printf 'publickey ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n' > "$work/auth-b"; SSH_USER_AUTH="$work/auth-b" ddo submitter_principal)
+SUB_A="dean-devbox"
+SUB_B="lane-b"
 
 fresh; rec2 other-repo repoB/main "$C1" "$SUB_A"
 ddo dedup_admit n1 "$dstore" repoA main "$C2" "$SUB_A"
@@ -373,10 +387,27 @@ rc_b=0; ddo dedup_admit b-1 "$dstore" repoA main "$C2" "$SUB_B" || rc_b=$?
 check "fairness: another submitter is still admitted while A is at its cap" test "$rc_b" = 0
 check "fairness: A's flood cancels none of B's gates, and B's gate is recorded" \
   bash -c 'test -f "$1/b-1" && ! grep -q "^superseded=." "$1/b-1"' _ "$PNEUMA_GATE_DEDUP_DIR"
-check "runner: submitter = fingerprint of the authenticated key (sshd SSH_USER_AUTH), not a client field" \
-  bash -c '[[ "$1" =~ ^[0-9a-f]{64}$ ]] && [ "$1" != "$2" ]' _ "$SUB_A" "$SUB_B"
-check "runner: no authenticated key means no submitter, so nothing is ever cancelled" \
-  bash -c '[ -z "$(SSH_USER_AUTH=/nonexistent ddo submitter_principal)" ]'
+rec_entry_out="$(SSH_ORIGINAL_COMMAND="run --profile fake --submitter evil --repo x" PNEUMA_GATE_RUNNER_BIN="$work/bin/argv-recorder" "$ENTRY" --submitter test-lane 2>&1)" && rec_entry_rc=0 || rec_entry_rc=$?
+check "identity: a client cannot pass --submitter in its command (forgery refused)" \
+  bash -c '[ "$1" = 75 ] && grep -q "option .--submitter. is not allowed" <<<"$2"' _ "$rec_entry_rc" "$rec_entry_out"
+SSH_ORIGINAL_COMMAND="run --profile fake --repo fakerepo --head $head --base $base --tree $tree" \
+  PNEUMA_GATE_RUNNER_BIN="$work/bin/argv-recorder" SSH_USER_AUTH=/tmp/forged-auth "$ENTRY" --submitter test-lane >/dev/null 2>&1 || true
+check "identity: the runner is called with the forced submitter, whatever the environment says" \
+  grep -q -- "--submitter test-lane" "$work/argv-recorded.txt"
+check "identity: an entry with no forced submitter refuses to run anything" \
+  bash -c 'SSH_ORIGINAL_COMMAND="status" "$1" >/dev/null 2>&1; test $? = 75' _ "$ENTRY"
+check "identity: the runner refuses a run with no submitter identity" \
+  bash -c '"$1" run --profile fake --repo fakerepo --head "$2" --base "$3" --tree "$4" >/dev/null 2>&1; test $? = 75' _ "$RUNNER" "$head" "$base" "$tree"
+check "grammar: an unknown verb is refused" \
+  bash -c 'SSH_ORIGINAL_COMMAND="rm -rf /" "$1" --submitter test-lane >/dev/null 2>&1; test $? = 75' _ "$ENTRY"
+check "grammar: shell metacharacters are refused, never run" \
+  bash -c 'SSH_ORIGINAL_COMMAND="status; touch $2/pwned" "$1" --submitter test-lane >/dev/null 2>&1; test ! -e "$2/pwned"' _ "$ENTRY" "$work"
+check "grammar: an option outside the allowlist is refused" \
+  bash -c 'SSH_ORIGINAL_COMMAND="run --profile fake --evil yes" "$1" --submitter test-lane >/dev/null 2>&1; test $? = 75' _ "$ENTRY"
+check "grammar: a value outside its pattern is refused (a non-hex head)" \
+  bash -c 'SSH_ORIGINAL_COMMAND="run --profile fake --head notahash" "$1" --submitter test-lane >/dev/null 2>&1; test $? = 75' _ "$ENTRY"
+check "identity: a forced submitter must look like an identifier" \
+  bash -c 'SSH_ORIGINAL_COMMAND="status" "$1" --submitter "../evil" >/dev/null 2>&1; test $? = 75' _ "$ENTRY"
 
 # the bundle binds the claim: it must carry the repo and branch at the head being gated
 dgit update-ref refs/pneuma-gate/repo/repoA "$C2"

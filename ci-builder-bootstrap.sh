@@ -197,20 +197,6 @@ log "installing base packages"
 apt-get update -qq
 apt-get install -y -qq curl unzip jq git ufw
 
-# ── 1c. sshd: expose the authenticated key to the gate runner ────────────
-# GATE-DEDUP-1 reads the submitter from sshd's own auth record (SSH_USER_AUTH), which
-# sshd writes only with ExposeAuthInfo. The drop-in is validated with `sshd -t` before
-# anything reloads; reload (never restart) keeps the current sessions alive.
-log "exposing the authenticated key to the gate runner (sshd ExposeAuthInfo)"
-printf 'ExposeAuthInfo yes\n' > /etc/ssh/sshd_config.d/50-pneuma-expose-auth.conf
-chmod 0644 /etc/ssh/sshd_config.d/50-pneuma-expose-auth.conf
-if sshd -t 2>/dev/null; then
-    systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || log "sshd reload failed; the drop-in applies at the next reload"
-else
-    rm -f /etc/ssh/sshd_config.d/50-pneuma-expose-auth.conf
-    log "sshd -t rejected the configuration: ExposeAuthInfo not applied"
-fi
-
 # ── 2. Docker ────────────────────────────────────────────────────────────
 if ! command -v docker &>/dev/null; then
     log "installing Docker CE"

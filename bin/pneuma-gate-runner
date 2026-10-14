@@ -145,6 +145,7 @@ cleanup() {
   [ -n "$DEDUP_ID" ] && dedup_remove "$DEDUP_ID"
 }
 refuse() { log "REFUSED: $1"; result 75 "$1"; exit 75; }
+refuse_noid() { echo "pneuma-gate-runner: refused: no submitter identity (only pneuma-gate-entry forces one)" >&2; exit 75; }
 
 # GATE-DEDUP-1. A gate for a repo and branch makes every older gate of that branch unusable.
 # Each run is recorded under a root-only directory with its key (repo/branch, never a SHA
@@ -159,15 +160,6 @@ refuse() { log "REFUSED: $1"; result 75 "$1"; exit 75; }
 DEDUP_DIR="${PNEUMA_GATE_DEDUP_DIR:-/var/lib/pneuma-gate-dedup}"
 PER_SUBMITTER_CAP="${PNEUMA_GATE_PER_SUBMITTER_CAP:-3}"   # live gates one submitter may hold at once (queued + running)
 SYSTEMCTL_BIN="${PNEUMA_GATE_SYSTEMCTL:-systemctl}"
-submitter_principal() {   # prints sha256 of the authenticated key's blob, or nothing
-  local f="${SSH_USER_AUTH:-}" kind keytype blob
-  [ -n "$f" ] && [ -r "$f" ] && [ ! -L "$f" ] || return 0
-  while read -r kind keytype blob _; do
-    [ "$kind" = publickey ] && [ -n "$blob" ] || continue
-    printf '%s' "$blob" | base64 -d 2>/dev/null | sha256sum | cut -c1-64
-    return 0
-  done < "$f"
-}
 dedup_register() {  # <id> <key> <head> <submitter> <unit>
   mkdir -p "$DEDUP_DIR" && chmod 0700 "$DEDUP_DIR" || return 1
   printf 'key=%s\nhead=%s\npid=%s\nsubmitter=%s\nunit=%s\nsuperseded=\n' "$2" "$3" "$$" "$4" "$5" > "$DEDUP_DIR/$1"
@@ -179,6 +171,7 @@ dedup_field() {  # <id> <field>
 }
 dedup_set() { [ -f "$DEDUP_DIR/$1" ] && [ ! -L "$DEDUP_DIR/$1" ] && sed -i "s/^$2=.*/$2=$3/" "$DEDUP_DIR/$1"; }
 dedup_supersede() {  # <id> <store> <key> <head> <submitter>
+  [ -n "$3" ] || return 0                     # no key (a detached run): nothing is superseded
   # Supersede the live runs of THIS key that the SAME submitter sent, when this head is a
   # DESCENDANT of theirs (or the two diverge: a force-push, the newest wins, and it is logged).
   # An older commit never cancels a newer one. Unknown ancestry, or an unknown submitter, cancels nothing.
@@ -235,8 +228,8 @@ dedup_admit() {  # <id> <store> <repo> <branch> <head> <submitter>: 0 recorded, 
     flock 8 || exit 1
     # Fairness: one submitter cannot fill the queue or the slots for the others.
     [ "$(dedup_count_submitter "$6")" -lt "$PER_SUBMITTER_CAP" ] || exit 2
-    dedup_register "$1" "$3/$4" "$5" "$6" "pneuma-gate-$1.service" || exit 1
-    dedup_supersede "$1" "$2" "$3/$4" "$5" "$6"
+    dedup_register "$1" "${4:+$3/$4}" "$5" "$6" "pneuma-gate-$1.service" || exit 1
+    dedup_supersede "$1" "$2" "${4:+$3/$4}" "$5" "$6"
   )
 }
 
@@ -383,17 +376,18 @@ cmd_run() {
   [ "$(as_gate git --git-dir="$store" rev-parse "${head}^{tree}")" = "$tree" ] || refuse "tree mismatch for $head"
 
   DEDUP_ID="$(date +%s%N)-$$"          # also the gate's unit name: pneuma-gate-<id>
-  if [ -n "$branch" ]; then
-    [[ "$branch" =~ ^[A-Za-z0-9._/-]{1,200}$ ]] && [[ "$branch" != *..* ]] || refuse "bad branch name"
-    local submitter; submitter="$(submitter_principal)"
-    log "gate for $repo branch $branch head ${head:0:12} submitter ${submitter:0:12}"
-    dedup_admit "$DEDUP_ID" "$store" "$repo" "$branch" "$head" "$submitter"
-    case $? in
-      0) ;;
-      2) refuse "submitter already holds $PER_SUBMITTER_CAP queued or running gates; wait for them";;
-      *) refuse "cannot record the gate";;
-    esac
+  # Every run is recorded under its submitter (the fairness cap applies to all of them). Only a
+  # run with a branch has a key, and only a key ever supersedes: a detached run supersedes nothing.
+  if [ -n "$branch" ] && ! [[ "$branch" =~ ^[A-Za-z0-9._/-]{1,200}$ ]] || [[ "$branch" == *..* ]]; then
+    refuse "bad branch name"
   fi
+  log "gate for ${repo:-?} branch ${branch:-(detached)} head ${head:0:12} submitter $SUBMITTER"
+  dedup_admit "$DEDUP_ID" "$store" "$repo" "$branch" "$head" "$SUBMITTER"
+  case $? in
+    0) ;;
+    2) refuse "submitter already holds $PER_SUBMITTER_CAP queued or running gates; wait for them";;
+    *) refuse "cannot record the gate";;
+  esac
   admit "$cores" "$mem"
 
   # ── per-run workspace: its own .git, objects via alternates to the store ───
@@ -450,9 +444,13 @@ cmd_run() {
 main() {
   local sub="${1:-}"
   [ $# -gt 0 ] && shift
+  # `--submitter <id>` is placed by pneuma-gate-entry (sshd's forced command), never by a client.
+  SUBMITTER=""
+  if [ "${1:-}" = --submitter ]; then SUBMITTER="${2:-}"; shift 2; fi
   case "$sub" in
     have) cmd_have "$@";;
-    run) cmd_run "$@"; exit $?;;
+    # every verb below requires an identity; there is no shared or empty submitter bucket
+    run) [[ "$SUBMITTER" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] || refuse_noid; cmd_run "$@"; exit $?;;
     status) cmd_status;;
     janitor) cmd_janitor;;
     *) echo "usage: pneuma-gate-runner {have|run|status|janitor}" >&2; exit 2;;

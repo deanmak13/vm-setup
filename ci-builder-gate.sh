@@ -35,6 +35,20 @@ if [ "$do_host" = 1 ]; then
   actual="$(ssh -o BatchMode=yes "$HOST" hostname)"
   [ "$actual" = "$APPROVED_HOST" ] || { echo "refusing: $HOST is '$actual', not the approved builder $APPROVED_HOST" >&2; exit 1; }
   # [host-only-begin]
+  # The submission entry point and its forced-command keys (GATE-DEDUP-1 identity): the
+  # submitter is the id the key line forces, never something the client sends.
+  rsync -a "$REPO_DIR/bin/pneuma-gate-entry" "$HOST:/usr/local/bin/pneuma-gate-entry"
+  rsync -a "$REPO_DIR/gate-submit-keys" "$HOST:/tmp/pneuma-gate-submit-keys"
+  ssh "$HOST" 'set -euo pipefail
+    chmod 0755 /usr/local/bin/pneuma-gate-entry
+    id pneuma-submit >/dev/null 2>&1 || useradd --system --create-home --home-dir /var/lib/pneuma-submit --shell /bin/bash pneuma-submit
+    install -d -o pneuma-submit -g pneuma-submit -m 0700 /var/lib/pneuma-submit/.ssh
+    grep -v "^#" /tmp/pneuma-gate-submit-keys | while read -r id type key; do
+      printf "command=\"/usr/local/bin/pneuma-gate-entry --submitter %s\",no-port-forwarding,no-agent-forwarding,no-pty,no-user-rc %s %s\n" "$id" "$type" "$key"
+    done > /var/lib/pneuma-submit/.ssh/authorized_keys
+    chown pneuma-submit:pneuma-submit /var/lib/pneuma-submit/.ssh/authorized_keys
+    chmod 0600 /var/lib/pneuma-submit/.ssh/authorized_keys
+    rm -f /tmp/pneuma-gate-submit-keys'
   ssh "$HOST" 'mkdir -p /usr/local/lib/pneuma-gate/profiles'
   rsync -a --delete "$REPO_DIR/gate-profiles/" "$HOST:/usr/local/lib/pneuma-gate/profiles/"
   rsync -a "$REPO_DIR/bin/pneuma-gate-runner" "$HOST:/usr/local/bin/pneuma-gate-runner"
