@@ -7,10 +7,12 @@
 #   bash ci-builder-gate.sh --client-only
 #   bash ci-builder-gate.sh --host-only --stage submit-path   # account, entry, sudoers, keys, from.conf; NOT the runner
 #   bash ci-builder-gate.sh --host-only --stage runner        # runner, profiles, janitor; NOT the submit path
+#   bash ci-builder-gate.sh --local-host --acceptance   # provision THIS machine (a VM/container for the acceptance test; root)
 #   PNEUMA_GATE_HOST=other bash ci-builder-gate.sh
 #
-# Touches ONLY: /usr/local/bin/pneuma-gate-runner, /usr/local/lib/pneuma-gate/,
-# /var/lib/pneuma-gate/, the unprivileged `pneuma-gate` user and one cron file.
+# Touches ONLY: /usr/local/bin/pneuma-gate-runner, /usr/local/lib/pneuma-gate/, /var/lib/pneuma-gate/,
+# /var/lib/pneuma-gate-state/, the unprivileged `pneuma-gate` user (it owns the object store only; every gate
+# itself runs as a per-run systemd DynamicUser) and the janitor and guard cron files.
 # It never restarts k3s, the GitHub runner services, or the VPN. Refuses to
 # mutate any host whose hostname is not the approved builder.
 set -euo pipefail
@@ -19,12 +21,14 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HOST="${PNEUMA_GATE_HOST:-ci-builder}"
 APPROVED_HOST="${PNEUMA_GATE_EXPECT_HOST:-vmi3387590}"
 CLIENT_DEST="${PNEUMA_GATE_CLIENT_DEST:-$HOME/.local/bin}"
-do_host=1; do_client=1; stage=all
+do_host=1; do_client=1; stage=all; stage_given=0; local_host=0; acceptance=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --host-only) do_client=0; shift;;
     --client-only) do_host=0; shift;;
-    --stage) stage="${2:-}"; shift 2;;
+    --stage) stage="${2:-}"; stage_given=1; shift 2;;
+    --local-host) do_client=0; local_host=1; shift;;
+    --acceptance) acceptance=1; shift;;
     *) echo "unknown argument $1" >&2; exit 2;;
   esac
 done
@@ -39,6 +43,17 @@ case "$stage" in
   *) echo "unknown stage '$stage' (use submit-path, runner or all)" >&2; exit 2;;
 esac
 
+# --local-host provisions THIS machine without the approved-host check the ssh path makes. It exists for the
+# acceptance test only, so it needs the explicit --acceptance flag, and it refuses on the approved builder
+# itself: a real host is provisioned over ssh. It installs the RUNNER side only (it has no sshd or key list),
+# so it cannot be combined with --stage, which selects between the submit path and the runner.
+if [ "$local_host" = 1 ]; then
+  [ "$acceptance" = 1 ] || { echo "refusing: --local-host is for the acceptance test only (add --acceptance); a real host is provisioned over ssh" >&2; exit 2; }
+  [ "$stage_given" = 0 ] || { echo "refusing: --stage cannot be combined with --local-host (it installs the runner side only)" >&2; exit 2; }
+  [ "$(hostname)" != "$APPROVED_HOST" ] || { echo "refusing: this IS the approved builder ($APPROVED_HOST); --local-host --acceptance never runs on a real host" >&2; exit 2; }
+fi
+if [ "$acceptance" = 1 ] && [ "$local_host" != 1 ]; then echo "refusing: --acceptance only goes with --local-host" >&2; exit 2; fi
+
 if [ "$do_client" = 1 ]; then
   mkdir -p "$CLIENT_DEST"
   # atomic: a temp file in the destination dir, then a rename (never a partially written client)
@@ -48,7 +63,16 @@ if [ "$do_client" = 1 ]; then
   printf 'client: %s/pneuma-remote-gate\n' "$CLIENT_DEST"
 fi
 
-if [ "$do_host" = 1 ]; then
+if [ "$do_host" = 1 ] && [ "$local_host" = 1 ]; then
+  # [host-only-begin]
+  STAGE="$(set -euo pipefail; install -d -o root -g root -m 0700 /var/lib/pneuma-gate-install && mktemp -d /var/lib/pneuma-gate-install/stage.XXXXXX)"
+  [[ "$STAGE" =~ ^/var/lib/pneuma-gate-install/stage\.[A-Za-z0-9]{6}$ ]] || { echo "refusing: unexpected staging path '$STAGE'" >&2; exit 1; }
+  trap 'rm -rf -- "$STAGE"' EXIT
+  install -m 0755 "$REPO_DIR/bin/pneuma-gate-runner" "$STAGE/pneuma-gate-runner"
+  mkdir "$STAGE/profiles" && cp -a "$REPO_DIR/gate-profiles/." "$STAGE/profiles/"
+  bash "$REPO_DIR/ci-builder-gate-host.sh" "$STAGE"
+  # [host-only-end]
+elif [ "$do_host" = 1 ]; then
   actual="$(ssh -o BatchMode=yes "$HOST" hostname)"
   [ "$actual" = "$APPROVED_HOST" ] || { echo "refusing: $HOST is '$actual', not the approved builder $APPROVED_HOST" >&2; exit 1; }
   # [host-only-begin]
@@ -78,65 +102,8 @@ if [ "$do_host" = 1 ]; then
   fi
 
   if [ "$do_runner" = 1 ]; then
-  ssh "$HOST" "bash -s -- '$STAGE'" <<'REMOTE'
-set -euo pipefail
-STAGE="$1"
-[[ "$STAGE" =~ ^/var/lib/pneuma-gate-install/stage\.[A-Za-z0-9]{6}$ ]] || { echo "refusing: bad stage $STAGE" >&2; exit 1; }
-id pneuma-gate >/dev/null 2>&1 || useradd --system --home-dir /var/lib/pneuma-gate --shell /usr/sbin/nologin pneuma-gate
-install -d -o pneuma-gate -g pneuma-gate -m 0755 /var/lib/pneuma-gate
-# They run as root (the runner sources the profiles as root): root owns everything, dirs 0755, files 0644,
-# set in the root-owned staging copy BEFORE anything reaches the live path.
-chown -R root:root "$STAGE/profiles"
-find "$STAGE/profiles" -type d -exec chmod 0755 {} +
-find "$STAGE/profiles" -type f -exec chmod 0644 {} +
-install -d -o root -g root -m 0755 /usr/local/lib/pneuma-gate
-# Profiles: one versioned directory per install under profiles.d/, and a live SYMLINK at profiles that is moved
-# by a single rename(2). The new tree is complete before the link moves, so the live path is never absent or
-# partial; a failed swap leaves the previous link live and says so. The runner reads through the link.
-ROOT=/usr/local/lib/pneuma-gate
-PROFILES="$ROOT/profiles"
-install -d -o root -g root -m 0755 "$ROOT" "$ROOT/profiles.d"
-if [ -d "$PROFILES" ] && [ ! -L "$PROFILES" ]; then
-  # one-time migration from the old real directory: kept as profiles.d/legacy, not deleted
-  mv -T -- "$PROFILES" "$ROOT/profiles.d/legacy"
-fi
-prev="$(readlink "$PROFILES" 2>/dev/null || true)"
-ver="$(mktemp -d "$ROOT/profiles.d/v.XXXXXX")"
-if ! rsync -a "$STAGE/profiles/" "$ver/"; then
-  rm -rf -- "$ver"
-  echo "refused: profiles copy failed; the live profiles are unchanged" >&2
-  exit 1
-fi
-new_link="$(mktemp -u "$ROOT/.profiles-link.XXXXXX")"
-ln -s -- "profiles.d/$(basename "$ver")" "$new_link"
-if ! mv -T -- "$new_link" "$PROFILES"; then
-  rm -f -- "$new_link"
-  rm -rf -- "$ver"
-  echo "refused: profiles swap failed; the previous profiles remain live (no change)" >&2
-  exit 1
-fi
-# keep the new version and the one before it (a hand rollback target); prune the rest, never legacy
-keep_new="$(basename "$ver")"
-keep_prev="$(basename "${prev:-none}")"
-for d in "$ROOT"/profiles.d/*; do
-  case "$(basename "$d")" in
-    "$keep_new"|"$keep_prev"|legacy) continue;;
-  esac
-  rm -rf -- "$d"
-done
-# The runner: atomic replace, mktemp beside the target.
-runner_tmp="$(mktemp /usr/local/bin/.pneuma-gate-runner.XXXXXX)"
-install -o root -g root -m 0755 "$STAGE/pneuma-gate-runner" "$runner_tmp"
-mv -f -- "$runner_tmp" /usr/local/bin/pneuma-gate-runner
-# Janitor: reap dead runs / stale keep-refs even when no gate is starting. Atomic; the dot-named temp file
-# is ignored by cron.d while it exists.
-cron_tmp="$(mktemp /etc/cron.d/.pneuma-gate-janitor.XXXXXX)"
-printf '*/30 * * * * root /usr/local/bin/pneuma-gate-runner janitor >/dev/null 2>&1\n' > "$cron_tmp"
-chown root:root "$cron_tmp"
-chmod 0644 "$cron_tmp"
-mv -f -- "$cron_tmp" /etc/cron.d/pneuma-gate-janitor
-/usr/local/bin/pneuma-gate-runner status
-REMOTE
+  # The root-side step (users, directories, the versioned profiles swap, the runner, the crons): ci-builder-gate-host.sh, on stdin.
+  ssh "$HOST" "bash -s -- '$STAGE'" < "$REPO_DIR/ci-builder-gate-host.sh"
   fi
   # [host-only-end]
 fi

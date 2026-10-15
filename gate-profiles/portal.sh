@@ -5,9 +5,8 @@
 # The gate is the portal's real .githooks/pre-push from the commit under test.
 # Its dependencies are one immutable environment per package-lock.json: a node
 # toolchain, every node_modules tree produced by `npm ci`, and diff-cover in a
-# venv. Each run hard-links those trees into its own checkout (no copy cost, no
-# shared writable state: the cache is read-only, so an in-place write fails
-# loudly instead of corrupting the next run).
+# venv. Each run copies those trees into its own checkout (the cache is a read-only
+# mount, so nothing is linked and nothing shared is writable).
 
 PORTAL_NODE_VERSION="${PNEUMA_GATE_PORTAL_NODE:-22.23.3}"   # ci.yml pins major 22
 PORTAL_ENV_SCHEMA=1
@@ -44,7 +43,7 @@ profile_gate() {
   local envdir="$1" head="$2" base="$3" timeout_s="$4" nm
   while IFS= read -r nm; do
     nm="${nm#"$envdir/trees/"}"
-    mkdir -p "$(dirname "$nm")" && cp -al "$envdir/trees/$nm" "$nm" || return 1
+    mkdir -p "$(dirname "$nm")" && cp -a "$envdir/trees/$nm" "$nm" || return 1
   done < <(find "$envdir/trees" -name node_modules -type d -prune)
   printf '[user]\n\tname = pneuma-gate\n\temail = gate@localhost\n' > "$HOME/.gitconfig"
   printf 'refs/heads/gate %s refs/heads/gate %s\n' "$head" "$base" |
