@@ -6,7 +6,7 @@
 # A throwaway container (--rm, no published ports) runs the real sudo as pneuma-submit against a runner
 # stand-in that exits 0 and is only reached when sudo allows the call.
 #
-# Matrix: the three verbs with their arguments must be ALLOWED; janitor, warm-env, unit, a bare run, a bare
+# Matrix: the four verbs with their arguments must be ALLOWED; janitor, warm-env, unit, a bare run, a bare
 # status, a bare have, the bare runner path with no verb, and /bin/cat must be REFUSED.
 # Mutation proof: the rule is then widened to the bare runner path, and the matrix must report violations.
 # A widened rule that the matrix does NOT flag would make this test a pass for a broken rule, so the test
@@ -51,6 +51,7 @@ ALLOW=(
   "status --submitter dean-devbox"
   "have --submitter dean-devbox"
   "run --submitter dean-devbox"
+  "cancel --submitter dean-devbox --repo fakerepo --head 0123456789abcdef0123456789abcdef01234567"
 )
 REFUSE=(
   "janitor"
@@ -60,6 +61,7 @@ REFUSE=(
   "run"
   "status"
   "have"
+  "cancel"
   "__BARE_RUNNER__"
 )
 

@@ -470,4 +470,83 @@ check "bundle: it binds from ANY working directory, even one with a broken workt
 check "bundle: a claimed head the bundle does not carry does NOT bind" \
   bash -c '! bash -c "source \"$1\"; bundle_binds \"$2\" repoA main \"$3\"" _ "$RUNNER" "$work/bind.bundle" "$C3"'
 
+# ── GATE-QUEUE-1: detached jobs, re-attach, cancel, a queue that never expires ─────────────
+# Helpers run the runner's own functions (sourced), as the dedup tests above do.
+lj() { bash -c 'source "$1"; live_job_for "$2" "$3" "$4"' _ "$RUNNER" "$@"; }
+as_sub() {   # as_sub <submitter> <cancel args...>: the runner's cmd_cancel, as that submitter
+  local who="$1"; shift
+  bash -c 'source "$1"; SUBMITTER="$2"; shift 2; cmd_cancel "$@"' _ "$RUNNER" "$who" "$@"
+}
+rm -rf "$PNEUMA_GATE_DEDUP_DIR"; mkdir -p "$PNEUMA_GATE_DEDUP_DIR"
+rec2 job-a "repoA/main" "$C2" "$SUB_A"
+check "attach: a live job for the same repo, head and submitter is found" \
+  bash -c 'test "$1" = job-a' _ "$(lj repoA "$C2" "$SUB_A")"
+check "attach: another submitter's live job for the same head is NOT attached to" \
+  bash -c 'test -z "$1"' _ "$(lj repoA "$C2" "$SUB_B")"
+check "attach: the same repo at another head is NOT attached to" \
+  bash -c 'test -z "$1"' _ "$(lj repoA "$C3" "$SUB_A")"
+check "attach: a different repo with the same head is NOT attached to" \
+  bash -c 'test -z "$1"' _ "$(lj otherrepo "$C2" "$SUB_A")"
+sed -i 's/^superseded=$/superseded=newer/' "$PNEUMA_GATE_DEDUP_DIR/job-a"
+check "attach: a superseded job is never attached to" \
+  bash -c 'test -z "$1"' _ "$(lj repoA "$C2" "$SUB_A")"
+
+# cancel: only the caller's own live jobs for that repo and head; the unit is stopped
+rm -rf "$PNEUMA_GATE_DEDUP_DIR"; mkdir -p "$PNEUMA_GATE_DEDUP_DIR"; : > "$WORK_STOPS"
+rec2 job-c "repoA/main" "$C2" "$SUB_A"
+as_sub "$SUB_B" --repo repoA --head "$C2" >/dev/null 2>&1
+check "cancel: another submitter cannot cancel this job" \
+  grep -qx "superseded=" "$PNEUMA_GATE_DEDUP_DIR/job-c"
+as_sub "$SUB_A" --repo repoA --head "$C2" >/dev/null 2>&1
+check "cancel: the submitter cancels its own job (superseded=cancelled-by-submitter)" \
+  grep -qx "superseded=cancelled-by-submitter" "$PNEUMA_GATE_DEDUP_DIR/job-c"
+check "cancel: the job's unit is stopped by name" \
+  grep -qx "stop pneuma-gate-job-c.service" "$WORK_STOPS"
+check "cancel: a malformed head is refused" \
+  bash -c 'source "$1"; SUBMITTER=x; ! cmd_cancel --repo repoA --head nope >/dev/null 2>&1' _ "$RUNNER"
+check "grammar: cancel is accepted with --repo and --head" \
+  bash -c 'SSH_ORIGINAL_COMMAND="cancel --repo fakerepo --head $2" PNEUMA_GATE_RUNNER_BIN="$3" "$1" --submitter test-lane >/dev/null 2>&1; grep -q "^cancel --submitter test-lane --repo fakerepo --head $2$" "$4"' _ "$ENTRY" "$head" "$work/bin/argv-recorder" "$ARGV_RECORD"
+
+# a newer head on the same branch auto-cancels the QUEUED older job; the queued job then refuses at admission
+rm -rf "$PNEUMA_GATE_DEDUP_DIR"; mkdir -p "$PNEUMA_GATE_DEDUP_DIR"
+rec2 job-q "repoA/main" "$C2" "$SUB_A"
+ddo dedup_admit job-new "$dstore" repoA main "$C3" "$SUB_A" >/dev/null 2>&1
+check "newer head: the older QUEUED job is superseded by the descendant head" \
+  grep -qx "superseded=$C3" "$PNEUMA_GATE_DEDUP_DIR/job-q"
+printf 'MemAvailable: 90000000 kB\n' > "$work/qmeminfo"; printf '0.10 0.10 0.10 1/100 1\n' > "$work/qloadavg"
+qadmit_rc=0
+qadmit_out="$(env PNEUMA_GATE_BASE="$work/qbase" PNEUMA_GATE_NPROC=64 PNEUMA_GATE_RESERVE_MEM_MB=0 PNEUMA_GATE_MEMINFO="$work/qmeminfo" \
+  PNEUMA_GATE_LOADAVG="$work/qloadavg" bash -c 'source "$1"; DEDUP_ID=job-q; mkdir -p "$PNEUMA_GATE_BASE/queue" "$PNEUMA_GATE_BASE/runs"; admit 1 100' _ "$RUNNER" 2>&1)" || qadmit_rc=$?
+check "newer head: the superseded QUEUED job refuses at admission (exit 75, names the superseder)" \
+  bash -c 'test "$1" = 75 && grep -q "superseded by" <<<"$2"' _ "$qadmit_rc" "$qadmit_out"
+
+# the queue never expires: with NO capacity and the old 2s timeout set, the wait outlives it
+rm -rf "$work/qbase"; mkdir -p "$work/qbase/queue" "$work/qbase/runs"
+env PNEUMA_GATE_BASE="$work/qbase" PNEUMA_GATE_MAX_CONCURRENT=0 PNEUMA_GATE_QUEUE_TIMEOUT_S=2 PNEUMA_GATE_POLL_S=1 \
+  bash -c 'source "$1"; admit 1 100' _ "$RUNNER" >/dev/null 2>&1 &
+qwait=$!
+sleep 6
+if kill -0 "$qwait" 2>/dev/null; then qalive=yes; else qalive=no; fi
+kill "$qwait" 2>/dev/null || true; wait "$qwait" 2>/dev/null || true
+expect_eq "queue: a waiting gate is still queued after the old 2s timeout (it never expires)" yes "$qalive"
+
+# a detached job outlives its connection: the client is killed mid-gate; a same-head submission re-attaches
+rm -rf "$PNEUMA_GATE_DEDUP_DIR" "$PNEUMA_GATE_BASE/jobs"; mkdir -p "$PNEUMA_GATE_DEDUP_DIR"
+echo 6 > "$work/profiles/sleep"
+# the client's stream is a PIPE: killing its reader is a dropped connection (the job's next write hits a broken pipe)
+"$RUNNER" run --submitter test-lane --profile fake --repo fakerepo --head "$head" --base "$base" --tree "$tree" --branch main 2>&1 | exec cat > "$work/dropA.out" &
+dropA=$!
+for _ in $(seq 1 30); do ls "$PNEUMA_GATE_DEDUP_DIR"/* >/dev/null 2>&1 && break; sleep 1; done
+# kill the reader only, and do not wait: the runner exits by itself at its next write, the job does not
+kill -9 "$dropA" 2>/dev/null || true
+"$RUNNER" run --submitter test-lane --profile fake --repo fakerepo --head "$head" --base "$base" --tree "$tree" --branch main > "$work/attachB.out" 2>&1; rcB=$?
+rm -f "$work/profiles/sleep"
+check "detached: the job survives its connection being killed (the re-attach gets a green verdict)" \
+  bash -c 'test "$1" = 0' _ "$rcB"
+check "detached: the re-submission attached to the live job instead of queueing again" \
+  grep -q "attached to live job" "$work/attachB.out"
+check "detached: the attached client receives the verdict line" \
+  grep -q "^PNEUMA_GATE_RESULT .*exit=0" "$work/attachB.out"
+expect_eq "detached: exactly one job ran for the two submissions" 1 "$(find "$PNEUMA_GATE_BASE/jobs" -mindepth 1 -maxdepth 1 | wc -l)"
+
 exit "$fail"

@@ -9,6 +9,7 @@
 #   pneuma-gate-runner run    --profile P --repo R --head SHA --base SHA --tree T
 #                             [--bundle]            (bundle on stdin; log on stdout)
 #   pneuma-gate-runner status                       capacity / disk / live runs
+#   pneuma-gate-runner cancel --repo R --head SHA   cancel THIS submitter's jobs for that repo and head
 #   pneuma-gate-runner janitor                      reap dead runs + stale keep-refs
 #
 # Verdict contract: the LAST stdout line of `run` is
@@ -30,7 +31,6 @@ MIN_FREE_GIB="${PNEUMA_GATE_MIN_FREE_GIB:-40}"          # absolute free-space fl
 RESERVE_CORES="${PNEUMA_GATE_RESERVE_CORES:-3}"       # left for runners + k3s
 RESERVE_MEM_MB="${PNEUMA_GATE_RESERVE_MEM_MB:-6144}"
 MAX_CONCURRENT="${PNEUMA_GATE_MAX_CONCURRENT:-4}"
-QUEUE_TIMEOUT_S="${PNEUMA_GATE_QUEUE_TIMEOUT_S:-10800}"
 GATE_TIMEOUT_S="${PNEUMA_GATE_TIMEOUT_S:-5400}"
 LOAD_CEILING_PCT="${PNEUMA_GATE_LOAD_CEILING_PCT:-150}" # % of nproc; only blocks stacking a 2nd gate
 POLL_S="${PNEUMA_GATE_POLL_S:-5}"
@@ -101,6 +101,12 @@ cmd_have() {
 }
 
 # ── janitor ──────────────────────────────────────────────────────────────────
+live_job_for_dir() {  # <id>: prints the id when its dedup record names a live pid or unit
+  local id="$1" pid unit
+  [ -f "$DEDUP_DIR/$id" ] || return 0
+  pid="$(dedup_field "$id" pid)"; unit="$(dedup_field "$id" unit)"
+  if kill -0 "$pid" 2>/dev/null || "$SYSTEMCTL_BIN" is-active --quiet "$unit" 2>/dev/null; then echo "$id"; fi
+}
 cmd_janitor() {
   local d pid store ref ts f
   for d in "$BASE_DIR"/runs/*/; do
@@ -115,6 +121,12 @@ cmd_janitor() {
     case "$(basename "$f")" in in-*) [ -n "$(find "$f" -mmin +120 2>/dev/null)" ] && rm -f "$f"; continue;; esac
     pid="${f##*-}"; kill -0 "$pid" 2>/dev/null || rm -f "$f"
   done
+  # job logs older than a week, unless their job is still live
+  if [ -d "$JOBS_DIR" ]; then
+    find "$JOBS_DIR" -mindepth 1 -maxdepth 1 -mtime +7 2>/dev/null | while read -r j; do
+      [ -n "$(live_job_for_dir "$(basename "$j")")" ] || rm -rf -- "$j"
+    done
+  fi
   # keep-refs older than 2 days no longer pin their objects
   for store in "$BASE_DIR"/repos/*.git; do
     [ -d "$store" ] || continue
@@ -134,6 +146,7 @@ cmd_status() {
 
 # ── run ──────────────────────────────────────────────────────────────────────
 RUN_DIR=""; QUEUE_FILE=""; START_TS=0
+DEDUP_ID=""; JOB_ID=""; WORKER_PID=""   # set by cmd_run / run_job; empty until then (the EXIT trap reads them)
 R_REPO=""; R_HEAD=""; R_TREE=""; R_PROFILE=""
 result() {   # result <exit> [reason]
   printf 'PNEUMA_GATE_RESULT repo=%s head=%s tree=%s profile=%s exit=%s elapsed=%ss host=%s%s\n' \
@@ -162,7 +175,7 @@ PER_SUBMITTER_CAP="${PNEUMA_GATE_PER_SUBMITTER_CAP:-3}"   # live gates one submi
 SYSTEMCTL_BIN="${PNEUMA_GATE_SYSTEMCTL:-systemctl}"
 dedup_register() {  # <id> <key> <head> <submitter> <unit>
   mkdir -p "$DEDUP_DIR" && chmod 0700 "$DEDUP_DIR" || return 1
-  printf 'key=%s\nhead=%s\npid=%s\nsubmitter=%s\nunit=%s\nsuperseded=\n' "$2" "$3" "$$" "$4" "$5" > "$DEDUP_DIR/$1"
+  printf 'key=%s\nhead=%s\npid=%s\nsubmitter=%s\nunit=%s\nsuperseded=\n' "$2" "$3" "${WORKER_PID:-$$}" "$4" "$5" > "$DEDUP_DIR/$1"
 }
 dedup_field() {  # <id> <field>
   local f="$DEDUP_DIR/$1"
@@ -277,7 +290,6 @@ admit() {   # admit <cores> <mem_mb> — block until admitted; creates RUN_DIR
     if [ $((waited % 60)) -eq 0 ]; then
       log "queued: $(live_runs | wc -l) running, no capacity (nproc=$NPROC reserve=$RESERVE_CORES mem_avail=$(mem_available_mb)MB load1=$(awk '{print $1}' "$LOADAVG")) waited ${waited}s"
     fi
-    [ "$waited" -ge "$QUEUE_TIMEOUT_S" ] && refuse "queue timeout after ${waited}s"
     sleep "$POLL_S"; waited=$((waited + POLL_S))
   done
 }
@@ -313,6 +325,61 @@ ensure_env() {   # ensure_env <profile> <work> → sets ENV_DIR (immutable share
   log "environment $profile/$key ready (read-only shared cache)"
 }
 
+# ── GATE-QUEUE-1: a job outlives its connection; a same-head submission re-attaches ─────────
+# A job is a detached worker writing to its own log under jobs/<id>/. The connection only TAILS that log, so
+# a dropped ssh loses the stream, never the job or its verdict. A submission for a repo and head that already
+# has a LIVE job from the SAME submitter follows that job instead of queueing again. Queued jobs never expire:
+# they wait until capacity admits them, or until a newer head or the submitter's own cancel supersedes them.
+JOBS_DIR="$BASE_DIR/jobs"
+live_job_for() {  # <repo> <head> <submitter>: id of a live, unsuperseded job for this repo, head and submitter
+  local f id
+  for f in "$DEDUP_DIR"/*; do
+    [ -f "$f" ] && [ ! -L "$f" ] || continue
+    id="$(basename "$f")"
+    [[ "$(dedup_field "$id" key)" == "$1/"* ]] || continue
+    [ "$(dedup_field "$id" head)" = "$2" ] || continue
+    [ "$(dedup_field "$id" submitter)" = "$3" ] || continue
+    [ -z "$(dedup_field "$id" superseded)" ] || continue
+    if kill -0 "$(dedup_field "$id" pid)" 2>/dev/null || "$SYSTEMCTL_BIN" is-active --quiet "$(dedup_field "$id" unit)" 2>/dev/null; then
+      echo "$id"; return 0
+    fi
+  done
+  return 0
+}
+follow_job() {  # <worker pid> <log>: stream the job's log until the job ends; the job keeps running if this drops
+  tail -n +1 -f --pid="$1" "$2" 2>/dev/null || true
+}
+job_exit() {  # <log>: the exit of the last verdict in a job log (75 when it has none: never green)
+  local m; m="$(grep '^PNEUMA_GATE_RESULT ' "$1" 2>/dev/null | tail -1)"
+  [ -n "$m" ] || { echo 75; return 0; }
+  sed -n 's/.* exit=\([0-9]*\).*/\1/p' <<<"$m" | head -1
+}
+cmd_cancel() {  # --repo R --head SHA: cancel THIS submitter's live jobs for that repo and head
+  local repo="" head="" n=0
+  while [ $# -gt 0 ]; do
+    case "$1" in --repo) repo="$2"; shift 2;; --head) head="$2"; shift 2;; *) echo "unknown arg $1" >&2; return 2;; esac
+  done
+  safe_name "$repo" && [[ "$head" =~ ^[0-9a-f]{40}$ ]] || { echo "refused: cancel needs --repo and a 40-hex --head" >&2; return 2; }
+  mkdir -p "$DEDUP_DIR" && chmod 0700 "$DEDUP_DIR" || return 1
+  (
+    exec 8>"$DEDUP_DIR/.lock"; flock 8 || exit 1
+    local f id unit
+    for f in "$DEDUP_DIR"/*; do
+      [ -f "$f" ] && [ ! -L "$f" ] || continue
+      id="$(basename "$f")"
+      [[ "$(dedup_field "$id" key)" == "$repo/"* ]] || continue
+      [ "$(dedup_field "$id" head)" = "$head" ] || continue
+      [ "$(dedup_field "$id" submitter)" = "$SUBMITTER" ] || continue     # only the caller's own jobs
+      [ -z "$(dedup_field "$id" superseded)" ] || continue
+      dedup_set "$id" superseded "cancelled-by-submitter"
+      unit="$(dedup_field "$id" unit)"
+      if [ -n "$unit" ]; then "$SYSTEMCTL_BIN" stop "$unit" >/dev/null 2>&1 || true; fi
+      n=$((n + 1))
+    done
+    echo "cancelled $n job(s) for $repo ${head:0:12}"
+  )
+}
+
 cmd_run() {
   local profile="" repo="" head="" base="" tree="" bundle=0 shallow="" origin_main="" branch="" fwd_env=()
   while [ $# -gt 0 ]; do
@@ -335,6 +402,14 @@ cmd_run() {
   [[ "$head" =~ ^[0-9a-f]{40}$ && "$base" =~ ^[0-9a-f]{40}$ && "$tree" =~ ^[0-9a-f]{40}$ ]] || refuse "head/base/tree must be 40-hex"
   check_host || refuse "host $(hostname) is not the approved builder ($EXPECT_HOST)"
   [ -r "$PROFILE_DIR/$profile.sh" ] || refuse "no gate profile '$profile' in $PROFILE_DIR"
+  # GATE-QUEUE-1: the same repo, head and submitter already has a live job: follow it, never queue twice
+  local live_id; live_id="$(live_job_for "$repo" "$head" "$SUBMITTER")"
+  if [ -n "$live_id" ]; then
+    [ "$bundle" = 1 ] && cat >/dev/null          # the live job already holds this head
+    log "attached to live job $live_id (same submitter, repo and head): following it, not queued again"
+    follow_job "$(dedup_field "$live_id" pid)" "$JOBS_DIR/$live_id/log"
+    return "$(job_exit "$JOBS_DIR/$live_id/log")"
+  fi
   mkdir -p "$BASE_DIR/runs" "$BASE_DIR/repos" "$BASE_DIR/envs" "$BASE_DIR/wheels" "$BASE_DIR/queue" 2>/dev/null \
     || refuse "cannot create $BASE_DIR"
   if [ -n "$RUN_AS" ]; then chown "$RUN_AS" "$BASE_DIR" "$BASE_DIR"/repos "$BASE_DIR"/envs "$BASE_DIR"/queue 2>/dev/null; fi
@@ -375,7 +450,22 @@ cmd_run() {
   done
   [ "$(as_gate git --git-dir="$store" rev-parse "${head}^{tree}")" = "$tree" ] || refuse "tree mismatch for $head"
 
-  DEDUP_ID="$(date +%s%N)-$$"          # also the gate's unit name: pneuma-gate-<id>
+  # the job runs DETACHED: its output goes to its own log and this connection only tails it
+  JOB_ID="$(date +%s%N)-$$"
+  mkdir -p "$JOBS_DIR/$JOB_ID" && chmod 0755 "$JOBS_DIR/$JOB_ID" || refuse "cannot create the job directory"
+  local job_log="$JOBS_DIR/$JOB_ID/log"; : > "$job_log"
+  ( run_job ) >>"$job_log" 2>&1 </dev/null &
+  local worker=$!
+  log "job $JOB_ID is running detached: a dropped connection no longer loses it"
+  follow_job "$worker" "$job_log"
+  wait "$worker"; return $?
+
+}
+
+run_job() {   # the detached worker: admission, workspace, the gate, the verdict (its stdout is its log)
+  WORKER_PID="$BASHPID"; DEDUP_ID="$JOB_ID"
+  trap cleanup EXIT
+  # the gate's unit is named after the job: pneuma-gate-<JOB_ID>
   # Every run is recorded under its submitter (the fairness cap applies to all of them). Only a
   # run with a branch has a key, and only a key ever supersedes: a detached run supersedes nothing.
   if [ -n "$branch" ] && ! [[ "$branch" =~ ^[A-Za-z0-9._/-]{1,200}$ ]] || [[ "$branch" == *..* ]]; then
@@ -456,9 +546,10 @@ main() {
     have) cmd_have "$@";;
     # every verb below requires an identity; there is no shared or empty submitter bucket
     run) [[ "$SUBMITTER" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] || refuse_noid; cmd_run "$@"; exit $?;;
+    cancel) [[ "$SUBMITTER" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] || refuse_noid; cmd_cancel "$@"; exit $?;;
     status) cmd_status;;
     janitor) cmd_janitor;;
-    *) echo "usage: pneuma-gate-runner {have|run|status|janitor}" >&2; exit 2;;
+    *) echo "usage: pneuma-gate-runner {have|run|cancel|status|janitor}" >&2; exit 2;;
   esac
 }
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then main "$@"; fi
