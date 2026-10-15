@@ -113,6 +113,7 @@ export SUDO_RECORD="$work/sudo-recorded.txt" PNEUMA_GATE_SUDO="$work/bin/sudo-st
 export ARGV_RECORD="$work/argv-recorded.txt"
 export PATH="$work/bin:$PATH" PNEUMA_GATE_RUNNER="$work/bin/gate-as-forced-command" PNEUMA_GATE_RUNNER_BIN="$RUNNER" PNEUMA_GATE_HOST=fakehost
 export PNEUMA_GATE_DEDUP_DIR="$work/dedup"   # GATE-DEDUP-1 state: never under /var/lib in tests
+export PNEUMA_GATE_RESULTS_DIR="$work/results"   # the root-owned verdict files: never under /var/lib in tests
 # the gate runs as a unit: stand-ins for systemd-run (runs the command inline) and systemctl
 cat > "$work/bin/systemd-run-stub" <<'STUB'
 #!/usr/bin/env bash
@@ -318,7 +319,8 @@ export PNEUMA_GATE_NPROC=8 PNEUMA_GATE_RESERVE_CORES=3 PNEUMA_GATE_RESERVE_MEM_M
 printf 'MemAvailable: %d kB\n' $((64 * 1024 * 1024)) > "$mem"; printf '0.1 1 1 1/1 1\n' > "$load"
 export PNEUMA_GATE_MEMINFO="$mem" PNEUMA_GATE_LOADAVG="$load"
 for i in 1 2 3; do
-  ( "$RUNNER" run --submitter test-lane --profile fake --repo fakerepo --head "$head" --base "$base" --tree "$tree" > "$work/c$i.out" 2>&1; echo $? > "$work/c$i.rc" ) &
+  # distinct submitters: three identical scopes would (correctly) attach to ONE job, and this test wants three runs
+  ( "$RUNNER" run --submitter "conc-$i" --profile fake --repo fakerepo --head "$head" --base "$base" --tree "$tree" > "$work/c$i.out" 2>&1; echo $? > "$work/c$i.rc" ) &
   sleep 1
 done
 sleep 3
@@ -472,24 +474,48 @@ check "bundle: a claimed head the bundle does not carry does NOT bind" \
 
 # ── GATE-QUEUE-1: detached jobs, re-attach, cancel, a queue that never expires ─────────────
 # Helpers run the runner's own functions (sourced), as the dedup tests above do.
-lj() { bash -c 'source "$1"; live_job_for "$2" "$3" "$4"' _ "$RUNNER" "$@"; }
+lj() { bash -c 'source "$1"; live_job_for_key "$2"' _ "$RUNNER" "$1"; }   # lj <jobkey>: the live job with exactly that key
+jk() { bash -c 'source "$1"; shift; job_key "$@"' _ "$RUNNER" "$@"; }   # jk <repo> <head> <tree> <submitter> <profile> <base> <origin_main> <env>
 as_sub() {   # as_sub <submitter> <cancel args...>: the runner's cmd_cancel, as that submitter
   local who="$1"; shift
   bash -c 'source "$1"; SUBMITTER="$2"; shift 2; cmd_cancel "$@"' _ "$RUNNER" "$who" "$@"
 }
+rec3() {  # rec3 <id> <key> <head> <submitter> <jobkey>: a live record that carries its scope key
+  mkdir -p "$PNEUMA_GATE_DEDUP_DIR"
+  printf 'key=%s\nhead=%s\npid=%s\nsubmitter=%s\nunit=pneuma-gate-%s.service\njobkey=%s\nsuperseded=\n' \
+    "$2" "$3" "$$" "$4" "$1" "$5" > "$PNEUMA_GATE_DEDUP_DIR/$1"
+}
+T2="$(dgit rev-parse "$C2^{tree}")"
+K0="$(jk repoA "$C2" "$T2" "$SUB_A" fake "$C1" "$C1" "")"
 rm -rf "$PNEUMA_GATE_DEDUP_DIR"; mkdir -p "$PNEUMA_GATE_DEDUP_DIR"
-rec2 job-a "repoA/main" "$C2" "$SUB_A"
-check "attach: a live job for the same repo, head and submitter is found" \
-  bash -c 'test "$1" = job-a' _ "$(lj repoA "$C2" "$SUB_A")"
-check "attach: another submitter's live job for the same head is NOT attached to" \
-  bash -c 'test -z "$1"' _ "$(lj repoA "$C2" "$SUB_B")"
-check "attach: the same repo at another head is NOT attached to" \
-  bash -c 'test -z "$1"' _ "$(lj repoA "$C3" "$SUB_A")"
-check "attach: a different repo with the same head is NOT attached to" \
-  bash -c 'test -z "$1"' _ "$(lj otherrepo "$C2" "$SUB_A")"
+rec3 job-a "repoA/main" "$C2" "$SUB_A" "$K0"
+check "attach: the job with EXACTLY this scope key is found" \
+  bash -c 'test "$1" = job-a' _ "$(lj "$K0")"
+check "attach: a different submitter (a different key) is NOT attached to" \
+  bash -c 'test -z "$1"' _ "$(lj "$(jk repoA "$C2" "$T2" "$SUB_B" fake "$C1" "$C1" "")")"
+check "attach: a different profile is NOT attached to" \
+  bash -c 'test -z "$1"' _ "$(lj "$(jk repoA "$C2" "$T2" "$SUB_A" other "$C1" "$C1" "")")"
+check "attach: a different base is NOT attached to" \
+  bash -c 'test -z "$1"' _ "$(lj "$(jk repoA "$C2" "$T2" "$SUB_A" fake "$C3" "$C1" "")")"
+check "attach: a different origin-main is NOT attached to" \
+  bash -c 'test -z "$1"' _ "$(lj "$(jk repoA "$C2" "$T2" "$SUB_A" fake "$C1" "$C3" "")")"
+check "attach: a different scope env flag (PNEUMA_PREPUSH_FULL) is NOT attached to" \
+  bash -c 'test -z "$1"' _ "$(lj "$(jk repoA "$C2" "$T2" "$SUB_A" fake "$C1" "$C1" "PNEUMA_PREPUSH_FULL=1")")"
+check "attach: another repo, or another head, is NOT attached to" \
+  bash -c 'test -z "$1" -a -z "$2"' _ "$(lj "$(jk otherrepo "$C2" "$T2" "$SUB_A" fake "$C1" "$C1" "")")" "$(lj "$(jk repoA "$C3" "$T2" "$SUB_A" fake "$C1" "$C1" "")")"
+check "attach: a record with no job key (a legacy record) is never attached to" \
+  bash -c 'test -z "$1"' _ "$(lj "")"
 sed -i 's/^superseded=$/superseded=newer/' "$PNEUMA_GATE_DEDUP_DIR/job-a"
 check "attach: a superseded job is never attached to" \
-  bash -c 'test -z "$1"' _ "$(lj repoA "$C2" "$SUB_A")"
+  bash -c 'test -z "$1"' _ "$(lj "$K0")"
+check "scope key: every scope field changes the key (repo, head, tree, submitter, profile, base, origin-main, env)" \
+  bash -c 'n=$(printf "%s\n" "$@" | sort -u | wc -l); test "$n" = 9' _ "$K0" \
+    "$(jk otherrepo "$C2" "$T2" "$SUB_A" fake "$C1" "$C1" "")" "$(jk repoA "$C3" "$T2" "$SUB_A" fake "$C1" "$C1" "")" \
+    "$(jk repoA "$C2" "$C3" "$SUB_A" fake "$C1" "$C1" "")" "$(jk repoA "$C2" "$T2" "$SUB_B" fake "$C1" "$C1" "")" \
+    "$(jk repoA "$C2" "$T2" "$SUB_A" other "$C1" "$C1" "")" "$(jk repoA "$C2" "$T2" "$SUB_A" fake "$C3" "$C1" "")" \
+    "$(jk repoA "$C2" "$T2" "$SUB_A" fake "$C1" "$C3" "")" "$(jk repoA "$C2" "$T2" "$SUB_A" fake "$C1" "$C1" "PNEUMA_PREPUSH_FULL=1")"
+check "scope key: the same scope always yields the same key" \
+  bash -c 'test "$1" = "$2"' _ "$K0" "$(jk repoA "$C2" "$T2" "$SUB_A" fake "$C1" "$C1" "")"
 
 # cancel: only the caller's own live jobs for that repo and head; the unit is stopped
 rm -rf "$PNEUMA_GATE_DEDUP_DIR"; mkdir -p "$PNEUMA_GATE_DEDUP_DIR"; : > "$WORK_STOPS"
@@ -561,5 +587,51 @@ check "dispatch: the cancel verb runs for an identified submitter" \
   bash -c 'out="$("$1" cancel --submitter test-lane --repo fakerepo --head "$2" 2>&1)" && grep -q "^cancelled 0 job" <<<"$out"' _ "$RUNNER" "$head"
 check "dispatch: an unknown verb is refused with usage (exit 2)" \
   bash -c '"$1" bogus --submitter test-lane >/dev/null 2>&1; test $? = 2' _ "$RUNNER"
+
+# the verdict's root-owned result file is authoritative: a forged log line cannot change an attach's exit
+rf_exit() { bash -c 'source "$1"; job_exit "$2"' _ "$RUNNER" "$1"; }
+mkdir -p "$PNEUMA_GATE_RESULTS_DIR" "$PNEUMA_GATE_BASE/jobs/rf-1" "$PNEUMA_GATE_BASE/jobs/rf-2"
+printf 'PNEUMA_GATE_RESULT repo=x exit=1 elapsed=1s host=h\n' > "$PNEUMA_GATE_RESULTS_DIR/rf-1"
+printf 'PNEUMA_GATE_RESULT repo=x exit=0 elapsed=1s host=h\n' > "$PNEUMA_GATE_BASE/jobs/rf-1/log"
+check "verdict: the exit comes from the result file, not from a forged green log line" \
+  bash -c 'test "$1" = 1' _ "$(rf_exit rf-1)"
+printf 'PNEUMA_GATE_RESULT repo=x exit=0 elapsed=1s host=h\n' > "$PNEUMA_GATE_BASE/jobs/rf-2/log"
+check "verdict: a job with a green log line but NO result file is never green (75)" \
+  bash -c 'test "$1" = 75' _ "$(rf_exit rf-2)"
+jid_of_e2e="$(basename "$(dirname "$(ls -d "$PNEUMA_GATE_BASE"/jobs/[0-9]*/log | head -1)")")"   # real job ids start with a timestamp
+check "verdict: the line the attached client received is the job's result file, verbatim" \
+  bash -c 'grep -qxF "$(cat "$2/$3")" "$1"' _ "$work/attachB.out" "$PNEUMA_GATE_RESULTS_DIR" "$jid_of_e2e"
+check "job log is 0640 (the submitter group reads it; nobody else does)" \
+  bash -c 'test "$(stat -c %a "$1")" = 640' _ "$PNEUMA_GATE_BASE/jobs/$jid_of_e2e/log"
+
+# the client verifies EVERY field of the verdict against the submission, and the job key that binds them
+VERDICT_BIN="$work/bin/verdict-runner"
+printf '%s\n' '#!/usr/bin/env bash' 'printf "%s\n" "$VERDICT_LINE"' 'exit 0' > "$VERDICT_BIN"; chmod +x "$VERDICT_BIN"
+om="$base"                                   # the client's origin-main: the fixture's origin/main is the base
+vj() { jk fakerepo "$head" "$tree" "${1:-test-lane}" "${2:-fake}" "$base" "$om" ""; }
+vline() {  # vline <submitter> <profile> <base> <origin_main> <env> <jobkey>
+  printf 'PNEUMA_GATE_RESULT repo=fakerepo head=%s tree=%s profile=%s base=%s origin_main=%s env=%s submitter=%s jobkey=%s exit=0 elapsed=1s host=fakehost' \
+    "$head" "$tree" "$2" "$3" "$4" "$5" "$1" "$6"
+}
+client_rc() {  # client_rc <verdict line>: the client's exit for a run whose verdict is this line
+  local rc=0
+  VERDICT_LINE="$1" PNEUMA_GATE_RUNNER="$VERDICT_BIN" "$CLIENT" --repo-dir "$src" --profile fake --head "$head" --base "$base" \
+    --log-dir "$work/logs-verdict" >/dev/null 2>&1 || rc=$?
+  echo "$rc"
+}
+expect_eq "verdict: a fully consistent verdict for this scope is green (exit 0)" 0 \
+  "$(client_rc "$(vline test-lane fake "$base" "$om" "" "$(vj)")")"
+expect_eq "verdict: a different PROFILE is refused (75)" 75 \
+  "$(client_rc "$(vline test-lane other "$base" "$om" "" "$(vj test-lane other)")")"
+expect_eq "verdict: a different BASE is refused (75)" 75 \
+  "$(client_rc "$(vline test-lane fake "$C3" "$om" "" "$(jk fakerepo "$head" "$tree" test-lane fake "$C3" "$om" "")")")"
+expect_eq "verdict: a different ORIGIN-MAIN is refused (75)" 75 \
+  "$(client_rc "$(vline test-lane fake "$base" "$C3" "" "$(jk fakerepo "$head" "$tree" test-lane fake "$base" "$C3" "")")")"
+expect_eq "verdict: a different scope ENV flag is refused (75)" 75 \
+  "$(client_rc "$(vline test-lane fake "$base" "$om" "PNEUMA_PREPUSH_FULL=1" "$(jk fakerepo "$head" "$tree" test-lane fake "$base" "$om" "PNEUMA_PREPUSH_FULL=1")")")"
+expect_eq "verdict: a job key that does not bind the fields is refused (75)" 75 \
+  "$(client_rc "$(vline test-lane fake "$base" "$om" "" "0000000000000000000000000000000000000000000000000000000000000000")")"
+expect_eq "verdict: a SUBMITTER field that does not match the job key is refused (75)" 75 \
+  "$(client_rc "$(vline other-lane fake "$base" "$om" "" "$(vj)")")"
 
 exit "$fail"

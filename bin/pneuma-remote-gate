@@ -145,6 +145,8 @@ fi
 # Same scope knobs the local hook honours travel with the commit.
 fwd_args=()
 [ "${PNEUMA_PREPUSH_FULL:-}" = 1 ] && fwd_args+=(--env PNEUMA_PREPUSH_FULL=1)
+# the scope env flags this submission sends, as the runner echoes them (sorted, comma-joined)
+env_s=""; [ "${PNEUMA_PREPUSH_FULL:-}" = 1 ] && env_s="PNEUMA_PREPUSH_FULL=1"
 shallow_args=()
 [ -n "$origin_main" ] && fwd_args+=(--origin-main "$origin_main")
 shallow_file="$(G rev-parse --path-format=absolute --git-path shallow)"
@@ -166,10 +168,22 @@ ssh_rc=${PIPESTATUS[0]}
 marker=$(grep '^PNEUMA_GATE_RESULT ' "$log" | tail -1)
 [ -n "$marker" ] || nogate "no PNEUMA_GATE_RESULT marker (ssh exit $ssh_rc) — treating as NOT green; log $log"
 field() { printf '%s' "$marker" | tr ' ' '\n' | sed -n "s/^$1=//p" | head -1; }
+# Must match the runner's job_key byte for byte: the scope key that binds a verdict's fields.
+job_key() {  # <repo> <head> <tree> <submitter> <profile> <base> <origin_main> <env>
+  printf 'pneuma-gate-job-v1|repo=%s|head=%s|tree=%s|submitter=%s|profile=%s|base=%s|origin_main=%s|env=%s' \
+    "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" | sha256sum | cut -d' ' -f1
+}
 [ "$(field head)" = "$head" ] && [ "$(field tree)" = "$tree" ] \
   || nogate "result is for head=$(field head) tree=$(field tree), expected $head/$tree — NOT green"
 [ -z "$EXPECT_HOST" ] || [ "$(field host)" = "$EXPECT_HOST" ] \
   || nogate "result came from host '$(field host)', not the approved builder $EXPECT_HOST — NOT green"
+# The verdict must be for EXACTLY this scope: every field this client sent, and a job key that binds them
+# (the submitter is the one field this client cannot know; the key binds it, so a changed submitter fails here).
+[ "$(field repo)" = "$repo" ] && [ "$(field profile)" = "$profile" ] && [ "$(field base)" = "$base" ] \
+  && [ "$(field origin_main)" = "$origin_main" ] && [ "$(field env)" = "$env_s" ] \
+  || nogate "result is for another scope (repo/profile/base/origin-main/env differ from this submission) — NOT green; log $log"
+[ -n "$(field jobkey)" ] && [ "$(field jobkey)" = "$(job_key "$repo" "$head" "$tree" "$(field submitter)" "$profile" "$base" "$origin_main" "$env_s")" ] \
+  || nogate "result's job key does not bind its fields — NOT green; log $log"
 rc="$(field exit)"
 case "$rc" in
   0) echo "remote-gate: GREEN for ${head:0:12} on $(field host) in $(field elapsed)  (log $log)" >&2; exit 0;;
