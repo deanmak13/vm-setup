@@ -182,6 +182,10 @@ persist_rescue() {
   return 0
 }
 
+# The submitter account: a system account with a home, created once. It is never removed by this script, and it
+# has no password: the only way in is the forced-command key. Without it the entry cannot be reached at all.
+id pneuma-submit >/dev/null 2>&1 || useradd --system --create-home --home-dir /var/lib/pneuma-submit --shell /bin/bash pneuma-submit \
+  || die "cannot create the pneuma-submit account"
 install -d -o root -g root -m 0755 "$KEYS_DIR" || die "cannot create $KEYS_DIR"
 save "$ENTRY" entry
 save "$KEYS" keys

@@ -73,6 +73,39 @@ if grep -q 'rsync -a --delete "\$STAGE/profiles/" /usr/local/lib' "$REPO/ci-buil
 elif grep -q 'mv -T -- "\$new_link" "\$PROFILES"' "$REPO/ci-builder-gate.sh"; then pass "profiles are a versioned dir behind a live symlink, swapped by one rename"
 else bad "profiles swap not found"; fi
 
+# 5. --stage: each stage touches exactly its own half (the runner and the submit path never mix)
+runstage() {  # runstage <stage|-> [extra args]: the caller with --host-only and that stage
+  local st="$1"; shift; : > "$LOG"
+  if [ "$st" = - ]; then
+    env PATH="$work/shim:$PATH" LOG_FILE="$LOG" PNEUMA_GATE_HOST=fakehost PNEUMA_GATE_EXPECT_HOST=fakehost \
+      PNEUMA_GATE_CLIENT_DEST="$work/dest" bash "$REPO/ci-builder-gate.sh" --host-only "$@" >"$work/out" 2>&1
+  else
+    env PATH="$work/shim:$PATH" LOG_FILE="$LOG" PNEUMA_GATE_HOST=fakehost PNEUMA_GATE_EXPECT_HOST=fakehost \
+      PNEUMA_GATE_CLIENT_DEST="$work/dest" bash "$REPO/ci-builder-gate.sh" --host-only --stage "$st" "$@" >"$work/out" 2>&1
+  fi
+}
+runstage submit-path; rc=$?
+if [ "$rc" = 0 ] && grep -q 'pneuma-submit-install.sh' "$LOG" && ! grep -q 'bash -s' "$LOG" \
+   && ! grep -q 'pneuma-gate-runner' "$LOG" && ! grep -q 'profiles' "$LOG"; then
+  pass "--stage submit-path: runs the submit installer and NOTHING of the runner (no runner, profiles or janitor)"
+else bad "--stage submit-path (rc $rc): $(cat "$LOG")"; fi
+runstage runner; rc=$?
+if [ "$rc" = 0 ] && ! grep -q 'pneuma-submit-install.sh' "$LOG" && grep -q 'bash -s' "$LOG" \
+   && grep -q 'pneuma-gate-runner' "$LOG" && grep -q 'profiles' "$LOG"; then
+  pass "--stage runner: deploys the runner, profiles and janitor and does NOT touch the submit path"
+else bad "--stage runner (rc $rc): $(cat "$LOG")"; fi
+runstage all; rc=$?
+if [ "$rc" = 0 ] && grep -q 'pneuma-submit-install.sh' "$LOG" && grep -q 'bash -s' "$LOG"; then
+  pass "--stage all (the default): both halves"
+else bad "--stage all (rc $rc)"; fi
+runstage - ; rc=$?
+if [ "$rc" = 0 ] && grep -q 'pneuma-submit-install.sh' "$LOG" && grep -q 'bash -s' "$LOG"; then
+  pass "no --stage given: the default is all (both halves)"
+else bad "default stage (rc $rc)"; fi
+runstage bogus; rc=$?
+if [ "$rc" = 2 ] && ! grep -q '^ssh\|^rsync' "$LOG"; then pass "an unknown --stage is refused before any host call (exit 2)"
+else bad "unknown stage not refused (rc $rc)"; fi
+
 # 4. no predictable /tmp names in the install scripts (mktemp in a root-owned dir or beside the target only)
 if ! grep -n '/tmp/pneuma' "$REPO/ci-builder-gate.sh" "$REPO/host/pneuma-submit-install.sh" >/dev/null; then
   pass "no predictable /tmp/pneuma names in the install scripts"

@@ -5,6 +5,8 @@
 #   bash ci-builder-gate.sh                  # host + client (idempotent)
 #   bash ci-builder-gate.sh --host-only
 #   bash ci-builder-gate.sh --client-only
+#   bash ci-builder-gate.sh --host-only --stage submit-path   # account, entry, sudoers, keys, from.conf; NOT the runner
+#   bash ci-builder-gate.sh --host-only --stage runner        # runner, profiles, janitor; NOT the submit path
 #   PNEUMA_GATE_HOST=other bash ci-builder-gate.sh
 #
 # Touches ONLY: /usr/local/bin/pneuma-gate-runner, /usr/local/lib/pneuma-gate/,
@@ -17,13 +19,25 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HOST="${PNEUMA_GATE_HOST:-ci-builder}"
 APPROVED_HOST="${PNEUMA_GATE_EXPECT_HOST:-vmi3387590}"
 CLIENT_DEST="${PNEUMA_GATE_CLIENT_DEST:-$HOME/.local/bin}"
-do_host=1; do_client=1
-for a in "$@"; do
-  case "$a" in
-    --host-only) do_client=0;; --client-only) do_host=0;;
-    *) echo "unknown argument $a" >&2; exit 2;;
+do_host=1; do_client=1; stage=all
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --host-only) do_client=0; shift;;
+    --client-only) do_host=0; shift;;
+    --stage) stage="${2:-}"; shift 2;;
+    *) echo "unknown argument $1" >&2; exit 2;;
   esac
 done
+# --stage submit-path: the pneuma-submit account, the entry, the sudoers rule, the keys and from.conf ONLY (the
+#   runner, profiles and janitor are not touched, so in-flight lanes on the root path keep the old runner).
+# --stage runner:      the runner, profiles and janitor ONLY (the submit path is not touched).
+# --stage all:         both, submit path first (the default).
+case "$stage" in
+  submit-path) do_submit=1; do_runner=0;;
+  runner) do_submit=0; do_runner=1;;
+  all) do_submit=1; do_runner=1;;
+  *) echo "unknown stage '$stage' (use submit-path, runner or all)" >&2; exit 2;;
+esac
 
 if [ "$do_client" = 1 ]; then
   mkdir -p "$CLIENT_DEST"
@@ -47,17 +61,23 @@ if [ "$do_host" = 1 ]; then
   trap 'ssh -o BatchMode=yes "$HOST" "rm -rf -- $STAGE" >/dev/null 2>&1 || true' EXIT
 
   # Stage everything. Ownership on the staged copies does not matter: the root-side steps set it.
-  rsync -a "$REPO_DIR/bin/pneuma-gate-entry" "$REPO_DIR/gate-submit-keys" \
-    "$REPO_DIR/host/pneuma-submit-install.sh" "$HOST:$STAGE/"
-  rsync -a "$REPO_DIR/bin/pneuma-gate-runner" "$HOST:$STAGE/pneuma-gate-runner"
-  rsync -a "$REPO_DIR/gate-profiles/" "$HOST:$STAGE/profiles/"
+  if [ "$do_submit" = 1 ]; then
+    rsync -a "$REPO_DIR/bin/pneuma-gate-entry" "$REPO_DIR/gate-submit-keys" \
+      "$REPO_DIR/host/pneuma-submit-install.sh" "$HOST:$STAGE/"
+  fi
+  if [ "$do_runner" = 1 ]; then
+    rsync -a "$REPO_DIR/bin/pneuma-gate-runner" "$HOST:$STAGE/pneuma-gate-runner"
+    rsync -a "$REPO_DIR/gate-profiles/" "$HOST:$STAGE/profiles/"
+  fi
 
-  # STAGED MIGRATION (PR #20): stage 1 installs the account, the entry, the keys, the sudoers rule and the
-  # sshd Match block, all validated and rolled back as one unit (host/pneuma-submit-install.sh). The old
-  # root path keeps working until the lanes' ssh config switches (stage 2); then the strict runner is
-  # deployed (stage 3). See the PR body for the steps.
-  ssh "$HOST" "bash '$STAGE/pneuma-submit-install.sh' '$STAGE'"
+  # STAGED MIGRATION (PR #20): the submit path (account, entry, sudoers, keys, sshd Match block, from.conf) is
+  # validated and rolled back as one unit by host/pneuma-submit-install.sh. The old root path keeps working
+  # until the lanes' ssh config switches; then the runner is deployed (--stage runner). See the PR body.
+  if [ "$do_submit" = 1 ]; then
+    ssh "$HOST" "bash '$STAGE/pneuma-submit-install.sh' '$STAGE'"
+  fi
 
+  if [ "$do_runner" = 1 ]; then
   ssh "$HOST" "bash -s -- '$STAGE'" <<'REMOTE'
 set -euo pipefail
 STAGE="$1"
@@ -117,5 +137,6 @@ chmod 0644 "$cron_tmp"
 mv -f -- "$cron_tmp" /etc/cron.d/pneuma-gate-janitor
 /usr/local/bin/pneuma-gate-runner status
 REMOTE
+  fi
   # [host-only-end]
 fi

@@ -227,6 +227,15 @@ if [ "$rc" != 0 ] && grep -q 'RESTORE FAILED for /etc/ssh/authorized_keys/pneuma
 else bad "S16 rc=$rc kept='$kept' ls=$(ls -la "$kept" 2>&1 | tr '\n' ' ') keys=$(cat "$kept/keys" 2>&1) mode=$(stat -c '%U:%a' "$kept" 2>&1) log: $(tail -3 "$LOG")"; fi
 rm -rf "$s" /var/lib/pneuma-gate-install-rescue
 
+# S17: the submit account is created by the installer when it is missing (the entry cannot be reached without it)
+userdel -r pneuma-submit >/dev/null 2>&1 || true
+seed_old; s="$(new_stage)"; printf 'dean-devbox %s submit-test\n' "$KEY1" > "$s/gate-submit-keys"
+run_install "$s"; rc=$?
+if [ "$rc" = 0 ] && id pneuma-submit >/dev/null 2>&1 && [ "$(getent passwd pneuma-submit | cut -d: -f7)" = /bin/bash ]; then
+  pass "S17 the installer creates the missing pneuma-submit account (rc 0)"
+else bad "S17 rc=$rc account: $(id pneuma-submit 2>&1) log: $(tail -2 "$LOG")"; fi
+rm -rf "$s"
+
 # ------------------------------------------------------------------ report
 if [ "$fails" = 0 ]; then echo "submit-install: all scenarios passed"; exit 0; fi
 echo "submit-install: $fails scenario(s) FAILED"; exit 1
