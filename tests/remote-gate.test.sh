@@ -549,4 +549,17 @@ check "detached: the attached client receives the verdict line" \
   grep -q "^PNEUMA_GATE_RESULT .*exit=0" "$work/attachB.out"
 expect_eq "detached: exactly one job ran for the two submissions" 1 "$(find "$PNEUMA_GATE_BASE/jobs" -mindepth 1 -maxdepth 1 | wc -l)"
 
+# the janitor reaps an old job log only when its job is gone; the dispatch runs cancel and refuses an unknown verb
+mkdir -p "$PNEUMA_GATE_BASE/jobs/old-dead" "$PNEUMA_GATE_BASE/jobs/old-live"
+touch -d '10 days ago' "$PNEUMA_GATE_BASE/jobs/old-dead" "$PNEUMA_GATE_BASE/jobs/old-live"
+rm -rf "$PNEUMA_GATE_DEDUP_DIR"; mkdir -p "$PNEUMA_GATE_DEDUP_DIR"
+printf 'key=repoA/main\nhead=%s\npid=%s\nsubmitter=x\nunit=none\nsuperseded=\n' "$C2" "$$" > "$PNEUMA_GATE_DEDUP_DIR/old-live"
+bash -c 'source "$1"; cmd_janitor' _ "$RUNNER" >/dev/null 2>&1 || true
+check "janitor: reaps an old job log whose job is gone" test ! -e "$PNEUMA_GATE_BASE/jobs/old-dead"
+check "janitor: keeps an old job log whose job is still live" test -e "$PNEUMA_GATE_BASE/jobs/old-live"
+check "dispatch: the cancel verb runs for an identified submitter" \
+  bash -c 'out="$("$1" cancel --submitter test-lane --repo fakerepo --head "$2" 2>&1)" && grep -q "^cancelled 0 job" <<<"$out"' _ "$RUNNER" "$head"
+check "dispatch: an unknown verb is refused with usage (exit 2)" \
+  bash -c '"$1" bogus --submitter test-lane >/dev/null 2>&1; test $? = 2' _ "$RUNNER"
+
 exit "$fail"
