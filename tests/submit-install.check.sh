@@ -236,6 +236,32 @@ if [ "$rc" = 0 ] && id pneuma-submit >/dev/null 2>&1 && [ "$(getent passwd pneum
 else bad "S17 rc=$rc account: $(id pneuma-submit 2>&1) log: $(tail -2 "$LOG")"; fi
 rm -rf "$s"
 
+# S18: an existing account with a USABLE password is refused before any live change
+echo 'pneuma-submit:not-a-real-password' | chpasswd
+seed_old; s="$(new_stage)"; printf 'dean-devbox %s submit-test\n' "$KEY1" > "$s/gate-submit-keys"
+run_install "$s"; rc=$?
+if [ "$rc" != 0 ] && old_intact; then pass "S18 an existing account with a usable password is refused, live state unchanged (rc $rc)"
+else bad "S18 rc=$rc old_intact=$(old_intact && echo y || echo n) log: $(tail -1 "$LOG")"; fi
+rm -rf "$s"
+
+# S19: a locked account (password locked) is accepted; the home is then root-owned
+passwd -l pneuma-submit >/dev/null 2>&1
+seed_old; s="$(new_stage)"; printf 'dean-devbox %s submit-test\n' "$KEY1" > "$s/gate-submit-keys"
+run_install "$s"; rc=$?
+submit_home="$(getent passwd pneuma-submit | cut -d: -f6)"
+if [ "$rc" = 0 ] && [ "$(stat -c %U "$submit_home")" = root ]; then pass "S19 a locked account is accepted and its home is root-owned (rc 0)"
+else bad "S19 rc=$rc home=$(stat -c %U "$submit_home" 2>&1) log: $(tail -1 "$LOG")"; fi
+rm -rf "$s"
+
+# S20: an account with an EXTRA group (sudo) is refused before any live change
+usermod -aG sudo pneuma-submit
+seed_old; s="$(new_stage)"; printf 'dean-devbox %s submit-test\n' "$KEY1" > "$s/gate-submit-keys"
+run_install "$s"; rc=$?
+if [ "$rc" != 0 ] && old_intact; then pass "S20 an account with an extra group is refused, live state unchanged (rc $rc)"
+else bad "S20 rc=$rc log: $(tail -1 "$LOG")"; fi
+rm -rf "$s"
+gpasswd -d pneuma-submit sudo >/dev/null 2>&1
+
 # ------------------------------------------------------------------ report
 if [ "$fails" = 0 ]; then echo "submit-install: all scenarios passed"; exit 0; fi
 echo "submit-install: $fails scenario(s) FAILED"; exit 1

@@ -70,6 +70,15 @@ STAGE="$1"
 for f in "$STAGE/pneuma-gate-entry" "$STAGE/gate-submit-keys"; do
   [ -f "$f" ] && [ ! -L "$f" ] || die "missing or non-regular staged file $f"
 done
+# An EXISTING submitter account must be the account this script would create: locked or with no password, its
+# only group its own, and its home where the script puts it. Anything else is refused before any live change.
+if id pneuma-submit >/dev/null 2>&1; then
+  [ "$(id -nG pneuma-submit)" = "pneuma-submit" ] || die "pneuma-submit has extra groups ($(id -nG pneuma-submit)); refusing to use it"
+  case "$(passwd -S pneuma-submit 2>/dev/null | awk '{print $2}')" in
+    L|NP) ;;
+    *) die "pneuma-submit has a usable password; lock it (passwd -l pneuma-submit) before install" ;;
+  esac
+fi
 bash -n "$STAGE/pneuma-gate-entry" || die "staged entry does not parse"
 
 WORK="$(mktemp -d "$STAGE/work.XXXXXX")"
@@ -186,6 +195,10 @@ persist_rescue() {
 # has no password: the only way in is the forced-command key. Without it the entry cannot be reached at all.
 id pneuma-submit >/dev/null 2>&1 || useradd --system --create-home --home-dir /var/lib/pneuma-submit --shell /bin/bash pneuma-submit \
   || die "cannot create the pneuma-submit account"
+# The account's home is ROOT-owned: the submitter account cannot write its own files there (nothing it needs is written there).
+submit_home="$(getent passwd pneuma-submit | cut -d: -f6)"
+[ -n "$submit_home" ] && [ -d "$submit_home" ] || die "pneuma-submit has no home directory"
+chown root:root "$submit_home" && chmod 0755 "$submit_home" || die "cannot make the submitter home root-owned"
 install -d -o root -g root -m 0755 "$KEYS_DIR" || die "cannot create $KEYS_DIR"
 save "$ENTRY" entry
 save "$KEYS" keys
