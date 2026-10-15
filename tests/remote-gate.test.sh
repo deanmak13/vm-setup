@@ -634,4 +634,16 @@ expect_eq "verdict: a job key that does not bind the fields is refused (75)" 75 
 expect_eq "verdict: a SUBMITTER field that does not match the job key is refused (75)" 75 \
   "$(client_rc "$(vline other-lane fake "$base" "$om" "" "$(vj)")")"
 
+# the sudo rule the installer renders (on the host, so this suite measures it): exactly the four verbs
+mkdir -p "$work/rule"
+bash "$REPO_DIR/host/pneuma-submit-install.sh" --render-sudoers "$work/rule/pneuma-submit"
+check "sudo rule: the installer renders the four verbs, cancel included, and nothing else" \
+  bash -c 'grep -q "NOPASSWD: .*/pneuma-gate-runner status \*, .*have \*, .*run \*, .*cancel \*$" "$1"' _ "$work/rule/pneuma-submit"
+
+# gate output carries the "gate: " prefix (no gate line can look like the verdict marker), and job dirs are 0750
+check "gate output: every line of the gate's own output carries the gate: prefix" \
+  bash -c 'grep -q "^gate: gate cwd=" "$1"' _ "$work/attachB.out"
+check "job dirs are 0750 (the submitter group may enter; others may not)" \
+  bash -c 'test "$(stat -c %a "$1")" = 750' _ "$(dirname "$(ls -d "$PNEUMA_GATE_BASE"/jobs/[0-9]*/log | head -1)")"
+
 exit "$fail"

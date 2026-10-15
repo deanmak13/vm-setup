@@ -51,6 +51,7 @@ ALLOW=(
   "status --submitter dean-devbox"
   "have --submitter dean-devbox"
   "run --submitter dean-devbox"
+  "cancel --submitter dean-devbox --repo fakerepo --head 0123456789abcdef0123456789abcdef01234567"
 )
 REFUSE=(
   "janitor"
@@ -60,6 +61,7 @@ REFUSE=(
   "run"
   "status"
   "have"
+  "cancel"
   "__BARE_RUNNER__"
 )
 

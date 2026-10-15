@@ -474,7 +474,8 @@ cmd_run() {
 
   # the job runs DETACHED: its output goes to its own log and this connection only tails it
   JOB_ID="$(date +%s%N)-$$"
-  mkdir -p "$JOBS_DIR/$JOB_ID" && chmod 0755 "$JOBS_DIR/$JOB_ID" || refuse "cannot create the job directory"
+  mkdir -p "$JOBS_DIR/$JOB_ID" && chmod 0750 "$JOBS_DIR/$JOB_ID" && chgrp "${PNEUMA_GATE_SUBMIT_GROUP:-pneuma-submit}" "$JOBS_DIR/$JOB_ID" 2>/dev/null \
+    || chmod 0750 "$JOBS_DIR/$JOB_ID" 2>/dev/null || refuse "cannot create the job directory"
   local job_log="$JOBS_DIR/$JOB_ID/log"; : > "$job_log"
   # the job log is readable by the submitter group only (0640); the verdict itself lives in the result file
   chmod 0640 "$job_log"; chgrp "${PNEUMA_GATE_SUBMIT_GROUP:-pneuma-submit}" "$job_log" 2>/dev/null || true
@@ -539,8 +540,10 @@ run_job() {   # the detached worker: admission, workspace, the gate, the verdict
     ${RUN_AS:+runuser -u "$RUN_AS" --} env -i PATH=/usr/local/bin:/usr/bin:/bin HOME="$RUN_DIR/home" TMPDIR="$RUN_DIR/tmp" LANG=C.UTF-8 \
     PNEUMA_GATE_REMOTE_RUN=1 PNEUMA_GATE_RUN_DIR="$RUN_DIR" PNEUMA_GATE_CORES="$cores" "${fwd_env[@]}" \
     bash -c 'source "$1"; cd "$2"; shift 2; profile_gate "$@"' _ \
-    "$PROFILE_DIR/$profile.sh" "$work" "$ENV_DIR" "$head" "$base" "$GATE_TIMEOUT_S" 2>&1
-  rc=$?
+    "$PROFILE_DIR/$profile.sh" "$work" "$ENV_DIR" "$head" "$base" "$GATE_TIMEOUT_S" 2>&1 | sed 's/^/gate: /'
+  # every gate output line carries the "gate: " prefix, so no line of the gate's own output can ever look like the
+  # verdict marker. The verdict's exit is the gate's exit, not the prefix pipe's.
+  rc=${PIPESTATUS[0]}
   # the unit's output went to the journal under its unit name: keep it in this verdict's log
   "${JOURNALCTL_BIN:-journalctl}" -u "pneuma-gate-$DEDUP_ID.service" --no-pager -o cat 2>/dev/null | sed 's/^/  gate: /' || true
   if [ -n "$DEDUP_ID" ] && [ -n "$(dedup_field "$DEDUP_ID" superseded)" ]; then
