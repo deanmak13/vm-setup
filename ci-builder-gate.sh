@@ -5,7 +5,7 @@
 #   bash ci-builder-gate.sh                  # host + client (idempotent)
 #   bash ci-builder-gate.sh --host-only
 #   bash ci-builder-gate.sh --client-only
-#   bash ci-builder-gate.sh --local-host     # provision THIS machine as the builder (root; fresh-host test)
+#   bash ci-builder-gate.sh --local-host --acceptance   # provision THIS machine (a VM/container for the acceptance test; root)
 #   PNEUMA_GATE_HOST=other bash ci-builder-gate.sh
 #
 # Touches ONLY: /usr/local/bin/pneuma-gate-runner, /usr/local/lib/pneuma-gate/,
@@ -19,14 +19,24 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HOST="${PNEUMA_GATE_HOST:-ci-builder}"
 APPROVED_HOST="${PNEUMA_GATE_EXPECT_HOST:-vmi3387590}"
 CLIENT_DEST="${PNEUMA_GATE_CLIENT_DEST:-$HOME/.local/bin}"
-do_host=1; do_client=1; local_host=0
+do_host=1; do_client=1; local_host=0; acceptance=0
 for a in "$@"; do
   case "$a" in
     --host-only) do_client=0;; --client-only) do_host=0;;
     --local-host) do_client=0; local_host=1;;
+    --acceptance) acceptance=1;;
     *) echo "unknown argument $a" >&2; exit 2;;
   esac
 done
+
+# --local-host provisions THIS machine without the approved-host check the ssh path makes. It exists for the
+# acceptance test only, so it needs the explicit --acceptance flag, and it refuses on the approved builder
+# itself (or on any host whose name is the approved one): a real host is provisioned over ssh.
+if [ "$local_host" = 1 ]; then
+  [ "$acceptance" = 1 ] || { echo "refusing: --local-host is for the acceptance test only (add --acceptance); a real host is provisioned over ssh" >&2; exit 2; }
+  [ "$(hostname)" != "$APPROVED_HOST" ] || { echo "refusing: this IS the approved builder ($APPROVED_HOST); --local-host --acceptance never runs on a real host" >&2; exit 2; }
+fi
+if [ "$acceptance" = 1 ] && [ "$local_host" != 1 ]; then echo "refusing: --acceptance only goes with --local-host" >&2; exit 2; fi
 
 if [ "$do_client" = 1 ]; then
   mkdir -p "$CLIENT_DEST"

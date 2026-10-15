@@ -153,8 +153,9 @@ export SCOPE_RECORD="$work/scope-record.txt" PNEUMA_GATE_SYSTEMD_RUN="$work/bin/
 cat > "$work/bin/systemctl-stub" <<'STUB'
 #!/usr/bin/env bash
 case "$1" in
-  is-active) grep -qx "$3" "$SYSTEMCTL_ACTIVE" 2>/dev/null && exit 0; exit 3;;
-  list-units) pat="${@: -1}"; while read -r u rest; do [[ "$u" == $pat ]] && echo "$u"; done < "$UNITS_FILE" 2>/dev/null; exit 0;;
+  is-active) u="${@: -1}"; [ "${SYSTEMCTL_IS_ACTIVE_BROKEN:-0}" = 1 ] && exit 1
+             if grep -qx "$u" "$SYSTEMCTL_ACTIVE" 2>/dev/null; then echo active; exit 0; fi; echo inactive; exit 3;;
+  list-units) [ "${SYSTEMCTL_FAIL:-0}" = 1 ] && exit 1; pat="${@: -1}"; while read -r u rest; do [[ "$u" == $pat ]] && echo "$u"; done < "$UNITS_FILE" 2>/dev/null; exit 0;;
   show)
     case "$3" in
       CPUQuotaPerSecUSec) awk -v u="$5" '$1 == u { print $2 "s" }' "$UNITS_FILE";;
@@ -175,15 +176,24 @@ export PNEUMA_GATE_IN_MOUNT="$work/mnt/in" PNEUMA_GATE_ENVS_MOUNT="$work/mnt/env
        PNEUMA_GATE_WHEELS_MOUNT="$work/mnt/wheels" PNEUMA_GATE_UNIT_WORK="$work/unitwork"   # the bind-mount targets and the private disk
 printf '#!/usr/bin/env bash\nexit 0\n' > "$work/bin/chown"; chmod +x "$work/bin/chown"
 # `ip route` stand-in: records the per-run loopback routes the runner adds and removes
+REAL_IP="$(command -v ip)"; export REAL_IP
 cat > "$work/bin/ip-stub" <<'STUB'
 #!/usr/bin/env bash
 [ "${IP_FAIL:-0}" = 1 ] && exit 1
+if [ "$1 $2 $3" = "-4 -o addr" ]; then
+  if [ -s "$IP_ADDRS" ]; then cat "$IP_ADDRS"; else exec "$REAL_IP" "$@"; fi
+  exit 0
+fi
+if [ "$1 $2 $3" = "route add local" ]; then
+  addr="${4%/32}"
+  if grep -qx "$addr" "$IP_EXISTS" 2>/dev/null; then echo "RTNETLINK answers: File exists" >&2; exit 2; fi
+fi
 echo "$*" >> "$IP_RECORD"
 if [ "$1 $2 $3 $4" = "route show table local" ]; then cat "$IP_ROUTES" 2>/dev/null; fi
 exit 0
 STUB
 chmod +x "$work/bin/ip-stub"
-export PNEUMA_GATE_IP="$work/bin/ip-stub" IP_RECORD="$work/ip-record.txt" IP_ROUTES="$work/ip-routes.txt"; : > "$IP_RECORD"; : > "$IP_ROUTES"   # warm-env freezes the env as root; the tests are not root
+export PNEUMA_GATE_IP="$work/bin/ip-stub" IP_RECORD="$work/ip-record.txt" IP_ROUTES="$work/ip-routes.txt" IP_ADDRS="$work/ip-addrs.txt" IP_EXISTS="$work/ip-exists.txt"; : > "$IP_RECORD"; : > "$IP_ROUTES"; : > "$IP_ADDRS"; : > "$IP_EXISTS"   # warm-env freezes the env as root; the tests are not root
 
 marker_of() { grep '^PNEUMA_GATE_RESULT ' <<<"$1" | tail -1; }
 field_of() { tr ' ' '\n' <<<"$1" | sed -n "s/^$2=//p" | head -1; }
@@ -570,20 +580,20 @@ mkdir -p "$PNEUMA_GATE_STATE_DIR/runs" "$PNEUMA_GATE_STATE_DIR/in"; : > "$UNITS_
 sleep 300 & live_pid=$!
 bash -c 'source "$1"; state_mark live-1 "$2" 2 1024' _ "$RUNNER" "$live_pid"
 touch -d "@$old" "$PNEUMA_GATE_STATE_DIR/runs/live-1"
-check "reservation: a live runner's reservation counts even when it is hours old" bash -c 'source "$1"; live_runs | grep -qx "live-1 2 1024"' _ "$RUNNER"
+check "reservation: a live runner's reservation counts even when it is hours old" bash -c 'source "$1"; live_runs | grep -x "live-1 2 1024" >/dev/null' _ "$RUNNER"
 printf 'pid=%s\npstart=1\ncores=2\nmem_mb=1024\n' "$live_pid" > "$PNEUMA_GATE_STATE_DIR/runs/recycled-1"
-check "reservation: a recycled pid (start time differs) is not the runner" bash -c 'source "$1"; ! live_runs | grep -q "^recycled-1 "' _ "$RUNNER"
+check "reservation: a recycled pid (start time differs) is not the runner" bash -c 'source "$1"; ! live_runs | grep "^recycled-1 " >/dev/null' _ "$RUNNER"
 rm -f "$PNEUMA_GATE_STATE_DIR/runs/recycled-1"
 printf 'pid=999999\npstart=1\ncores=2\nmem_mb=1024\n' > "$PNEUMA_GATE_STATE_DIR/runs/dead-1"
-check "reservation: a dead runner's reservation does not count" bash -c 'source "$1"; ! live_runs | grep -q "^dead-1 "' _ "$RUNNER"
+check "reservation: a dead runner's reservation does not count" bash -c 'source "$1"; ! live_runs | grep "^dead-1 " >/dev/null' _ "$RUNNER"
 printf 'pid=nonsense\n' > "$PNEUMA_GATE_STATE_DIR/runs/junk-1"
-check "reservation: a malformed marker does not count" bash -c 'source "$1"; ! live_runs | grep -q "^junk-1 "' _ "$RUNNER"
+check "reservation: a MALFORMED marker still counts (unknown liveness is occupied, not free)" bash -c 'source "$1"; live_runs | grep "^junk-1 " >/dev/null' _ "$RUNNER"
 sleep 300 & queued_pid=$!
 # a QUEUED runner staged its bundle before it holds capacity: its marker (pid + start time) keeps it
 bash -c 'source "$1"; state_mark y-1 "$2" 1 256 queued' _ "$RUNNER" "$queued_pid"
 printf 'pid=%s\npstart=1\ncores=1\nmem_mb=256\nstate=queued\n' "$queued_pid" > "$PNEUMA_GATE_STATE_DIR/runs/r-1"   # a recycled pid
 : > "$PNEUMA_GATE_STATE_DIR/in/x-999999.bundle"; : > "$PNEUMA_GATE_STATE_DIR/in/y-1.bundle"; : > "$PNEUMA_GATE_STATE_DIR/in/r-1.bundle"; : > "$PNEUMA_GATE_STATE_DIR/in/live-1.bundle"
-check "reservation: a queued marker holds no capacity" bash -c 'source "$1"; ! live_runs | grep -q "^y-1 "' _ "$RUNNER"
+check "reservation: a queued marker holds no capacity" bash -c 'source "$1"; ! live_runs | grep "^y-1 " >/dev/null' _ "$RUNNER"
 "$RUNNER" janitor >/dev/null 2>&1
 check "janitor: removes the marker of a dead runner" test ! -e "$PNEUMA_GATE_STATE_DIR/runs/dead-1"
 check "janitor: removes the staged bundle of a dead runner" test ! -e "$PNEUMA_GATE_STATE_DIR/in/x-999999.bundle"
@@ -621,12 +631,12 @@ check "guard: low disk stops every gate unit, including one with a live runner" 
 kill "$gd_pid" 2>/dev/null; : > "$UNITS_FILE"; : > "$SYSTEMCTL_RECORD"; rm -f "$PNEUMA_GATE_STATE_DIR"/runs/*
 
 # per-run loopback route: added before the unit starts, removed when the run ends, swept when stale
-check "loopback: a run adds a host route that sources its own address" grep -qE '^route replace local 127\.[0-9]+\.[0-9]+\.[0-9]+/32 dev lo scope host src 127\.' "$IP_RECORD"
+check "loopback: a run adds a host route that sources its own address" grep -qE '^route add local 127\.[0-9]+\.[0-9]+\.[0-9]+/32 dev lo scope host src 127\.' "$IP_RECORD"
 check "loopback: and removes it afterwards" grep -qE '^route del local 127\.[0-9]+\.[0-9]+\.[0-9]+/32 dev lo' "$IP_RECORD"
 : > "$IP_RECORD"
-live_lo="$(bash -c 'source "$1"; run_loopback live-keep' _ "$RUNNER")"
+live_lo="$(bash -c 'source "$1"; run_loopback live-keep.0' _ "$RUNNER")"
 sleep 300 & lp_pid=$!
-bash -c 'source "$1"; state_mark live-keep "$2" 1 256 admitted' _ "$RUNNER" "$lp_pid"
+bash -c 'source "$1"; state_mark live-keep "$2" 1 256 admitted "$3"' _ "$RUNNER" "$lp_pid" "$live_lo"
 printf 'local 127.88.1.1 dev lo scope host src 127.88.1.1\nlocal %s dev lo scope host src %s\nlocal 127.0.0.53 dev lo scope host src 127.0.0.1\nlocal 127.0.0.0/8 dev lo scope host src 127.0.0.1\n' "$live_lo" "$live_lo" > "$IP_ROUTES"
 "$RUNNER" janitor >/dev/null 2>&1
 check "loopback sweep: a stale per-run route is removed" grep -q '^route del local 127.88.1.1/32' "$IP_RECORD"
@@ -906,11 +916,221 @@ dgit bundle create "$work/bind.bundle" refs/pneuma-gate/repo/repoA refs/pneuma-g
 check "bundle: a bundle carrying the claimed repo and branch at the head binds" \
   ddo bundle_binds "$work/bind.bundle" repoA main "$C2"
 check "bundle: a bundle whose branch is not the claimed one does NOT bind" \
-  bash -c '! bash -c "source \"$1\"; bundle_binds \"$2\" repoA other \"$3\"" _ "$RUNNER" "$work/bind.bundle" "$C2"'
+  not ddo bundle_binds "$work/bind.bundle" repoA other "$C2"
 mkdir -p "$work/brokenwt" && echo "gitdir: $work/nonexistent/worktrees/x" > "$work/brokenwt/.git"
 check "bundle: it binds from ANY working directory, even one with a broken worktree .git (the container case)" \
   bash -c 'cd "$3" && bash -c "source \"$1\"; bundle_binds \"$2\" repoA main \"$4\""' _ "$RUNNER" "$work/bind.bundle" "$work/brokenwt" "$C2"
 check "bundle: a claimed head the bundle does not carry does NOT bind" \
-  bash -c '! bash -c "source \"$1\"; bundle_binds \"$2\" repoA main \"$3\"" _ "$RUNNER" "$work/bind.bundle" "$C3"'
+  not ddo bundle_binds "$work/bind.bundle" repoA main "$C3"
+
+# ════ security review of 175dee9: one test per finding, each fails without its fix ════
+# ── AUTHORIZATION ──
+# A1. a submitter that came through sudo may run only have / run / status
+for verb in janitor guard warm-env unit promote warm-unit nonsense; do
+  a1_out="$(SUDO_USER=pneuma-submit "$RUNNER" "$verb" 2>&1)" && a1_rc=0 || a1_rc=$?
+  check "A1: through sudo the verb '$verb' is refused (75), the sudoers rule's three verbs only" bash -c '[ "$1" = 75 ] && grep -q "not available through the submit path" <<<"$2"' _ "$a1_rc" "$a1_out"
+done
+check "A1: through sudo, status is still served" bash -c 'SUDO_USER=pneuma-submit "$1" status | grep -q "^host="' _ "$RUNNER"
+
+# A2. the submitter's cap is enforced BEFORE the runner reads the bundle, promotes it, claims a loopback
+# address or touches the store: an over-cap submitter costs the host nothing
+mkdir -p "$PNEUMA_GATE_DEDUP_DIR"; rm -f "$PNEUMA_GATE_DEDUP_DIR"/*
+sleep 300 & cap_pid=$!
+for n in 1 2 3; do
+  bash -c 'source "$1"; mkdir -p "$PNEUMA_GATE_DEDUP_DIR"; printf "key=\nhead=%s\npid=%s\npstart=%s\nsubmitter=capped\nunit=pneuma-gate-cap-%s.service\nsuperseded=\n" "$3" "$2" "$(proc_start "$2")" "$4" > "$PNEUMA_GATE_DEDUP_DIR/cap-$4"' _ "$RUNNER" "$cap_pid" "$head" "$n"
+done
+: > "$SCOPE_RECORD"; : > "$IP_RECORD"; ls "$PNEUMA_GATE_STATE_DIR/in" > "$work/in-before.txt"
+git init -q --bare "$work/cap-bundle-src.git" 2>/dev/null
+a2_out="$("$RUNNER" run --submitter capped --profile fake --repo capfresh --head "$head" --base "$base" --tree "$tree" --bundle < /dev/null 2>&1)" && a2_rc=0 || a2_rc=$?
+check "A2: a submitter at its cap is refused (75, named)" bash -c '[ "$1" = 75 ] && grep -q "already holds" <<<"$2"' _ "$a2_rc" "$a2_out"
+check "A2: ...before any promote unit ran" bash -c '! grep -q -- "--unit=pneuma-promote-" "$1"' _ "$SCOPE_RECORD"
+check "A2: ...before a loopback address was claimed" bash -c '! grep -q "route add local" "$1"' _ "$IP_RECORD"
+check "A2: ...before a bundle was staged" bash -c 'ls "$1/in" | cmp -s - "$2"' _ "$PNEUMA_GATE_STATE_DIR" "$work/in-before.txt"
+check "A2: ...and before the object store for the repo was created" test ! -d "$PNEUMA_GATE_BASE/repos/capfresh.git"
+check "A2: another submitter is not blocked by that cap" bash -c '"$1" run --submitter other-lane --profile fake --repo fakerepo --head "$2" --base "$3" --tree "$4" >/dev/null 2>&1; test $? = 0' _ "$RUNNER" "$head" "$base" "$tree"
+kill "$cap_pid" 2>/dev/null; rm -f "$PNEUMA_GATE_DEDUP_DIR"/*
+
+# A3. the claimed names are compared as fixed strings, and a bad branch is refused before anything is staged
+dgit update-ref refs/pneuma-gate/repo/aXb "$C2"
+dgit update-ref refs/pneuma-gate/branch/mainX "$C2"
+dgit bundle create "$work/regex.bundle" refs/pneuma-gate/repo/aXb refs/pneuma-gate/branch/mainX >/dev/null 2>&1
+check "A3: a claimed repo 'a.b' does NOT bind to a bundle carrying 'aXb' (no pattern matching)" \
+  not ddo bundle_binds "$work/regex.bundle" a.b mainX "$C2"
+check "A3: a claimed branch 'main.' does NOT bind to 'mainX'" \
+  not ddo bundle_binds "$work/regex.bundle" aXb main. "$C2"
+check "A3: the exact names still bind" ddo bundle_binds "$work/regex.bundle" aXb mainX "$C2"
+# the call site, not only the function: a run whose bundle does not carry the claimed repo/branch is
+# refused by cmd_run itself (75, named), and one that does carry it gets past the binding
+bind_bad="$("$RUNNER" run --submitter bind-lane --profile fake --repo fakerepo --head "$head" --base "$base" --tree "$tree" --branch other --bundle < "$work/bind.bundle" 2>&1)" && bind_bad_rc=0 || bind_bad_rc=$?
+check "B: cmd_run refuses a bundle that does not carry the claimed repo and branch (75, named)" bash -c '[ "$1" = 75 ] && grep -q "does not carry" <<<"$2"' _ "$bind_bad_rc" "$bind_bad"
+bind_ok="$("$RUNNER" run --submitter bind-lane --profile fake --repo aXb --head "$C2" --base "$C2" --tree "$(dgit rev-parse "$C2^{tree}")" --branch mainX --bundle < "$work/regex.bundle" 2>&1)" || true
+check "B: ...and the same call with names the bundle does carry gets past the binding" bash -c '! grep -q "does not carry" <<<"$1" && grep -q "gate for aXb branch mainX" <<<"$1"' _ "$bind_ok"
+check "B: a claimed repo that merely pattern-matches the bundle's is refused at the call site too" bash -c 'out="$("$1" run --submitter bind-lane --profile fake --repo "a.b" --head "$2" --base "$2" --tree "$3" --branch mainX --bundle < "$4" 2>&1)"; grep -q "does not carry" <<<"$out"' _ "$RUNNER" "$C2" "$(dgit rev-parse "$C2^{tree}")" "$work/regex.bundle"
+: > "$SCOPE_RECORD"
+a3_out="$("$RUNNER" run --submitter test-lane --profile fake --repo fakerepo --head "$head" --base "$base" --tree "$tree" --branch 'a..b' --bundle < "$work/regex.bundle" 2>&1)" && a3_rc=0 || a3_rc=$?
+check "A3: an invalid branch is refused up front (75), before a bundle is staged or promoted" bash -c '[ "$1" = 75 ] && grep -q "bad branch name" <<<"$2" && ! grep -q "pneuma-promote" "$3"' _ "$a3_rc" "$a3_out" "$SCOPE_RECORD"
+
+# A4. liveness by pid + start time: a recycled pid is not a live gate (it would lock a submitter out)
+sleep 300 & rc_pid=$!
+fresh
+for n in 1 2 3; do
+  printf 'key=\nhead=%s\npid=%s\npstart=1\nsubmitter=recyc\nunit=pneuma-gate-rc-%s.service\nsuperseded=\n' "$C1" "$rc_pid" "$n" > "$PNEUMA_GATE_DEDUP_DIR/rc-$n"
+done
+rc_a4=0; ddo dedup_hold new-a4 repoA main "$C2" recyc || rc_a4=$?
+check "A4: records whose pid was recycled (start time differs) do not count toward the cap" test "$rc_a4" = 0
+printf 'key=\nhead=%s\npid=%s\npstart=%s\nsubmitter=live\nunit=pneuma-gate-lv.service\nsuperseded=\n' "$C1" "$rc_pid" "$(bash -c 'source "$1"; proc_start "$2"' _ "$RUNNER" "$rc_pid")" > "$PNEUMA_GATE_DEDUP_DIR/lv-1"
+check "A4: a record whose runner is the same live process counts" bash -c 'source "$1"; mkdir -p "$PNEUMA_GATE_DEDUP_DIR"; [ "$(dedup_count_submitter live)" = 1 ]' _ "$RUNNER"
+kill "$rc_pid" 2>/dev/null; fresh
+
+# ── NETWORK POLICY ──
+net_list() { PNEUMA_GATE_RESOLV_CONFS="$1" bash -c 'source "$1"; net_allow_list 127.77.1.2' _ "$RUNNER"; }
+in_list() { python3 -c '
+import ipaddress, sys
+ip = ipaddress.ip_address(sys.argv[1])
+sys.exit(0 if any(ip in ipaddress.ip_network(n) for n in sys.argv[2].split()) else 1)' "$1" "$2"; }
+# N1. a resolver on 127.0.0.1 (or any non-stub loopback) would open every host-local service: never allowed
+printf 'nameserver 127.0.0.1\nnameserver 127.0.0.2\nnameserver 127.0.0.53\nnameserver 8.8.4.4\nnameserver 2001:4860:4860::8888\n' > "$work/resolv-a.conf"
+# the host's address list is scripted WITHOUT lo, so the loopback rule is what must exclude them (not "it is a local address")
+printf '2: eth0    inet 192.0.2.50/24 brd 192.0.2.255 scope global eth0\n' > "$IP_ADDRS"
+n1="$(net_list "$work/resolv-a.conf")"; : > "$IP_ADDRS"
+check "N1: a resolver on 127.0.0.1 is NOT allowed (DNS fails loudly rather than opening the k3s API)" not in_list 127.0.0.1 "$n1"
+check "N1: nor any other loopback address (127.0.0.2)" not in_list 127.0.0.2 "$n1"
+check "N1: the systemd-resolved stub 127.0.0.53 (DNS only) is allowed" in_list 127.0.0.53 "$n1"
+check "N1: a remote resolver is allowed" in_list 8.8.4.4 "$n1"
+check "N1: an IPv6 resolver adds nothing (no IPv6 in the allow list at all: IPv6 is denied)" bash -c '! grep -q : <<<"$1"' _ "$n1"
+printf 'nameserver 10.99.7.7\n' > "$IP_ADDRS"; printf '2: eth0    inet 10.99.7.7/24 brd 10.99.7.255 scope global eth0\n' > "$IP_ADDRS"
+printf 'nameserver 10.99.7.7\nnameserver 203.0.113.9\n' > "$work/resolv-b.conf"
+n1b="$(net_list "$work/resolv-b.conf")"
+check "N1: a resolver that is one of THIS host's own addresses is NOT allowed" not in_list 10.99.7.7 "$n1b"
+check "N1: a resolver elsewhere is" in_list 203.0.113.9 "$n1b"
+# N2. a point-to-point address line ("peer") must not break the list, and its peer is excluded too
+printf '3: tun0    inet 10.9.0.1 peer 198.51.100.77/32 scope global tun0\n4: eth1    inet 192.0.2.10/24 brd 192.0.2.255 scope global eth1\n' > "$IP_ADDRS"
+n2="$(net_list "$work/resolv-a.conf")"; n2_rc=$?
+check "N2: an address line with a peer does not fail the list" test "$n2_rc" = 0 -a -n "$n2"
+check "N2: the peer address of a tunnel is excluded" not in_list 198.51.100.77 "$n2"
+check "N2: the host's own non-private address is excluded" not in_list 192.0.2.10 "$n2"
+check "N2: its neighbours stay allowed (public egress works)" in_list 198.51.100.78 "$n2"
+: > "$IP_ADDRS"
+# N3. two runs can never hold the same loopback address: the claim retries on a collision
+first_lo="$(bash -c 'source "$1"; run_loopback coll-1.0' _ "$RUNNER")"
+printf '%s\n' "$first_lo" > "$IP_EXISTS"; : > "$IP_RECORD"
+got_lo="$(bash -c 'source "$1"; loopback_claim coll-1' _ "$RUNNER")"
+check "N3: a taken loopback address is skipped, another one is claimed and routed" bash -c '[ -n "$1" ] && [ "$1" != "$2" ] && grep -q "route add local $1/32" "$3"' _ "$got_lo" "$first_lo" "$IP_RECORD"
+for i in 0 1 2 3 4 5 6 7; do bash -c 'source "$1"; run_loopback "coll-2.$2"; echo' _ "$RUNNER" "$i"; done > "$IP_EXISTS"
+check "N3: when every candidate is taken the claim FAILS (the run is refused, never shares an address)" bash -c '! bash -c "source \"$1\"; loopback_claim coll-2" _ "$RUNNER"' _ "$RUNNER"
+: > "$IP_EXISTS"
+# N4. every unit class carries the policy: gate, warm (key and build) get deny-by-default; promote has no network
+: > "$SCOPE_RECORD"
+"$RUNNER" run --submitter test-lane --profile fake --repo fakerepo --head "$head" --base "$base" --tree "$tree" --bundle < "$work/regex.bundle" >/dev/null 2>&1 || true
+chmod -R u+w "$PNEUMA_GATE_BASE/envs" 2>/dev/null; rm -rf "$PNEUMA_GATE_BASE/envs/fake"; mkdir -p "$PNEUMA_GATE_BASE/envs/fake"
+"$RUNNER" warm-env --profile fake --repo fakerepo --ref "$head" >/dev/null 2>&1 || true
+all_units="$(grep -o -- '--unit=[^ ]*' "$SCOPE_RECORD" | sort -u | wc -l)"
+denied="$(grep -c -- '--property=IPAddressDeny=any' "$SCOPE_RECORD")"
+promoted="$(grep -c -- '--property=PrivateNetwork=yes' "$SCOPE_RECORD")"
+check "N4: every systemd-run in the runner either denies the network by default or has none (units seen: $all_units)" test "$all_units" = "$((denied + promoted))"
+check "N4: at least one gate unit and the warm units were among them" test "$denied" -ge 3
+check "N4: no systemd-run in the runner is launched without the policy properties (static)" bash -c '
+  n=$(grep -c "\$SYSTEMD_RUN_BIN\" --unit=" "$1"); m=$(grep -c "\"\${UNIT_PROPS\[@\]}\"\|PrivateNetwork=yes" "$1"); [ "$n" -le "$m" ]' _ "$RUNNER"
+chmod -R u+w "$PNEUMA_GATE_BASE/envs" 2>/dev/null; rm -rf "$PNEUMA_GATE_BASE/envs/fake"; mkdir -p "$PNEUMA_GATE_BASE/envs/fake"
+check "N4: the loopback pool is never 127.0.0.1" bash -c 'for i in $(seq 1 300); do a="$(source "$1"; run_loopback "id-$i")"; [ "$a" != 127.0.0.1 ] && [[ "$a" =~ ^127\.(1[6-9]|[2-9][0-9]|1[0-9][0-9]|2[01][0-9])\. ]] || exit 1; done' _ "$RUNNER"
+
+
+# ════ capacity-cap bypass / fail-open liveness: unknown is OCCUPIED, only positive proof of death frees ════
+fresh_state() { rm -rf "$PNEUMA_GATE_STATE_DIR/runs" "$PNEUMA_GATE_STATE_DIR/in"; mkdir -p "$PNEUMA_GATE_STATE_DIR/runs" "$PNEUMA_GATE_STATE_DIR/in"; : > "$UNITS_FILE"; : > "$SYSTEMCTL_ACTIVE"; }
+admit_one() {  # → can_admit for a 2-core job with MAX_CONCURRENT=1 on an idle 8-core host
+  printf 'MemAvailable: %d kB\n' $((64 * 1024 * 1024)) > "$work/cf-mem"; printf '0.1 1 1 1/1 1\n' > "$work/cf-load"
+  PNEUMA_GATE_MAX_CONCURRENT=1 PNEUMA_GATE_NPROC=8 PNEUMA_GATE_MEMINFO="$work/cf-mem" PNEUMA_GATE_LOADAVG="$work/cf-load" \
+    PNEUMA_GATE_RESERVE_MEM_MB=0 bash -c 'source "$1"; can_admit 2 512' _ "$RUNNER"
+}
+sleep 300 & cf_pid=$!
+cf_start="$(bash -c 'source "$1"; proc_start "$2"' _ "$RUNNER" "$cf_pid")"
+
+# F1. a reservation whose runner cannot be examined holds its slot
+fresh_state
+check "F1: baseline: with nothing running a job is admitted" admit_one
+printf 'pid=nonsense\npstart=1\ncores=2\nmem_mb=512\nstate=admitted\n' > "$PNEUMA_GATE_STATE_DIR/runs/f1-garbage"
+check "F1: a marker with an unparseable pid keeps the slot (the next job is NOT admitted past MAX_CONCURRENT)" not admit_one
+fresh_state; printf 'pid=%s\npstart=\ncores=2\nmem_mb=512\nstate=admitted\n' "$cf_pid" > "$PNEUMA_GATE_STATE_DIR/runs/f1-nostart"
+check "F1: a live pid with no recorded start time keeps the slot" not admit_one
+fresh_state; printf 'garbage with no keys at all\n' > "$PNEUMA_GATE_STATE_DIR/runs/f1-junk"
+check "F1: a marker with no fields keeps the slot" not admit_one
+fresh_state; printf 'pid=999999\npstart=7\ncores=2\nmem_mb=512\nstate=admitted\n' > "$PNEUMA_GATE_STATE_DIR/runs/f1-dead"
+check "F1: a runner that is positively dead (pid not in /proc) releases the slot" admit_one
+fresh_state; printf 'pid=%s\npstart=1\ncores=2\nmem_mb=512\nstate=admitted\n' "$cf_pid" > "$PNEUMA_GATE_STATE_DIR/runs/f1-recycled"
+check "F1: a recycled pid (same pid, other start time) is positive proof of death" admit_one
+fresh_state; printf 'pid=%s\npstart=%s\ncores=2\nmem_mb=512\nstate=admitted\n' "$cf_pid" "$cf_start" > "$PNEUMA_GATE_STATE_DIR/runs/f1-live"
+check "F1: a live runner keeps its slot" not admit_one
+fresh_state; printf 'pid=nonsense\npstart=1\ncores=x\nmem_mb=512\nstate=admitted\n' > "$PNEUMA_GATE_STATE_DIR/runs/f1-badcores"
+check "F1: an unreadable weight is charged as the whole host" bash -c 'source "$1"; PNEUMA_GATE_NPROC=8 live_runs | grep -x "f1-badcores 8 512" >/dev/null' _ "$RUNNER"
+
+# F2. the janitor reclaims ONLY on positive proof of death
+fresh_state
+printf 'pid=nonsense\npstart=1\ncores=2\nmem_mb=512\nstate=admitted\n' > "$PNEUMA_GATE_STATE_DIR/runs/f2-unknown"
+printf 'pid=999999\npstart=7\ncores=2\nmem_mb=512\nstate=admitted\n' > "$PNEUMA_GATE_STATE_DIR/runs/f2-dead"
+printf 'pid=999998\npstart=7\ncores=2\nmem_mb=512\nstate=admitted\n' > "$PNEUMA_GATE_STATE_DIR/runs/f2-dead-unit-active"
+: > "$PNEUMA_GATE_STATE_DIR/in/f2-unknown.bundle"; : > "$PNEUMA_GATE_STATE_DIR/in/f2-orphan-999996.bundle"
+printf 'pneuma-gate-f2-dead-unit-active.service\n' > "$SYSTEMCTL_ACTIVE"
+"$RUNNER" janitor >/dev/null 2>&1
+check "F2: a marker whose runner cannot be examined is NOT reclaimed" test -e "$PNEUMA_GATE_STATE_DIR/runs/f2-unknown"
+check "F2: a positively dead runner with no unit is reclaimed" test ! -e "$PNEUMA_GATE_STATE_DIR/runs/f2-dead"
+check "F2: a dead runner whose unit is still active is NOT reclaimed" test -e "$PNEUMA_GATE_STATE_DIR/runs/f2-dead-unit-active"
+printf 'pid=999997\npstart=7\ncores=2\nmem_mb=512\nstate=admitted\n' > "$PNEUMA_GATE_STATE_DIR/runs/f2-dead-unit-unknown"
+SYSTEMCTL_IS_ACTIVE_BROKEN=1 "$RUNNER" janitor >/dev/null 2>&1
+check "F2: a dead runner whose unit state cannot be read is NOT reclaimed" test -e "$PNEUMA_GATE_STATE_DIR/runs/f2-dead-unit-unknown"
+check "F2: an orphan bundle is reclaimed only with proof (runner dead, unit inactive)" test ! -e "$PNEUMA_GATE_STATE_DIR/in/f2-orphan-999996.bundle"
+check "F2: a bundle whose marker is unreadable is kept" test -e "$PNEUMA_GATE_STATE_DIR/in/f2-unknown.bundle"
+
+# F3. systemctl failing is not "no units running"
+fresh_state
+check "F3: the live-run listing FAILS when systemctl does" bash -c 'SYSTEMCTL_FAIL=1 bash -c "source \"$1\"; ! live_runs >/dev/null 2>&1" _ "$1"' _ "$RUNNER"
+admit_one_fail() { SYSTEMCTL_FAIL=1 admit_one; }
+check "F3: admission refuses when the units cannot be listed" not admit_one_fail
+f3_out="$(SYSTEMCTL_FAIL=1 PNEUMA_GATE_QUEUE_TIMEOUT_S=2 PNEUMA_GATE_POLL_S=1 "$RUNNER" run --submitter test-lane --profile fake --repo fakerepo --head "$head" --base "$base" --tree "$tree" 2>&1)" && f3_rc=0 || f3_rc=$?
+check "F3: a run with an unlistable host waits and times out (75), it is never started blind" bash -c '[ "$1" = 75 ] && grep -q "queue timeout" <<<"$2"' _ "$f3_rc" "$f3_out"
+printf 'pneuma-gate-f3-weird.service - -\n' > "$UNITS_FILE"; printf 'pneuma-gate-f3-weird.service\n' > "$SYSTEMCTL_ACTIVE"
+check "F3: a running unit whose quota cannot be read is charged as the whole host" bash -c 'source "$1"; PNEUMA_GATE_NPROC=8 live_runs | grep -x "f3-weird 8 0" >/dev/null' _ "$RUNNER"
+fresh_state
+check "F3: an unreadable load average counts as saturated (a second gate is not stacked)" bash -c '
+  printf "pneuma-gate-f3-a.service 1 256\n" > "$UNITS_FILE"; printf "pneuma-gate-f3-a.service\n" > "$SYSTEMCTL_ACTIVE"
+  printf "MemAvailable: %d kB\n" $((64*1024*1024)) > "$1/m"
+  ! PNEUMA_GATE_MAX_CONCURRENT=4 PNEUMA_GATE_NPROC=8 PNEUMA_GATE_MEMINFO="$1/m" PNEUMA_GATE_LOADAVG="$1/no-such-loadavg" PNEUMA_GATE_RESERVE_MEM_MB=0 bash -c "source \"$2\"; can_admit 2 512"' _ "$work" "$RUNNER"
+fresh_state
+
+# F4. the guard stops a unit only when its runner is POSITIVELY dead
+printf 'pneuma-gate-f4-unknown.service 1 256\npneuma-gate-f4-dead.service 1 256\n' > "$UNITS_FILE"
+printf 'pid=nonsense\npstart=1\ncores=1\nmem_mb=256\nstate=admitted\n' > "$PNEUMA_GATE_STATE_DIR/runs/f4-unknown"
+printf 'pid=999995\npstart=7\ncores=1\nmem_mb=256\nstate=admitted\n' > "$PNEUMA_GATE_STATE_DIR/runs/f4-dead"
+: > "$SYSTEMCTL_RECORD"; "$RUNNER" guard >/dev/null 2>&1
+check "F4: guard stops the unit of a positively dead runner" grep -qx 'stop pneuma-gate-f4-dead.service' "$SYSTEMCTL_RECORD"
+check "F4: guard leaves the unit of a runner it cannot examine (it may be a healthy gate)" bash -c '! grep -q f4-unknown "$1"' _ "$SYSTEMCTL_RECORD"
+fresh_state; : > "$SYSTEMCTL_RECORD"
+
+# F5. the per-submitter cap counts records whose liveness is unknown, and never deletes or supersedes them
+fresh
+for n in 1 2 3; do printf 'key=\nhead=%s\npid=nonsense\npstart=1\nsubmitter=unk\nunit=pneuma-gate-unk-%s.service\nsuperseded=\n' "$C1" "$n" > "$PNEUMA_GATE_DEDUP_DIR/unk-$n"; done
+f5_rc=0; ddo dedup_hold f5-new repoA main "$C2" unk || f5_rc=$?
+check "F5: three records of unknown liveness hold the submitter at its cap (a fourth gate is refused, exit 2)" test "$f5_rc" = 2
+fresh
+printf 'key=repoA/main\nhead=%s\npid=nonsense\npstart=1\nsubmitter=%s\nunit=pneuma-gate-f5-unk.service\nsuperseded=\n' "$C1" "$SUB_A" > "$PNEUMA_GATE_DEDUP_DIR/f5-unk"
+ddo dedup_admit f5-newer "$dstore" repoA main "$C2" "$SUB_A" >/dev/null 2>&1
+check "F5: an unknown-liveness record is neither deleted nor superseded by a newer head" bash -c 'test -f "$1/f5-unk" && grep -qx "superseded=" "$1/f5-unk"' _ "$PNEUMA_GATE_DEDUP_DIR"
+fresh
+printf 'key=repoA/main\nhead=%s\npid=999994\npstart=7\nsubmitter=%s\nunit=pneuma-gate-f5-dead.service\nsuperseded=\n' "$C1" "$SUB_A" > "$PNEUMA_GATE_DEDUP_DIR/f5-dead"
+ddo dedup_admit f5-newer2 "$dstore" repoA main "$C2" "$SUB_A" >/dev/null 2>&1
+check "F5: a record whose runner and unit are both positively gone is dropped" test ! -e "$PNEUMA_GATE_DEDUP_DIR/f5-dead"
+fresh
+printf 'key=repoA/main\nhead=%s\npid=999993\npstart=7\nsubmitter=%s\nunit=pneuma-gate-f5-dead-active.service\nsuperseded=\n' "$C1" "$SUB_A" > "$PNEUMA_GATE_DEDUP_DIR/f5-dead-active"
+printf 'pneuma-gate-f5-dead-active.service\n' > "$SYSTEMCTL_ACTIVE"
+f5b="$(ddo dedup_count_submitter "$SUB_A")"
+check "F5: a record whose runner is dead but whose unit is active still counts" test "$f5b" = 1
+: > "$SYSTEMCTL_ACTIVE"; fresh
+
+# F6. a queue ticket that cannot be examined is neither deleted nor treated as the head
+printf 'garbage\n' > "$PNEUMA_GATE_BASE/queue/1-unk"
+"$RUNNER" janitor >/dev/null 2>&1
+check "F6: an unparseable ticket is kept by the janitor" test -e "$PNEUMA_GATE_BASE/queue/1-unk"
+check "F6: ...and is never the head of the queue" bash -c 'source "$1"; [ "$(first_live_waiter)" != 1-unk ]' _ "$RUNNER"
+rm -f "$PNEUMA_GATE_BASE"/queue/*; kill "$cf_pid" 2>/dev/null
+
 
 exit "$fail"

@@ -91,10 +91,10 @@ state_init() {
   mkdir -p "$STATE_DIR/runs" "$STATE_DIR/in" && chmod 0700 "$STATE_DIR" "$STATE_DIR/runs" "$STATE_DIR/in"
 }
 proc_start() { sed 's/.*) //' "/proc/$1/stat" 2>/dev/null | awk '{print $20}'; }   # starttime of a pid
-state_mark() {  # <run id> <runner pid> <cores> <mem_mb> <queued|admitted>: only an admitted marker holds capacity
+state_mark() {  # <run id> <runner pid> <cores> <mem_mb> <queued|admitted|warm> [loopback]: only an admitted marker holds capacity
   local f="$STATE_DIR/runs/$1" tmp="$STATE_DIR/runs/.$1.$$"
   [ -L "$f" ] && return 1
-  printf 'pid=%s\npstart=%s\ncores=%s\nmem_mb=%s\nstate=%s\n' "$2" "$(proc_start "$2")" "$3" "$4" "${5:-admitted}" > "$tmp" && mv -f "$tmp" "$f"
+  printf 'pid=%s\npstart=%s\ncores=%s\nmem_mb=%s\nstate=%s\nloopback=%s\n' "$2" "$(proc_start "$2")" "$3" "$4" "${5:-admitted}" "${6:-}" > "$tmp" && mv -f "$tmp" "$f"
 }
 state_get() {  # <run id> <key>
   local f="$STATE_DIR/runs/$1"
@@ -102,28 +102,55 @@ state_get() {  # <run id> <key>
   sed -n "s/^$2=//p" "$f" | head -1
 }
 state_remove() { [ -L "$STATE_DIR/runs/$1" ] || rm -f "$STATE_DIR/runs/$1"; }
-ticket_alive() {  # <ticket file>: its content is "<pid> <start time>"; a recycled pid does not match
-  local pid pstart
-  read -r pid pstart < "$1" 2>/dev/null || return 1
-  case "$pid" in ''|*[!0-9]*) return 1;; esac
-  [ -n "$pstart" ] && [ "$(proc_start "$pid")" = "$pstart" ]
+# Liveness is three-valued. "dead" needs POSITIVE proof (the pid is not in /proc, or it is there with a
+# different start time); anything that cannot be parsed or read is "unknown", and unknown counts as
+# OCCUPIED: it holds its slot and its place, and only a positive "dead" lets a reservation, a ticket or a
+# record be reclaimed. A slot is never freed because its owner could not be examined.
+proc_state() {  # <pid> <pstart>: alive | dead | unknown
+  local pid="$1" pstart="$2" now
+  case "$pid" in ''|*[!0-9]*) echo unknown; return;; esac
+  [ -r /proc/self/stat ] || { echo unknown; return; }          # /proc itself is not usable: cannot tell
+  if [ ! -e "/proc/$pid" ]; then echo dead; return; fi          # no such process: positive proof
+  [ -n "$pstart" ] || { echo unknown; return; }
+  now="$(proc_start "$pid")"
+  [ -n "$now" ] || { echo unknown; return; }
+  if [ "$now" = "$pstart" ]; then echo alive; else echo dead; fi   # same pid, another start time: recycled
 }
-runner_alive() {  # <run id>: the runner that holds this reservation is still the same live process
-  local pid pstart
-  pid="$(state_get "$1" pid)"; pstart="$(state_get "$1" pstart)"
-  case "$pid" in ''|*[!0-9]*) return 1;; esac
-  [ -n "$pstart" ] && [ "$(proc_start "$pid")" = "$pstart" ]
+unit_state() {  # <unit>: active | inactive | unknown (systemctl is-active's own words; anything else is unknown)
+  local out; out="$("$SYSTEMCTL_BIN" is-active "$1" 2>/dev/null)"
+  case "$out" in
+    active|activating|deactivating|reloading|refreshing) echo active;;
+    inactive|failed) echo inactive;;
+    *) echo unknown;;
+  esac
 }
+ticket_state() {  # <ticket file>: its content is "<pid> <start time>"
+  local pid pstart
+  read -r pid pstart < "$1" 2>/dev/null || { echo unknown; return; }
+  proc_state "$pid" "$pstart"
+}
+runner_state() {  # <run id>: the runner that holds this reservation
+  local f="$STATE_DIR/runs/$1"
+  [ -L "$f" ] && { echo unknown; return; }
+  [ -e "$f" ] || { echo dead; return; }                          # no record at all: nothing holds it
+  [ -f "$f" ] || { echo unknown; return; }
+  proc_state "$(state_get "$1" pid)" "$(state_get "$1" pstart)"
+}
+runner_alive() { [ "$(runner_state "$1")" = alive ]; }
+runner_dead() { [ "$(runner_state "$1")" = dead ]; }
 
 live_runs() {   # prints "<id> <cores> <mem_mb>"
   local unit id cores mem active f quota bytes
-  active="$("$SYSTEMCTL_BIN" list-units --plain --no-legend --state=active,activating,deactivating 'pneuma-gate-*.service' 2>/dev/null | awk '{print $1}')"
+  # If the units cannot be listed the capacity is UNKNOWN, not zero: fail (admission then refuses).
+  active="$("$SYSTEMCTL_BIN" list-units --plain --no-legend --state=active,activating,deactivating 'pneuma-gate-*.service' 2>/dev/null)" || return 1
+  active="$(awk '{print $1}' <<<"$active")"
   while read -r unit; do
     [ -n "$unit" ] || continue
     id="${unit#pneuma-gate-}"; id="${id%.service}"
     quota="$("$SYSTEMCTL_BIN" show -p CPUQuotaPerSecUSec --value "$unit" 2>/dev/null)"
     bytes="$("$SYSTEMCTL_BIN" show -p MemoryMax --value "$unit" 2>/dev/null)"
-    cores="$(awk -v q="$quota" 'BEGIN { sub(/s$/, "", q); c = int(q + 0.5); if (c < 1) c = 1; print c }')"
+    # a quota that cannot be read is charged as the whole host, never as the smallest unit
+    cores="$(awk -v q="$quota" -v all="$NPROC" 'BEGIN { sub(/s$/, "", q); if (q !~ /^[0-9]+(\.[0-9]+)?$/) { print all; exit } c = int(q + 0.5); if (c < 1) c = 1; print c }')"
     case "$bytes" in ''|*[!0-9]*) mem=0;; *) mem=$(( bytes / 1048576 ));; esac
     printf '%s %s %s\n' "$id" "$cores" "$mem"
   done <<< "$active"
@@ -132,9 +159,10 @@ live_runs() {   # prints "<id> <cores> <mem_mb>"
     [ -f "$f" ] && [ ! -L "$f" ] || continue
     id="$(basename "$f")"
     grep -qx "pneuma-gate-$id.service" <<< "$active" && continue   # its unit is counted already
-    runner_alive "$id" || continue
-    [ "$(state_get "$id" state)" = queued ] && continue   # staged and waiting: holds no capacity yet
-    printf '%s %s %s\n' "$id" "$(state_get "$id" cores)" "$(state_get "$id" mem_mb)"
+    runner_dead "$id" && continue            # only a positively dead runner releases its reservation
+    case "$(state_get "$id" state)" in queued|warm) continue;; esac   # staged and waiting, or an operator build: holds no gate capacity
+    cores="$(state_get "$id" cores)"; case "$cores" in ''|*[!0-9]*) cores="$NPROC";; esac   # unreadable weight = the whole host
+    printf '%s %s %s\n' "$id" "$cores" "$(state_get "$id" mem_mb)"
   done
 }
 
@@ -142,8 +170,10 @@ can_admit() {
   local cores="$1" mem="$2" n=0 used_c=0 id c m
   while read -r id c m; do
     [ -n "$id" ] || continue
+    [ "$id" = LIVE-RUNS-UNKNOWN ] && return 1          # the units could not be listed: nothing is known to be free
+    case "$c" in ''|*[!0-9]*) c="$NPROC";; esac
     n=$((n + 1)); used_c=$((used_c + c))
-  done < <(live_runs)
+  done < <(live_runs || echo "LIVE-RUNS-UNKNOWN 0 0")
   [ "$n" -ge "$MAX_CONCURRENT" ] && return 1
   # Core budget = cores minus the reserve; one gate is always allowed to use
   # its own weight so a tiny host still makes progress.
@@ -154,7 +184,8 @@ can_admit() {
   [ $(($(mem_available_mb) - RESERVE_MEM_MB)) -lt "$mem" ] && return 1
   # Load: when the host is already saturated by runners/k3s, only the first
   # gate may start (never stack gates on a starved box).
-  if [ "$n" -gt 0 ] && [ "$(load1_x100)" -gt $((NPROC * LOAD_CEILING_PCT)) ]; then return 1; fi
+  local load; load="$(load1_x100)"; case "$load" in ''|*[!0-9]*) load=999999999;; esac   # unreadable load = saturated
+  if [ "$n" -gt 0 ] && [ "$load" -gt $((NPROC * LOAD_CEILING_PCT)) ]; then return 1; fi
   return 0
 }
 
@@ -186,21 +217,21 @@ cmd_janitor() {
   loopback_sweep
   for f in "$BASE_DIR"/queue/*; do
     [ -e "$f" ] || continue
-    ticket_alive "$f" || rm -f "$f"
+    [ "$(ticket_state "$f")" = dead ] && rm -f "$f"     # unknown stays: only a positive death frees a place
   done
   for f in "$STATE_DIR"/runs/*; do
     [ -f "$f" ] && [ ! -L "$f" ] || continue
     id="$(basename "$f")"
-    runner_alive "$id" && continue
-    "$SYSTEMCTL_BIN" is-active --quiet "pneuma-gate-$id.service" && continue
+    runner_dead "$id" || continue
+    [ "$(unit_state "pneuma-gate-$id.service")" = inactive ] || continue
     rm -f "$f"
   done
   for f in "$STATE_DIR"/in/*; do
     [ -f "$f" ] && [ ! -L "$f" ] || continue
     id="$(basename "$f" .bundle)"
     [ -f "$STATE_DIR/runs/$id" ] && continue
-    runner_alive "$id" && continue   # a queued runner has staged its bundle (its marker is "queued")
-    "$SYSTEMCTL_BIN" is-active --quiet "pneuma-gate-$id.service" && continue
+    runner_dead "$id" || continue    # a queued runner has staged its bundle (its marker is "queued")
+    [ "$(unit_state "pneuma-gate-$id.service")" = inactive ] || continue
     rm -f "$f"
   done
   # keep-refs older than 2 days no longer pin their objects
@@ -224,7 +255,7 @@ cmd_guard() {
   while read -r unit; do
     [ -n "$unit" ] || continue
     id="${unit#pneuma-gate-}"; id="${id%.service}"
-    if [ "$low" = 1 ] || ! runner_alive "$id"; then
+    if [ "$low" = 1 ] || runner_dead "$id"; then
       log "guard: stopping $unit (${low:+disk low or }runner gone)"
       "$SYSTEMCTL_BIN" stop "$unit" >/dev/null 2>&1
     fi
@@ -267,28 +298,51 @@ SANDBOX_PROPS=(
 # docker networks), and every address configured on this host (so its public address does not loop back
 # to host-local services). Deny-by-default; the allow list is the complement of those ranges.
 net_allow_list() {   # <per-run loopback address> → space separated CIDRs
-  local resolvers
-  resolvers="$(cat /etc/resolv.conf /run/systemd/resolve/resolv.conf 2>/dev/null | awk '$1=="nameserver"{print $2}' | tr '\n' ' ')"
-  { ip -4 -o addr show 2>/dev/null | awk '{print $4}' | sed 's#/.*##' | sed 's#$#/32#'; } |
+  local confs="${PNEUMA_GATE_RESOLV_CONFS:-/etc/resolv.conf /run/systemd/resolve/resolv.conf}" resolvers
+  # shellcheck disable=SC2086
+  resolvers="$(cat $confs 2>/dev/null | awk '$1=="nameserver"{print $2}' | tr '\n' ' ')"
+  # Every IPv4 token of every address line (local, peer and broadcast addresses alike: a point-to-point
+  # tunnel line carries a "peer" address that is just as host-local), as /32 exclusions.
+  "$IP_BIN" -4 -o addr show 2>/dev/null |
     python3 -c '
-import ipaddress, sys
+import ipaddress, re, sys
 lo, resolvers = sys.argv[1], sys.argv[2].split()
+local = set()
+for line in sys.stdin:
+    for tok in re.findall(r"\b\d{1,3}(?:\.\d{1,3}){3}\b", line):
+        try:
+            local.add(ipaddress.ip_address(tok))
+        except ValueError:
+            pass
 excl = [ipaddress.ip_network(n) for n in (
     "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12",
     "192.0.0.0/24", "192.168.0.0/16", "198.18.0.0/15", "224.0.0.0/3")]
-excl += [ipaddress.ip_network(l.strip()) for l in sys.stdin if l.strip()]
+excl += [ipaddress.ip_network(f"{a}/32") for a in local]
 nets = [ipaddress.ip_network("0.0.0.0/0")]
 for e in excl:
     nxt = []
     for n in nets:
-        if e.version != n.version or not n.overlaps(e):
+        if not n.overlaps(e):
             nxt.append(n)
         elif e.subnet_of(n):
             nxt.extend(n.address_exclude(e) if e != n else [])
         # else: n is inside e, dropped
     nets = nxt
 out = [str(n) for n in ipaddress.collapse_addresses(nets)]
-out += [f"{r}/32" for r in resolvers if r.count(".") == 3] + [f"{lo}/32"]
+# A resolver is reachable on every port, so only one that is not this host qualifies: not one of the host
+# own addresses, and on loopback only the systemd-resolved stub (127.0.0.53, DNS only). A resolver on
+# 127.0.0.1 would open the host-local services; DNS then fails loudly instead.
+for r in resolvers:
+    try:
+        ip = ipaddress.ip_address(r)
+    except ValueError:
+        continue
+    if ip.version != 4 or ip in local:
+        continue
+    if ip.is_loopback and str(ip) != "127.0.0.53":
+        continue
+    out.append(f"{ip}/32")
+out.append(f"{lo}/32")
 print(" ".join(out))' "$1" "$resolvers"
 }
 run_loopback() {   # <run id> → a loopback address no other run uses and that is not 127.0.0.1
@@ -299,15 +353,22 @@ run_loopback() {   # <run id> → a loopback address no other run uses and that 
 # (rightly) does not allow 127.0.0.1. A host route per run makes the source the run's own address, so
 # only that address is ever used on loopback. Removed with the run; the janitor sweeps the stale ones.
 IP_BIN="${PNEUMA_GATE_IP:-ip}"
-loopback_up() { "$IP_BIN" route replace local "$1/32" dev lo scope host src "$1"; }
+loopback_claim() {   # <run id> → prints a per-run loopback address that no other run holds, route in place
+  local i addr
+  for i in 0 1 2 3 4 5 6 7; do
+    addr="$(run_loopback "$1.$i")"
+    # `route add` (not replace) fails when the address is already routed: a collision with another run
+    if "$IP_BIN" route add local "$addr/32" dev lo scope host src "$addr" 2>/dev/null; then printf '%s' "$addr"; return 0; fi
+  done
+  return 1
+}
 loopback_down() { "$IP_BIN" route del local "$1/32" dev lo >/dev/null 2>&1; return 0; }
 loopback_sweep() {   # drop the per-run routes of runs that are gone
-  local keep r addr u
-  keep="$("$SYSTEMCTL_BIN" list-units --plain --no-legend --state=active,activating,deactivating 'pneuma-gate-*.service' 'pneuma-warm-*.service' 2>/dev/null | awk '{print $1}' |
-    while read -r u; do u="${u#pneuma-gate-}"; u="${u#pneuma-warm-}"; run_loopback "${u%.service}"; echo; done)"
+  local keep="" r addr
   for r in "$STATE_DIR"/runs/*; do
     [ -f "$r" ] && [ ! -L "$r" ] || continue
-    runner_alive "$(basename "$r")" && keep="$keep"$'\n'"$(run_loopback "$(basename "$r")")"
+    runner_dead "$(basename "$r")" && continue
+    keep="$keep"$'\n'"$(state_get "$(basename "$r")" loopback)"
   done
   "$IP_BIN" route show table local 2>/dev/null | awk '$1=="local" && $2 ~ /^127\.(1[6-9]|[2-9][0-9]|1[0-9][0-9]|2[01][0-9])\.[0-9]+\.[0-9]+$/ {print $2}' |
     while read -r addr; do grep -qxF "$addr" <<<"$keep" || loopback_down "$addr"; done
@@ -366,8 +427,24 @@ DEDUP_DIR="${PNEUMA_GATE_DEDUP_DIR:-/var/lib/pneuma-gate-dedup}"
 PER_SUBMITTER_CAP="${PNEUMA_GATE_PER_SUBMITTER_CAP:-3}"   # live gates one submitter may hold at once (queued + running)
 dedup_register() {  # <id> <key> <head> <submitter> <unit>
   mkdir -p "$DEDUP_DIR" && chmod 0700 "$DEDUP_DIR" || return 1
-  printf 'key=%s\nhead=%s\npid=%s\nsubmitter=%s\nunit=%s\nsuperseded=\n' "$2" "$3" "$$" "$4" "$5" > "$DEDUP_DIR/$1"
+  printf 'key=%s\nhead=%s\npid=%s\npstart=%s\nsubmitter=%s\nunit=%s\nsuperseded=\n' "$2" "$3" "$$" "$(proc_start "$$")" "$4" "$5" > "$DEDUP_DIR/$1"
 }
+# A record is live while its runner is the SAME process (pid + start time, so a recycled pid is not
+# mistaken for it) or its unit is active. A record without a start time (older runner) falls back to the pid.
+dedup_state() {  # <id>: alive | dead | unknown; dead needs the runner AND the unit both positively gone
+  local pid pstart ps us
+  pid="$(dedup_field "$1" pid)"; pstart="$(dedup_field "$1" pstart)"
+  # a record without a start time (older runner) is judged by the pid alone: present is alive, absent is dead
+  if [ -n "$pid" ] && [ -z "$pstart" ] && [[ "$pid" =~ ^[0-9]+$ ]]; then
+    if [ -e "/proc/$pid" ]; then ps=alive; else ps=dead; fi
+  else
+    ps="$(proc_state "$pid" "$pstart")"
+  fi
+  us="$(unit_state "$(dedup_field "$1" unit)")"
+  [ "$ps" = alive ] || [ "$us" = active ] && { echo alive; return; }
+  if [ "$ps" = dead ] && [ "$us" = inactive ]; then echo dead; else echo unknown; fi
+}
+dedup_alive() { [ "$(dedup_state "$1")" != dead ]; }    # unknown counts as live (occupied)
 dedup_field() {  # <id> <field>
   local f="$DEDUP_DIR/$1"
   [ -f "$f" ] && [ ! -L "$f" ] || return 0
@@ -389,9 +466,11 @@ dedup_supersede() {  # <id> <store> <key> <head> <submitter>
     [ "$(dedup_field "$other" submitter)" = "$5" ] || continue     # never another submitter's gate
     old="$(dedup_field "$other" head)"
     [ "$old" = "$4" ] && continue
-    if ! kill -0 "$(dedup_field "$other" pid)" 2>/dev/null && ! "$SYSTEMCTL_BIN" is-active --quiet "$(dedup_field "$other" unit)" 2>/dev/null; then
-      rm -f "$f"; continue                     # neither its runner nor its unit exists any more
-    fi
+    case "$(dedup_state "$other")" in
+      dead) rm -f "$f"; continue;;             # both its runner and its unit are positively gone
+      alive) ;;
+      *) log "not superseding run $other: its liveness is unknown"; continue;;   # unknown: cancel nothing, delete nothing
+    esac
     if git --git-dir="$store" merge-base --is-ancestor "$4" "$old" 2>/dev/null; then
       log "not superseding run $other: head ${4:0:12} is older than its head ${old:0:12}"
       continue                                  # an older commit never cancels a newer gate
@@ -419,11 +498,29 @@ dedup_count_submitter() {  # <submitter>: live gates (queued or running) that su
     [ -f "$f" ] && [ ! -L "$f" ] || continue
     other="$(basename "$f")"
     [ "$(dedup_field "$other" submitter)" = "$1" ] || continue
-    if kill -0 "$(dedup_field "$other" pid)" 2>/dev/null || "$SYSTEMCTL_BIN" is-active --quiet "$(dedup_field "$other" unit)" 2>/dev/null; then
-      n=$((n + 1))
-    fi
+    if dedup_alive "$other"; then n=$((n + 1)); fi
   done
   echo "$n"
+}
+# The two halves of the admission decision, each under the root lock. HOLD runs first thing in a run: it
+# enforces the submitter's cap and records the run, before the runner reads a byte of the bundle, promotes
+# anything or touches the store, so an over-cap submitter costs the host nothing. DECIDE runs once the bundle
+# is in the store (ancestry needs it) and supersedes the older gates.
+dedup_hold() {  # <id> <repo> <branch> <head> <submitter>: 0 recorded, 2 over the submitter's cap
+  (
+    mkdir -p "$DEDUP_DIR" && chmod 0700 "$DEDUP_DIR" || exit 1
+    exec 8>"$DEDUP_DIR/.lock"
+    flock 8 || exit 1
+    [ "$(dedup_count_submitter "$5")" -lt "$PER_SUBMITTER_CAP" ] || exit 2
+    dedup_register "$1" "${3:+$2/$3}" "$4" "$5" "pneuma-gate-$1.service" || exit 1
+  )
+}
+dedup_decide() {  # <id> <store> <repo> <branch> <head> <submitter>
+  (
+    exec 8>"$DEDUP_DIR/.lock"
+    flock 8 || exit 1
+    dedup_supersede "$1" "$2" "${4:+$3/$4}" "$5" "$6"
+  )
 }
 dedup_admit() {  # <id> <store> <repo> <branch> <head> <submitter>: 0 recorded, 2 over the submitter's cap
   (
@@ -444,15 +541,17 @@ bundle_binds() {  # <bundle file> <repo> <branch> <head>
   local heads
   # from /, never the caller's directory: a stray .git there (a worktree's, say) must not decide
   heads="$(cd / && git bundle list-heads "$1" 2>/dev/null)" || return 1
-  grep -qx "$4 refs/pneuma-gate/repo/$2" <<< "$heads" && grep -qx "$4 refs/pneuma-gate/branch/$3" <<< "$heads"
+  grep -qxF "$4 refs/pneuma-gate/repo/$2" <<< "$heads" && grep -qxF "$4 refs/pneuma-gate/branch/$3" <<< "$heads"
 }
 dedup_remove() { [ -L "$DEDUP_DIR/$1" ] || rm -f "$DEDUP_DIR/$1"; }
 
 first_live_waiter() {
   local f
   for f in $(ls "$BASE_DIR/queue" 2>/dev/null | sort); do
-    if ticket_alive "$BASE_DIR/queue/$f"; then printf '%s' "$f"; return 0; fi
-    rm -f "$BASE_DIR/queue/$f"
+    case "$(ticket_state "$BASE_DIR/queue/$f")" in
+      alive) printf '%s' "$f"; return 0;;
+      dead) rm -f "$BASE_DIR/queue/$f";;
+    esac
   done
 }
 
@@ -483,7 +582,7 @@ reserve_capacity() {   # <cores> <mem_mb>: 0 when this run holds a reservation
     flock 9 || exit 1
     [ "$(first_live_waiter)" = "$(basename "$QUEUE_FILE")" ] || exit 1
     can_admit "$cores" "$mem" || exit 1
-    state_mark "$RUN_ID" "$$" "$cores" "$mem" admitted || exit 1
+    state_mark "$RUN_ID" "$$" "$cores" "$mem" admitted "$LOOPBACK" || exit 1
   )
 }
 
@@ -551,6 +650,10 @@ cmd_run() {
   [[ "$head" =~ ^[0-9a-f]{40}$ && "$base" =~ ^[0-9a-f]{40}$ && "$tree" =~ ^[0-9a-f]{40}$ ]] || refuse "head/base/tree must be 40-hex"
   [[ -z "$origin_main" || "$origin_main" =~ ^[0-9a-f]{40}$ ]] || refuse "bad --origin-main"
   [[ -z "$shallow" || "$shallow" =~ ^[0-9a-f]{40}(,[0-9a-f]{40})*$ ]] || refuse "bad --shallow"
+  # a branch is a name the runner compares and records: validated here, before it is used anywhere
+  if [ -n "$branch" ]; then
+    [[ "$branch" =~ ^[A-Za-z0-9._/-]{1,200}$ && "$branch" != *..* ]] || refuse "bad branch name"
+  fi
   check_host || refuse "host $(hostname) is not the approved builder ($EXPECT_HOST)"
   [ -r "$PROFILE_DIR/$profile.sh" ] || refuse "no gate profile '$profile' in $PROFILE_DIR"
   command -v "$SYSTEMD_RUN_BIN" >/dev/null 2>&1 || refuse "no $SYSTEMD_RUN_BIN: the gate's service unit is required"
@@ -571,15 +674,27 @@ cmd_run() {
   cores="$(profile_cores)"; mem="$(profile_mem_mb)"
   [[ "$cores" =~ ^[0-9]+$ && "$mem" =~ ^[0-9]+$ ]] || refuse "profile $profile has no numeric limits"
 
+  RUN_ID="$(date +%Y%m%dT%H%M%S)-$$"; UNIT="pneuma-gate-$RUN_ID"
+  DEDUP_ID="$RUN_ID"          # also the gate's unit name: pneuma-gate-<id>
+  # FIRST: the submitter's cap, and the record of this run. Nothing below (the store, the loopback route,
+  # the bundle, the promote unit) happens for a submitter that is over its cap.
+  log "gate for ${repo:-?} branch ${branch:-(detached)} head ${head:0:12} submitter $SUBMITTER"
+  dedup_hold "$DEDUP_ID" "$repo" "$branch" "$head" "$SUBMITTER"
+  case $? in
+    0) ;;
+    2) DEDUP_ID=""; refuse "submitter already holds $PER_SUBMITTER_CAP queued or running gates; wait for them";;
+    *) DEDUP_ID=""; refuse "cannot record the gate";;
+  esac
   local store; store="$(store_for "$repo")"
   if [ ! -d "$store" ]; then as_gate git init -q --bare "$store" || refuse "cannot init object store"; fi
-  RUN_ID="$(date +%Y%m%dT%H%M%S)-$$"; UNIT="pneuma-gate-$RUN_ID"
   # A queued marker (pid + start time) exists before anything is staged, so the janitor never takes
   # a waiting runner's bundle; it holds no capacity until admit() makes it an admitted marker.
   state_mark "$RUN_ID" "$$" "$cores" "$mem" queued || refuse "cannot record the run"
-  local loopback; loopback="$(run_loopback "$RUN_ID")"
+  # The run's own loopback address: claimed with `ip route add`, which fails if any other run holds it.
+  local loopback; loopback="$(loopback_claim "$RUN_ID")" || refuse "cannot claim a loopback address for the run"
+  LOOPBACK="$loopback"
+  state_mark "$RUN_ID" "$$" "$cores" "$mem" queued "$loopback" || refuse "cannot record the run"
   unit_props "$loopback" || refuse "cannot build the unit's properties (network allow list or write cap): see the message above"
-  LOOPBACK="$loopback"; loopback_up "$loopback" || refuse "cannot set up the run's loopback address"
   # The bundle is only staged, read-only, for the unit to unpack. The file is world-readable so
   # the unit's own uid can read it, but it sits in a 0700 root directory: the only way to it
   # is the bind mount of this one run.
@@ -598,19 +713,7 @@ cmd_run() {
   # The bundle goes into the object store first (sandboxed promote unit), so the supersession decision
   # can tell ancestry from the store; the gate unit still unpacks the bundle itself for its own run.
   if [ "$bundle" = 1 ]; then promote_bundle "$store" "$BUNDLE_FILE" "$shallow" || true; fi
-  DEDUP_ID="$RUN_ID"          # also the gate's unit name: pneuma-gate-<id>
-  # Every run is recorded under its submitter (the fairness cap applies to all of them). Only a run with a
-  # branch has a key, and only a key ever supersedes: a detached run supersedes nothing.
-  if [ -n "$branch" ] && ! [[ "$branch" =~ ^[A-Za-z0-9._/-]{1,200}$ ]] || [[ "$branch" == *..* ]]; then
-    refuse "bad branch name"
-  fi
-  log "gate for ${repo:-?} branch ${branch:-(detached)} head ${head:0:12} submitter $SUBMITTER"
-  dedup_admit "$DEDUP_ID" "$store" "$repo" "$branch" "$head" "$SUBMITTER"
-  case $? in
-    0) ;;
-    2) refuse "submitter already holds $PER_SUBMITTER_CAP queued or running gates; wait for them";;
-    *) refuse "cannot record the gate";;
-  esac
+  dedup_decide "$DEDUP_ID" "$store" "$repo" "$branch" "$head" "$SUBMITTER"
   admit "$cores" "$mem"   # reserves capacity (counted while this runner is alive); systemd creates the run's directories
 
   local rc run_dir="$RUN_ROOT/$RUN_ID" work_dir="$UNIT_WORK/$RUN_ID"
@@ -781,8 +884,9 @@ cmd_warm_env() {
 
 warm_unit() {   # <id> <store> <profile> <ref> <cores> <mem> <key|build> <slot bind or empty>
   local id="$1" store="$2" profile="$3" ref="$4" cores="$5" mem="$6" mode="$7" slot="$8" binds=() lo
-  lo="$(run_loopback "$id")"; unit_props "$lo" || return 75
-  loopback_up "$lo" || return 75
+  lo="$(loopback_claim "$id")" || return 75
+  state_mark "$id" "$$" 0 0 warm "$lo" || { loopback_down "$lo"; return 75; }
+  unit_props "$lo" || { loopback_down "$lo"; state_remove "$id"; return 75; }
   [ -n "$slot" ] && binds=(--property=BindPaths="$slot" --property=ExecStartPre="+$(command -v chown) --reference=$RUN_ROOT/$id ${slot#*:}")
   "$SYSTEMD_RUN_BIN" --unit="pneuma-warm-$id" --wait --collect --pipe --quiet "${SANDBOX_PROPS[@]}" "${UNIT_PROPS[@]}" \
     --property=MemoryMax="${mem}M" --property=CPUQuota="$((cores * 100))%" --property=TasksMax=512 \
@@ -795,7 +899,7 @@ warm_unit() {   # <id> <store> <profile> <ref> <cores> <mem> <key|build> <slot b
       PNEUMA_GATE_WHEELS_MOUNT="$WHEELS_MOUNT" PNEUMA_GATE_LOOPBACK="$lo" \
     "$SELF" warm-unit "$mode" --profile "$profile" --ref "$ref" </dev/null
   local rc=$?
-  loopback_down "$lo"
+  loopback_down "$lo"; state_remove "$id"
   return "$rc"
 }
 
@@ -828,6 +932,14 @@ main() {
   # non-root caller). Any other sudo user is refused. A root shell without sudo is an operator.
   if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != pneuma-submit ]; then
     echo "pneuma-gate-runner: refused: elevation by '$SUDO_USER' (only pneuma-submit may run the gate)" >&2; exit 75
+  fi
+  # ...and a submitter that got here through sudo may only run the verbs the sudoers rule names. The internal
+  # verbs (unit, promote, warm-unit) and the operator verbs (janitor, guard, warm-env) are never a submitter's.
+  if [ -n "${SUDO_USER:-}" ]; then
+    case "$sub" in
+      have|run|status) ;;
+      *) echo "pneuma-gate-runner: refused: verb '$sub' is not available through the submit path" >&2; exit 75;;
+    esac
   fi
   # `--submitter <id>` is placed by pneuma-gate-entry (sshd's forced command), never by a client.
   if [ "${1:-}" = --submitter ]; then SUBMITTER="${2:-}"; shift 2; fi

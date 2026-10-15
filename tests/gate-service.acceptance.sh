@@ -54,7 +54,7 @@ if pg_lsclusters 2>/dev/null | awk 'NR>1{f=1} END{exit !f}'; then pg_dropcluster
 systemctl disable --now postgresql >/dev/null 2>&1 || true
 DESC="fresh-host: no gate state exists before the install"
 check not test -e /var/lib/pneuma-gate
-bash "$REPO_DIR/ci-builder-gate.sh" --local-host >"$LOGS/install.log" 2>&1
+bash "$REPO_DIR/ci-builder-gate.sh" --local-host --acceptance >"$LOGS/install.log" 2>&1
 DESC="fresh-host: the installer succeeds"; check grep -q '^limits:' "$LOGS/install.log"
 DESC="fresh-host: envs/ and wheels/ are root-owned (units get them read-only)"
 check bash -c '[ "$(stat -c %U /var/lib/pneuma-gate/envs)" = root ] && [ "$(stat -c %U /var/lib/pneuma-gate/wheels)" = root ]'
@@ -62,19 +62,19 @@ DESC="fresh-host: only the object store belongs to the static pneuma-gate user"
 check bash -c '[ "$(stat -c %U /var/lib/pneuma-gate/repos)" = pneuma-gate ]'
 DESC="fresh-host: the state directory is root-only (0700)"
 check bash -c '[ "$(stat -c %a /var/lib/pneuma-gate-state)" = 700 ]'
-bad_io_out="$(PNEUMA_GATE_IO_DEVICE=/dev/no-such-disk bash "$REPO_DIR/ci-builder-gate.sh" --local-host 2>&1)" && bad_io_rc=0 || bad_io_rc=$?
+bad_io_out="$(PNEUMA_GATE_IO_DEVICE=/dev/no-such-disk bash "$REPO_DIR/ci-builder-gate.sh" --local-host --acceptance 2>&1)" && bad_io_rc=0 || bad_io_rc=$?
 DESC="fresh-host: an install whose disk does not resolve for IOWriteBandwidthMax FAILS loudly (nonzero, named)"
 check bash -c '[ "$1" != 0 ] && grep -q "no IOWriteBandwidthMax device resolves" <<<"$2"' _ "$bad_io_rc" "$bad_io_out"
 if [ "$MUTANTS" = 1 ]; then
   mkdir -p "$ACC/mut-install" && cp -a "$REPO_DIR/." "$ACC/mut-install/" 2>/dev/null
   sed -i "s/if ! grep -q '^io-cap: \/dev\/' <<<\"\$status_out\"; then/if false; then/" "$ACC/mut-install/ci-builder-gate-host.sh"
   cmp -s "$REPO_DIR/ci-builder-gate-host.sh" "$ACC/mut-install/ci-builder-gate-host.sh" && { echo "FAIL mutant install did not change (no-op probe)"; fail=1; }
-  mut_io_out="$(PNEUMA_GATE_IO_DEVICE=/dev/no-such-disk bash "$ACC/mut-install/ci-builder-gate.sh" --local-host 2>&1)" && mut_io_rc=0 || mut_io_rc=$?
+  mut_io_out="$(PNEUMA_GATE_IO_DEVICE=/dev/no-such-disk bash "$ACC/mut-install/ci-builder-gate.sh" --local-host --acceptance 2>&1)" && mut_io_rc=0 || mut_io_rc=$?
   DESC="fresh-host MUTANT (io-cap check removed): the install passes on a host with no resolvable disk -> the check goes RED"
   check bash -c '[ "$1" = 0 ]' _ "$mut_io_rc"
   rm -rf "$ACC/mut-install"
 fi
-bash "$REPO_DIR/ci-builder-gate.sh" --local-host >"$LOGS/install.log" 2>&1   # the good install again (idempotent)
+bash "$REPO_DIR/ci-builder-gate.sh" --local-host --acceptance >"$LOGS/install.log" 2>&1   # the good install again (idempotent)
 DESC="fresh-host: the guard cron runs every minute"
 check grep -q '^\* \* \* \* \* root .*pneuma-gate-runner guard' /etc/cron.d/pneuma-gate-guard
 DESC="fresh-host: no Ubuntu default cluster listens on 5432"
@@ -136,6 +136,15 @@ except Exception as e:
       echo "ACC net_k3s_hostaddr=$(probe "$1" 6443)"
       echo "ACC net_wg0=$(probe "$2" 6443)"
       echo "ACC net_internet=$(probe 1.1.1.1 443)"
+      v6="$(timeout 5 python3 -c '
+import socket
+s = socket.socket(socket.AF_INET6); s.settimeout(3)
+try:
+    s.connect(("::1", 6443)); print("open")
+except Exception:
+    print("blocked")')"
+      echo "ACC net_v6_loopback=$v6"
+      echo "ACC net_other_loopback=$(probe 127.0.0.2 6443)"
       # the run's own loopback address works for its own listener
       timeout 10 python3 -c '
 import os, socket
@@ -345,7 +354,7 @@ exec systemd-run "$@"
 SHIM
   chmod +x "$ACC/slow-shim"
   commit_mode sleepy; start_run "$tag-1" "$runner" accept PNEUMA_GATE_MAX_CONCURRENT=1 PNEUMA_GATE_SYSTEMD_RUN="$ACC/slow-shim"
-  wait_for 30 bash -c 'ls /var/lib/pneuma-gate-state/runs | grep -q .'
+  wait_for 60 bash -c 'grep -qs "^state=admitted" /var/lib/pneuma-gate-state/runs/*'
   sleep 5   # longer than any age-based grace would honour
   commit_mode sleepy; start_run "$tag-2" "$runner" accept PNEUMA_GATE_MAX_CONCURRENT=1
   sleep 3
@@ -359,7 +368,7 @@ check bash -c '[ "$1" = 0 ]' _ "$SLOW_RUN2_LAUNCHED"
 DESC="slow-start: both runs finish GREEN in turn"
 check bash -c 'grep -q exit=0 "$1" && grep -q exit=0 "$2"' _ "$LOGS/slow-1.log" "$LOGS/slow-2.log"
 if [ "$MUTANTS" = 1 ]; then
-  m="$(mutant age-grace 's/^runner_alive() {.*/runner_alive() { local c; c="$(stat -c %Y "$STATE_DIR\/runs\/$1" 2>\/dev\/null)" || return 1; [ $(( $(date +%s) - c )) -lt 3 ]; }\nrunner_alive_unused() {  # mutant/')"
+  m="$(mutant age-grace 's/^runner_dead() {.*/runner_dead() { local c; c="$(stat -c %Y "$STATE_DIR\/runs\/$1" 2>\/dev\/null)" || return 0; [ $(( $(date +%s) - c )) -ge 3 ]; }\nrunner_dead_unused() { :; }  # mutant/')"
   slowstart "$m" slowmut
   DESC="slow-start MUTANT (reservation by age): run 2 is over-admitted -> the property check goes RED"
   check bash -c '[ "$1" != 0 ]' _ "$SLOW_RUN2_LAUNCHED"
@@ -515,11 +524,15 @@ cat > "$ACC/listen.py" <<'PY'
 import socket, sys, time
 socks = []
 for addr in sys.argv[1:]:
-    s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.bind((addr, 6443)); s.listen(8); socks.append(s)
+    fam = socket.AF_INET6 if ":" in addr else socket.AF_INET
+    s = socket.socket(fam); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        s.bind((addr, 6443)); s.listen(8); socks.append(s)
+    except OSError:
+        pass
 time.sleep(600)
 PY
-python3 "$ACC/listen.py" 127.0.0.1 "$HOSTADDR" 10.99.0.1 & LISTENER=$!
+python3 "$ACC/listen.py" 127.0.0.1 127.0.0.2 ::1 "$HOSTADDR" 10.99.0.1 & LISTENER=$!
 sleep 1
 commit_mode net; printf '%s 10.99.0.1\n' "$HOSTADDR" > "$REPO/target"; G add -A; G commit -qm net-target --allow-empty
 HEAD_C="$(G rev-parse HEAD)"; TREE_C="$(G rev-parse 'HEAD^{tree}')"; G update-ref "refs/pneuma-gate/head-$HEAD_C" "$HEAD_C"
@@ -529,6 +542,8 @@ netrun net "$RUNNER"
 DESC="net: the k3s API on 127.0.0.1:6443 is unreachable from a gate unit"; check bash -c '[ "$1" = blocked ]' _ "$(acc net net_k3s_loopback)"
 DESC="net: a host service on the host's own address is unreachable"; check bash -c '[ "$1" = blocked ]' _ "$(acc net net_k3s_hostaddr)"
 DESC="net: wg0 (10.99.0.1) is unreachable"; check bash -c '[ "$1" = blocked ]' _ "$(acc net net_wg0)"
+DESC="net: IPv6 loopback (::1) is unreachable (the policy denies IPv6 altogether)"; check bash -c '[ "$1" = blocked ]' _ "$(acc net net_v6_loopback)"
+DESC="net: another loopback address (127.0.0.2) is unreachable: only the run's own address is allowed"; check bash -c '[ "$1" = blocked ]' _ "$(acc net net_other_loopback)"
 DESC="net: public egress (package registries) still works"; check bash -c '[ "$1" = open ]' _ "$(acc net net_internet)"
 DESC="net: the run's own loopback address works for its own listener"; check bash -c '[ "$1" = open ]' _ "$(acc net net_own_loopback)"
 if [ "$MUTANTS" = 1 ]; then
@@ -631,6 +646,41 @@ idA="$(unit_of supA)"; idB="$(unit_of supB)"
 check settled bash -c '[ ! -e "/var/lib/pneuma-gate-dedup/${1#pneuma-gate-}" ] && [ ! -e "/var/lib/pneuma-gate-dedup/${2#pneuma-gate-}" ]' _ "$idA" "$idB"
 DESC="entry: a submission with no submitter identity is refused (75), never run"
 check bash -c '"$1" run --profile accept --repo accrepo --head "$2" --base "$2" --tree "$3" >/dev/null 2>&1; [ $? = 75 ]' _ "$RUNNER" "$HEAD_C" "$TREE_C"
+fi
+
+if sect cap; then
+# ── 13. capacity cap: unknown liveness is OCCUPIED; only positive proof of death frees a slot ──
+gcap() { PNEUMA_GATE_MAX_CONCURRENT=1 "$@"; }
+mkdir -p /var/lib/pneuma-gate-state/runs
+printf 'pid=nonsense\npstart=1\ncores=1\nmem_mb=256\nstate=admitted\n' > /var/lib/pneuma-gate-state/runs/zz-unknown
+commit_mode green; start_run capA "$RUNNER" accept PNEUMA_GATE_MAX_CONCURRENT=1
+sleep 8
+DESC="cap: with a reservation of unknown liveness holding the only slot, a gate is NOT launched (queued)"
+check bash -c '! grep -q "launching unit" "$1" && grep -q "queued" "$1"' _ "$LOGS/capA.log"
+"$RUNNER" janitor >/dev/null 2>&1
+DESC="cap: the janitor does not reclaim a reservation it cannot examine"
+check test -e /var/lib/pneuma-gate-state/runs/zz-unknown
+printf 'pid=999999\npstart=7\ncores=1\nmem_mb=256\nstate=admitted\n' > /var/lib/pneuma-gate-state/runs/zz-unknown
+DESC="cap: once the owner is positively dead the slot frees and the gate runs green"
+wait_for 60 done_run capA
+check grep -q 'exit=0' <<<"$(mark capA)"
+DESC="cap: a unit-listing failure refuses admission (queue timeout, 75), the gate is never started blind"
+PATH_BAK="$PATH"; mkdir -p "$ACC/badctl"; printf '#!/bin/sh\n[ "$1" = list-units ] && exit 1\nexec /usr/bin/systemctl "$@"\n' > "$ACC/badctl/systemctl"; chmod +x "$ACC/badctl/systemctl"
+commit_mode green; start_run capB "$RUNNER" accept PNEUMA_GATE_SYSTEMCTL="$ACC/badctl/systemctl" PNEUMA_GATE_QUEUE_TIMEOUT_S=4
+wait_for 60 done_run capB
+check bash -c 'grep -q "queue timeout" "$1" && ! grep -q "launching unit" "$1" && grep -q "exit=75" "$1"' _ "$LOGS/capB.log"
+find /var/lib/pneuma-gate-state/runs /var/lib/pneuma-gate-state/in -mindepth 1 -delete
+DESC="authz: through the submit path (SUDO_USER=pneuma-submit) the operator verbs are refused"
+check bash -c 'for v in janitor guard warm-env unit promote; do SUDO_USER=pneuma-submit "$1" "$v" >/dev/null 2>&1; [ $? = 75 ] || exit 1; done' _ "$RUNNER"
+DESC="authz: a submitter over its cap is refused before anything is staged (no bundle, no store, no route)"
+mkdir -p /var/lib/pneuma-gate-dedup
+sleep 120 & CAPPID=$!
+for n in 1 2 3; do printf 'key=\nhead=%s\npid=%s\npstart=%s\nsubmitter=capped\nunit=pneuma-gate-c%s.service\nsuperseded=\n' "$HEAD_C" "$CAPPID" "$(sed 's/.*) //' /proc/$CAPPID/stat | awk '{print $20}')" "$n" > "/var/lib/pneuma-gate-dedup/cap-$n"; done
+commit_mode green
+ip_before="$(ip route show table local | grep -c 'src 127\.')"
+capped_out="$(env "${TENV[@]}" "$RUNNER" run --submitter capped --profile accept --repo capfresh --head "$HEAD_C" --base "$HEAD_C" --tree "$TREE_C" --bundle < "$BUNDLE" 2>&1)" && capped_rc=0 || capped_rc=$?
+check bash -c '[ "$1" = 75 ] && grep -q "already holds" <<<"$2" && [ ! -d /var/lib/pneuma-gate/repos/capfresh.git ] && [ -z "$(find /var/lib/pneuma-gate-state/in -mindepth 1)" ] && [ "$(ip route show table local | grep -c "src 127\.")" = "$3" ]' _ "$capped_rc" "$capped_out" "$ip_before"
+kill "$CAPPID" 2>/dev/null; rm -f /var/lib/pneuma-gate-dedup/cap-*
 fi
 
 if sect janitor; then
