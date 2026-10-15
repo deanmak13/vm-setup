@@ -88,6 +88,14 @@ can_admit() {
 # ── repo store ───────────────────────────────────────────────────────────────
 safe_name() { [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]] && [ "$1" != . ] && [ "$1" != .. ]; }
 store_for() { printf '%s/repos/%s.git' "$BASE_DIR" "$1"; }
+# Fetch a submitted bundle's refs into the store's KEEP refs. The refspec is FORCED (+): a keep ref pins objects
+# and must follow the newest submission of each repo and branch. A new head is often NOT a descendant of the
+# previous one (a rebase, a sibling, a force-push), and a non-forced refspec rejects that update as
+# non-fast-forward. With -q the rejection was silent: every such gate was refused "bundle fetch failed".
+fetch_keep_refs() {  # <store> <bundle>
+  as_gate git --git-dir="$1" fetch "$2" "+refs/pneuma-gate/*:refs/gate-keep/*" 2>&1 | sed 's/^/  fetch: /'
+  return "${PIPESTATUS[0]}"
+}
 
 cmd_have() {
   local repo="" shas=()
@@ -461,8 +469,7 @@ cmd_run() {
     fi
     if [ -n "$RUN_AS" ]; then chown "$RUN_AS" "$bf"; fi
     log "received bundle ($(du -h "$bf" | cut -f1))"
-    as_gate git --git-dir="$store" fetch -q "$bf" "refs/pneuma-gate/*:refs/gate-keep/*" 2>&1 | sed 's/^/  fetch: /'
-    [ "${PIPESTATUS[0]}" -eq 0 ] || { rm -f "$bf"; refuse "bundle fetch failed"; }
+    fetch_keep_refs "$store" "$bf" || { rm -f "$bf"; refuse "bundle fetch failed"; }
     rm -f "$bf"
   fi
   local o

@@ -634,4 +634,17 @@ expect_eq "verdict: a job key that does not bind the fields is refused (75)" 75 
 expect_eq "verdict: a SUBMITTER field that does not match the job key is refused (75)" 75 \
   "$(client_rc "$(vline other-lane fake "$base" "$om" "" "$(vj)")")"
 
+# the keep-ref fetch is FORCED: a head that is NOT a descendant of the last keep value (a sibling, a rebase) is
+# accepted and the keep ref follows it. A non-forced refspec rejects it as non-fast-forward (the P0 outage).
+kstore="$work/keepstore.git"; git init -q --bare "$kstore"
+dgit push -q "$kstore" "$C2:refs/gate-keep/repo/repoK"
+dgit update-ref refs/pneuma-gate/repo/repoK "$CX"
+dgit bundle create "$work/keep.bundle" refs/pneuma-gate/repo/repoK >/dev/null 2>&1
+dgit update-ref -d refs/pneuma-gate/repo/repoK
+kfetch_ok() {
+  ddo fetch_keep_refs "$kstore" "$work/keep.bundle" >/dev/null 2>&1 \
+    && [ "$(git --git-dir="$kstore" rev-parse refs/gate-keep/repo/repoK)" = "$CX" ]
+}
+check "keep refs: a non-descendant head is fetched and the keep ref follows it (forced refspec)" kfetch_ok
+
 exit "$fail"
