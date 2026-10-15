@@ -68,9 +68,9 @@ run SHIM_STAGE=/var/lib/pneuma-gate-install/stage.ab.cd; rc=$?
 if [ "$rc" != 0 ] && ! grep -q '^rsync' "$LOG"; then pass "a staging path with a dot inside the name is refused before any upload"
 else bad "dot in stage name accepted (rc $rc)"; fi
 
-# 3c. the profiles sync is a stage-then-rename: no rsync straight into the live profiles dir
+# 3c. the profiles swap is one rename of a symlink: no rsync straight into the live profiles dir
 if grep -q 'rsync -a --delete "\$STAGE/profiles/" /usr/local/lib' "$REPO/ci-builder-gate.sh"; then bad "profiles still synced straight into the live dir"
-elif grep -q 'mv -T -- "\$new_profiles" /usr/local/lib/pneuma-gate/profiles' "$REPO/ci-builder-gate.sh"; then pass "profiles are built beside the live dir and swapped in by rename"
+elif grep -q 'mv -T -- "\$new_link" "\$PROFILES"' "$REPO/ci-builder-gate.sh"; then pass "profiles are a versioned dir behind a live symlink, swapped by one rename"
 else bad "profiles swap not found"; fi
 
 # 4. no predictable /tmp names in the install scripts (mktemp in a root-owned dir or beside the target only)

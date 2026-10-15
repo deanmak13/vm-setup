@@ -70,23 +70,40 @@ chown -R root:root "$STAGE/profiles"
 find "$STAGE/profiles" -type d -exec chmod 0755 {} +
 find "$STAGE/profiles" -type f -exec chmod 0644 {} +
 install -d -o root -g root -m 0755 /usr/local/lib/pneuma-gate
-# Atomic profiles sync: the full new tree is built beside the live one (never into it), then swapped in by two
-# renames. If the second rename fails, the old tree is put back and the run fails loudly.
-new_profiles="$(mktemp -d /usr/local/lib/pneuma-gate/.profiles-new.XXXXXX)"
-rsync -a "$STAGE/profiles/" "$new_profiles/"
-old_profiles="$(mktemp -u /usr/local/lib/pneuma-gate/.profiles-old.XXXXXX)"
-had_live=0
-if [ -e /usr/local/lib/pneuma-gate/profiles ]; then
-  mv -T -- /usr/local/lib/pneuma-gate/profiles "$old_profiles"
-  had_live=1
+# Profiles: one versioned directory per install under profiles.d/, and a live SYMLINK at profiles that is moved
+# by a single rename(2). The new tree is complete before the link moves, so the live path is never absent or
+# partial; a failed swap leaves the previous link live and says so. The runner reads through the link.
+ROOT=/usr/local/lib/pneuma-gate
+PROFILES="$ROOT/profiles"
+install -d -o root -g root -m 0755 "$ROOT" "$ROOT/profiles.d"
+if [ -d "$PROFILES" ] && [ ! -L "$PROFILES" ]; then
+  # one-time migration from the old real directory: kept as profiles.d/legacy, not deleted
+  mv -T -- "$PROFILES" "$ROOT/profiles.d/legacy"
 fi
-if ! mv -T -- "$new_profiles" /usr/local/lib/pneuma-gate/profiles; then
-  [ "$had_live" = 1 ] && mv -T -- "$old_profiles" /usr/local/lib/pneuma-gate/profiles
-  rm -rf -- "$new_profiles"
-  echo "refused: profiles swap failed; the previous profiles were put back" >&2
+prev="$(readlink "$PROFILES" 2>/dev/null || true)"
+ver="$(mktemp -d "$ROOT/profiles.d/v.XXXXXX")"
+if ! rsync -a "$STAGE/profiles/" "$ver/"; then
+  rm -rf -- "$ver"
+  echo "refused: profiles copy failed; the live profiles are unchanged" >&2
   exit 1
 fi
-[ "$had_live" = 1 ] && rm -rf -- "$old_profiles"
+new_link="$(mktemp -u "$ROOT/.profiles-link.XXXXXX")"
+ln -s -- "profiles.d/$(basename "$ver")" "$new_link"
+if ! mv -T -- "$new_link" "$PROFILES"; then
+  rm -f -- "$new_link"
+  rm -rf -- "$ver"
+  echo "refused: profiles swap failed; the previous profiles remain live (no change)" >&2
+  exit 1
+fi
+# keep the new version and the one before it (a hand rollback target); prune the rest, never legacy
+keep_new="$(basename "$ver")"
+keep_prev="$(basename "${prev:-none}")"
+for d in "$ROOT"/profiles.d/*; do
+  case "$(basename "$d")" in
+    "$keep_new"|"$keep_prev"|legacy) continue;;
+  esac
+  rm -rf -- "$d"
+done
 # The runner: atomic replace, mktemp beside the target.
 runner_tmp="$(mktemp /usr/local/bin/.pneuma-gate-runner.XXXXXX)"
 install -o root -g root -m 0755 "$STAGE/pneuma-gate-runner" "$runner_tmp"

@@ -74,6 +74,8 @@ bash -n "$STAGE/pneuma-gate-entry" || die "staged entry does not parse"
 
 WORK="$(mktemp -d "$STAGE/work.XXXXXX")"
 KEEP_WORK=0
+RESCUE_ROOT=/var/lib/pneuma-gate-install-rescue
+RESCUE_DIR=""
 trap '[ "$KEEP_WORK" = 1 ] || rm -rf -- "$WORK"' EXIT
 SAVED="$WORK/saved"
 mkdir "$SAVED"
@@ -152,13 +154,32 @@ rollback() {
   restore "$DROPIN" dropin || { failed=1; echo "pneuma-submit-install: RESTORE FAILED for $DROPIN" >&2; }
   restore "$SUDOERS" sudoers || { failed=1; echo "pneuma-submit-install: RESTORE FAILED for $SUDOERS" >&2; }
   if [ "$failed" = 1 ]; then
-    # the saved copies are the only good record of the previous state: keep them, say where, and fail loudly
-    KEEP_WORK=1
-    echo "pneuma-submit-install: the previous state is NOT fully restored. Saved copies kept at $SAVED - restore them by hand before anything else" >&2
+    # The saved copies are the only good record of the previous state. They move OUT of the staging dir (the
+    # caller removes that on exit) into a root-only rescue dir that survives the run. The rescue root sits
+    # outside the pneuma-gate user's tree, so that account cannot rename or remove it.
+    if persist_rescue; then
+      echo "pneuma-submit-install: the previous state is NOT fully restored. Saved copies kept at $RESCUE_DIR - restore them by hand before anything else" >&2
+    else
+      echo "pneuma-submit-install: the previous state is NOT fully restored AND the saved copies could not be persisted; they are being discarded with the staging dir. Restore by hand from the live files." >&2
+    fi
   else
     echo "pneuma-submit-install: previous state restored" >&2
   fi
   exit 1
+}
+
+# Copy the saved copies to RESCUE_ROOT/<utc-timestamp>.XXXXXX (root 0700). Sets RESCUE_DIR and returns non-zero
+# if the copy fails. On success the staging copies are dropped, so only the rescue copy remains.
+persist_rescue() {
+  local ts
+  install -d -o root -g root -m 0700 "$RESCUE_ROOT" || return 1
+  ts="$(date -u +%Y%m%dT%H%M%SZ)"
+  RESCUE_DIR="$(mktemp -d "$RESCUE_ROOT/$ts.XXXXXX")" || return 1
+  cp -a -- "$SAVED"/. "$RESCUE_DIR"/ || return 1
+  # cp -a carries the saved directory's own mode onto the rescue dir: re-apply the root-only mode afterwards
+  chown root:root "$RESCUE_DIR" && chmod 0700 "$RESCUE_DIR" || return 1
+  KEEP_WORK=0
+  return 0
 }
 
 install -d -o root -g root -m 0755 "$KEYS_DIR" || die "cannot create $KEYS_DIR"

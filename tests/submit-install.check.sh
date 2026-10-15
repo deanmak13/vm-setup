@@ -219,12 +219,13 @@ S
 chmod +x /shim/mv-fail-keys/mv
 seed_old; s="$(new_stage)"; keys_ok "$s"
 run_install "$s" /shim/mv-fail-keys; rc=$?
-kept="$(grep -o '/[^ ]*/work\.[A-Za-z0-9]*' "$LOG" | head -1)"
+kept="$(sed -n 's/.*Saved copies kept at \([^ ]*\).*/\1/p' "$LOG" | head -1)"
 if [ "$rc" != 0 ] && grep -q 'RESTORE FAILED for /etc/ssh/authorized_keys/pneuma-submit' "$LOG" \
-   && grep -q 'NOT fully restored' "$LOG" && [ -n "$kept" ] && [ -d "$kept" ] && [ "$(cat "$kept/saved/keys" 2>/dev/null)" = OLD-KEYS ]; then
-  pass "S16 a failed restore keeps the saved copies (kept at $kept), says so loudly, rc $rc"
-else bad "S16 rc=$rc kept='$kept' log: $(tail -3 "$LOG")"; fi
-rm -rf "$s" "$kept"
+   && grep -q 'NOT fully restored' "$LOG" && [ -n "$kept" ] && [ -d "$kept" ] && [ "$(cat "$kept/keys" 2>/dev/null)" = OLD-KEYS ] \
+   && [ "$(stat -c '%U:%a' "$kept")" = root:700 ]; then
+  pass "S16 a failed restore persists the saved copies in the root-only rescue dir ($kept), says so loudly, rc $rc"
+else bad "S16 rc=$rc kept='$kept' ls=$(ls -la "$kept" 2>&1 | tr '\n' ' ') keys=$(cat "$kept/keys" 2>&1) mode=$(stat -c '%U:%a' "$kept" 2>&1) log: $(tail -3 "$LOG")"; fi
+rm -rf "$s" /var/lib/pneuma-gate-install-rescue
 
 # ------------------------------------------------------------------ report
 if [ "$fails" = 0 ]; then echo "submit-install: all scenarios passed"; exit 0; fi
