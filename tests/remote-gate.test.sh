@@ -634,4 +634,64 @@ expect_eq "verdict: a job key that does not bind the fields is refused (75)" 75 
 expect_eq "verdict: a SUBMITTER field that does not match the job key is refused (75)" 75 \
   "$(client_rc "$(vline other-lane fake "$base" "$om" "" "$(vj)")")"
 
+# the keep-ref fetch is FORCED: a head that is NOT a descendant of the last keep value (a sibling, a rebase) is
+# accepted and the keep ref follows it. A non-forced refspec rejects it as non-fast-forward (the P0 outage).
+kstore="$work/keepstore.git"; git init -q --bare "$kstore"
+dgit push -q "$kstore" "$C2:refs/gate-keep/repo/repoK"
+dgit update-ref refs/pneuma-gate/repo/repoK "$CX"
+dgit bundle create "$work/keep.bundle" refs/pneuma-gate/repo/repoK >/dev/null 2>&1
+dgit update-ref -d refs/pneuma-gate/repo/repoK
+kfetch_ok() {
+  ddo fetch_keep_refs "$kstore" "$work/keep.bundle" repoK "" >/dev/null 2>&1 \
+    && [ "$(git --git-dir="$kstore" rev-parse refs/gate-keep/repo/repoK)" = "$CX" ]
+}
+check "keep refs: a non-descendant head is fetched and the keep ref follows it (forced refspec)" kfetch_ok
+
+# SCOPE: a bundle names other repos' refs too; the keep fetch only ever writes THIS repo's keep refs.
+dgit update-ref refs/pneuma-gate/repo/repoK "$CX"
+dgit update-ref refs/pneuma-gate/repo/otherrepo "$C3"
+dgit bundle create "$work/scope.bundle" refs/pneuma-gate/repo/repoK refs/pneuma-gate/repo/otherrepo >/dev/null 2>&1
+dgit update-ref -d refs/pneuma-gate/repo/repoK; dgit update-ref -d refs/pneuma-gate/repo/otherrepo
+scope_ok() {
+  ddo fetch_keep_refs "$kstore" "$work/scope.bundle" repoK "" >/dev/null 2>&1 \
+    && [ -z "$(git --git-dir="$kstore" for-each-ref refs/gate-keep/repo/otherrepo)" ] \
+    && [ "$(git --git-dir="$kstore" rev-parse refs/gate-keep/repo/repoK)" = "$CX" ]
+}
+check "keep scope: a bundle's refs for ANOTHER repo are never written; this repo's keep ref is" scope_ok
+
+# CONCURRENCY (P0 follow-up): 24 runs record their shallow boundaries into ONE store at once. Each must succeed and
+# every boundary must be recorded. The old fixed temp name made concurrent runs' mv fail ("cannot stat shallow.new").
+sstore="$work/shstore.git"; git init -q --bare "$sstore"
+shallow_race_ok() {
+  local i rcs="$work/shrc" n
+  : > "$rcs"
+  for i in $(seq 1 24); do
+    ( ddo record_shallow "$sstore" "$(printf '%040x' "$i")" >/dev/null 2>&1; echo $? >> "$rcs" ) &
+  done
+  wait
+  n="$(sort -u "$sstore/shallow" 2>/dev/null | wc -l)"
+  [ "$(grep -c '^0$' "$rcs")" = 24 ] && [ "$n" = 24 ]
+}
+check "shallow race: 24 concurrent runs of one store all succeed and every boundary is recorded" shallow_race_ok
+check "shallow race: no stale temp file is left in the store" bash -c 'test -z "$(ls "$1"/shallow.* 2>/dev/null)"' _ "$sstore"
+
+# CONCURRENCY: 8 runs fetch keep refs of the same repo, at different heads, into ONE store at once; every fetch succeeds.
+for k in 1 2 3 4 5 6 7 8; do
+  case $((k % 4)) in 0) cur="$C1";; 1) cur="$C2";; 2) cur="$C3";; 3) cur="$CX";; esac
+  dgit update-ref refs/pneuma-gate/repo/repoR "$cur"
+  dgit bundle create "$work/race$k.bundle" refs/pneuma-gate/repo/repoR >/dev/null 2>&1
+done
+dgit update-ref -d refs/pneuma-gate/repo/repoR
+rstore="$work/rstore.git"; git init -q --bare "$rstore"
+fetch_race_ok() {
+  local k rcs="$work/fetchrc"
+  : > "$rcs"
+  for k in 1 2 3 4 5 6 7 8; do
+    ( ddo fetch_keep_refs "$rstore" "$work/race$k.bundle" repoR "" >/dev/null 2>&1; echo $? >> "$rcs" ) &
+  done
+  wait
+  [ "$(grep -c '^0$' "$rcs")" = 8 ]
+}
+check "keep fetch race: 8 concurrent keep-ref fetches of one repo all succeed (no silent rejection)" fetch_race_ok
+
 exit "$fail"
