@@ -389,6 +389,7 @@ eval "$(declare -f _engine_run_live | sed '1s/_engine_run_live/_orig_run_live/')
 _engine_run_live() {
   pid="$(head -1 "$PNEUMA_GATE_WORK_DIR/pg/data/postmaster.pid")"
   echo "ACC pg_cgroup=$(cut -d: -f3 /proc/$pid/cgroup) gate_cgroup=$(cut -d: -f3 /proc/self/cgroup) pg_uid=$(stat -c %u /proc/$pid)"
+  echo "ACC pg_nonce_ok=$([ "$(/usr/lib/postgresql/16/bin/psql "$PGTEST_DSN" -Atc 'show pneuma.run_nonce')" = "$PNEUMA_GATE_NONCE" ] && [ -n "$PNEUMA_GATE_NONCE" ] && echo yes || echo no)"
   echo "ACC pg_settings=$(/usr/lib/postgresql/16/bin/psql "$PGTEST_DSN" -Atc "select current_setting('shared_buffers')||','||current_setting('max_connections')||','||current_setting('listen_addresses')")"
   echo "ACC pg_listen=$(ss -H -ltn | awk -v p=":${PGTEST_DSN##*:}" '$4 ~ ("^127.0.0.1" ) {print $4}' | tr '\n' ' ')"
   _orig_run_live "$@"
@@ -480,6 +481,8 @@ DESC="live-pg: the postmaster is in the unit's cgroup (the unit's caps cover it)
 check bash -c 'l="$(sed -n "s/.*ACC pg_cgroup=//p" "$1" | head -1)"; [ "${l%% *}" = "$(sed -n "s/.*gate_cgroup=\([^ ]*\).*/\1/p" "$1" | head -1)" ]' _ "$LOGS/pgok.log"
 DESC="live-pg: the postmaster runs as the run's own dynamic uid"
 check bash -c '[ "$(sed -n "s/.*pg_uid=//p" "$1" | head -1)" = "$(sed -n "s/.*ACC mode.*//p;" "$1")" ] || [ "$(sed -n "s/.*pg_uid=//p" "$1" | head -1)" -ge 61184 ]' _ "$LOGS/pgok.log"
+DESC="live-pg: the cluster carries this run's nonce (pneuma.run_nonce = the unit's PNEUMA_GATE_NONCE), verified before use"
+check grep -q 'ACC pg_nonce_ok=yes' "$LOGS/pgok.log"
 DESC="live-pg: caps applied (shared_buffers=128MB, max_connections=50) and loopback only"
 check grep -qE 'ACC pg_settings=128MB,50,127\.[0-9]+\.[0-9]+\.[0-9]+$' "$LOGS/pgok.log"
 
@@ -562,7 +565,7 @@ GIB=1073741824
 free_bytes() { df -B1 --output=avail /var/tmp | tail -1 | tr -dc 0-9; }
 diskrun() {  # <name> <runner> <abort GiB> → min free bytes seen in $DISK_MIN
   local name="$1" runner="$2" abort="$3"
-  commit_mode writer; printf '4000\n' > "$REPO/target"; G add -A; G commit -qm w --allow-empty
+  commit_mode writer; printf '6000\n' > "$REPO/target"; G add -A; G commit -qm w --allow-empty
   HEAD_C="$(G rev-parse HEAD)"; TREE_C="$(G rev-parse 'HEAD^{tree}')"; G update-ref "refs/pneuma-gate/head-$HEAD_C" "$HEAD_C"
   BUNDLE="$ACC/$HEAD_C.bundle"; G bundle create "$BUNDLE" "refs/pneuma-gate/head-$HEAD_C" >/dev/null 2>&1
   start_run "$name" "$runner" accept PNEUMA_GATE_ABORT_FREE_GIB="$abort" PNEUMA_GATE_IO_DEVICE="$IODEV" PNEUMA_GATE_IO_WRITE_MAX=200M PNEUMA_GATE_TIMEOUT_S=300
@@ -570,12 +573,12 @@ diskrun() {  # <name> <runner> <abort GiB> → min free bytes seen in $DISK_MIN
   while ! done_run "$name"; do local f; f=$(free_bytes); [ "$f" -lt "$DISK_MIN" ] && DISK_MIN=$f; sleep 0.2; done
 }
 START_FREE=$(( $(free_bytes) / GIB ))
-ABORT=$(( START_FREE - 2 ))      # the stand-in "eviction margin": the guard line sits 2GiB below where we start
+ABORT=$(( START_FREE - 3 ))      # the stand-in "eviction margin": the guard line sits 3GiB below where we start
 diskrun diskguard "$RUNNER" "$ABORT"
 echo "     disk: start=${START_FREE}GiB guard line=${ABORT}GiB lowest free seen=$((DISK_MIN / 1048576))MiB (line=$((ABORT * 1024))MiB)"
 DESC="disk: a fast writer is stopped by the guard (result 75, builder disk low), never green"
 check bash -c 'grep -q "builder disk low" "$1" && grep -q "exit=75" "$1"' _ "$LOGS/diskguard.log"
-DESC="disk: the writer did not finish its 4000MB"; check bash -c '! grep -q "writer_done=4000MB" "$1"' _ "$LOGS/diskguard.log"
+DESC="disk: the writer did not finish its 6000MB"; check bash -c '! grep -q "writer_done=6000MB" "$1"' _ "$LOGS/diskguard.log"
 # The real guard line is 35GiB and the kubelet evicts near 29GiB: 6GiB of margin. The burst after the
 # line (poll <= 1s at the IOWriteBandwidthMax cap, the stop, and the writeback of already dirty pages) must
 # fit in half of it.
@@ -586,7 +589,7 @@ check settled bash -c '[ -z "$(ls -d /var/tmp/systemd-private-*pneuma-gate-2* 2>
 if [ "$MUTANTS" = 1 ]; then
   diskrun diskmut "$RUNNER" 0
   DESC="disk MUTANT (guard line unreachable): the writer runs to completion -> the property check goes RED"
-  check bash -c 'grep -q "writer_done=4000MB" "$1"' _ "$LOGS/diskmut.log"
+  check bash -c 'grep -q "writer_done=6000MB" "$1"' _ "$LOGS/diskmut.log"
 fi
 fi
 
@@ -601,9 +604,16 @@ orphan() {  # <runner-for-guard> <tag>
   kill -9 "$(sed -n 's/^pid=//p' "/var/lib/pneuma-gate-state/runs/${unit#pneuma-gate-}")"
   sleep 1
   ORPHAN_ACTIVE_BEFORE="$(systemctl is-active "$unit.service")"
+  ORPHAN_ID="${unit#pneuma-gate-}"
+  ORPHAN_LO="$(sed -n 's/^loopback=//p' "/var/lib/pneuma-gate-state/runs/$ORPHAN_ID")"
+  ORPHAN_NONCE="$(sed -n 's/^nonce=//p' "/var/lib/pneuma-gate-state/runs/$ORPHAN_ID")"
+  ORPHAN_UNIT_HAS_NONCE="$(systemctl show -p ExecStart --value "$unit.service" | grep -c "PNEUMA_GATE_NONCE=$ORPHAN_NONCE")"
+  ORPHAN_ROUTE_BEFORE="$(ip route show table local | grep -c "^local $ORPHAN_LO ")"
   "$guard" janitor >/dev/null 2>&1
   sleep 3
   ORPHAN_ACTIVE_AFTER="$(systemctl is-active "$unit.service")"
+  ORPHAN_ROUTE_AFTER="$(ip route show table local | grep -c "^local $ORPHAN_LO ")"
+  ORPHAN_MARKER_AFTER="$(ls /var/lib/pneuma-gate-state/runs | grep -c "^$ORPHAN_ID\$")"
   ORPHAN_UNIT="$unit"
 }
 orphan "$RUNNER" orphan
@@ -611,11 +621,15 @@ DESC="orphan: kill -9 of the runner leaves its unit running (the runner's own gu
 check bash -c '[ "$1" = active ]' _ "$ORPHAN_ACTIVE_BEFORE"
 DESC="orphan: the janitor (guard) stops the unit whose runner is dead"
 check bash -c '[ "$1" != active ]' _ "$ORPHAN_ACTIVE_AFTER"
+DESC="stale-id: the real unit's command line carries the nonce its reservation records (the binding the guard verifies)"
+check bash -c '[ -n "$1" ] && [ "$2" -ge 1 ]' _ "$ORPHAN_NONCE" "$ORPHAN_UNIT_HAS_NONCE"
+DESC="stale-id: the run's loopback address is routed while its unit lives, and released only after the unit is gone"
+check bash -c '[ "$1" = 1 ] && [ "$2" = 0 ] && [ "$3" = 0 ]' _ "$ORPHAN_ROUTE_BEFORE" "$ORPHAN_ROUTE_AFTER" "$ORPHAN_MARKER_AFTER"
 DESC="orphan: its run directory and private tmp go with it"
 check settled bash -c '[ -z "$(ls /run/pneuma-gate 2>/dev/null)" ] && [ -z "$(ls -d /var/tmp/systemd-private-*pneuma-gate-2* 2>/dev/null)" ]'
 find /var/lib/pneuma-gate-state/runs /var/lib/pneuma-gate-state/in -mindepth 1 -delete   # the killed runner could not clean its own
 if [ "$MUTANTS" = 1 ]; then
-  m="$(mutant no-guard 's/if \[ "\$low" = 1 \] || ! runner_alive "\$id"; then/if [ "$low" = 1 ] || false; then/')"
+  m="$(mutant no-guard 's/    elif runner_dead "\$id"; then/    elif false; then/')"
   orphan "$m" orphanmut
   DESC="orphan MUTANT (guard ignores dead runners): the unit keeps running -> the property check goes RED"
   check bash -c '[ "$1" = active ]' _ "$ORPHAN_ACTIVE_AFTER"
@@ -681,6 +695,27 @@ ip_before="$(ip route show table local | grep -c 'src 127\.')"
 capped_out="$(env "${TENV[@]}" "$RUNNER" run --submitter capped --profile accept --repo capfresh --head "$HEAD_C" --base "$HEAD_C" --tree "$TREE_C" --bundle < "$BUNDLE" 2>&1)" && capped_rc=0 || capped_rc=$?
 check bash -c '[ "$1" = 75 ] && grep -q "already holds" <<<"$2" && [ ! -d /var/lib/pneuma-gate/repos/capfresh.git ] && [ -z "$(find /var/lib/pneuma-gate-state/in -mindepth 1)" ] && [ "$(ip route show table local | grep -c "src 127\.")" = "$3" ]' _ "$capped_rc" "$capped_out" "$ip_before"
 kill "$CAPPID" 2>/dev/null; rm -f /var/lib/pneuma-gate-dedup/cap-*
+fi
+
+if sect stale; then
+# ── 14. stale identity: a reservation that names a unit but carries another run's nonce never stops it ──
+commit_mode hold; start_run stale "$RUNNER" accept
+wait_for 90 bash -c "grep -q 'ACC mode=hold' $LOGS/stale.log"
+unit="$(unit_of stale)"; sid="${unit#pneuma-gate-}"
+M="/var/lib/pneuma-gate-state/runs/$sid"
+good_nonce="$(sed -n 's/^nonce=//p' "$M")"
+kill -9 "$(sed -n 's/^pid=//p' "$M")"; sleep 1
+sed -i 's/^nonce=.*/nonce=a-recycled-name-from-another-run/' "$M"
+"$RUNNER" janitor >/dev/null 2>&1; sleep 2
+DESC="stale-id: a dead reservation whose nonce is not the unit's does NOT stop the unit (recycled name refused)"
+check bash -c '[ "$(systemctl is-active "$1.service")" = active ]' _ "$unit"
+DESC="stale-id: ...and it keeps its reservation and its loopback route"
+check bash -c 'test -e "$1" && ip route show table local | grep -q "^local $2 "' _ "$M" "$(sed -n 's/^loopback=//p' "$M")"
+sed -i "s/^nonce=.*/nonce=$good_nonce/" "$M"
+"$RUNNER" janitor >/dev/null 2>&1; sleep 3
+DESC="stale-id: with the matching nonce the same reservation stops the unit"
+check bash -c '[ "$(systemctl is-active "$1.service")" != active ]' _ "$unit"
+find /var/lib/pneuma-gate-state/runs /var/lib/pneuma-gate-state/in -mindepth 1 -delete
 fi
 
 if sect janitor; then

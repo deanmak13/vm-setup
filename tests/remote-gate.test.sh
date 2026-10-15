@@ -133,12 +133,14 @@ for a in "$@"; do
     --) break;;
   esac
 done
+# the unit files are shared by concurrent stubs: every edit is under one lock (a bare `sed -i` loses updates)
 cleanup() { local l; for l in "${links[@]}"; do rm -f "$l"; done
-  if [ -n "$unit" ] && [ -n "${UNITS_FILE:-}" ]; then sed -i "\|^$unit |d" "$UNITS_FILE"; sed -i "\|^$unit\$|d" "$SYSTEMCTL_ACTIVE"; fi; }
+  if [ -n "$unit" ] && [ -n "${UNITS_FILE:-}" ]; then
+    flock "$UNITS_FILE.lock" bash -c 'sed -i "\|^$1 |d" "$2"; sed -i "\|^$1\$|d" "$3"' _ "$unit" "$UNITS_FILE" "$SYSTEMCTL_ACTIVE"
+  fi; }
 trap cleanup EXIT
 if [ -n "$unit" ] && [ -n "${UNITS_FILE:-}" ]; then
-  printf '%s %s %s\n' "$unit" "$cores" "$mem" >> "$UNITS_FILE"
-  printf '%s\n' "$unit" >> "$SYSTEMCTL_ACTIVE"
+  flock "$UNITS_FILE.lock" bash -c 'printf "%s %s %s\n" "$1" "$2" "$3" >> "$5"; printf "%s\n" "$1" >> "$4"' _ "$unit" "$cores" "$mem" "$SYSTEMCTL_ACTIVE" "$UNITS_FILE"
 fi
 while [ $# -gt 0 ] && [ "$1" != -- ]; do shift; done; shift
 # a real unit gets a scrubbed environment (`env -i`); here the tracer's variables must survive so
@@ -160,6 +162,7 @@ case "$1" in
     case "$3" in
       CPUQuotaPerSecUSec) awk -v u="$5" '$1 == u { print $2 "s" }' "$UNITS_FILE";;
       MemoryMax) awk -v u="$5" '$1 == u { print $3 * 1048576 }' "$UNITS_FILE";;
+      ExecStart) awk -v u="$5" '$1 == u { print "{ path=/usr/bin/env ; argv[]=/usr/bin/env -i PNEUMA_GATE_NONCE=" $2 " /bin/true ; }" }' "$UNIT_NONCES" 2>/dev/null;;
     esac; exit 0;;
   stop) echo "stop $2" >> "${SYSTEMCTL_RECORD:-/dev/null}"; exit 0;;
 esac
@@ -170,6 +173,8 @@ export PNEUMA_GATE_SYSTEMCTL="$work/bin/systemctl-stub"   # every test: never th
 export SYSTEMCTL_ACTIVE="$work/systemctl-active.txt" UNITS_FILE="$work/systemctl-units.txt"
 export SYSTEMCTL_RECORD="$work/systemctl-record.txt"; : > "$SYSTEMCTL_RECORD"
 export PNEUMA_GATE_STATE_DIR="$work/root-state" PNEUMA_GATE_RUN_ROOT="$work/run"   # tests never touch /run or /var/lib
+export UNIT_NONCES="$work/unit-nonces.txt"; : > "$UNIT_NONCES"
+export PNEUMA_GATE_DYNAMIC_UID_MIN="$(id -u)" PNEUMA_GATE_DYNAMIC_UID_MAX="$(id -u)"   # the stubbed build unit runs as this user
 export PNEUMA_GATE_IO_DEVICE=none   # the stubbed units have no disk to cap; the io-cap tests below set a device on purpose
 export PNEUMA_GATE_ABORT_FREE_GIB=1   # the disk guard is exercised on purpose below, never by accident
 export PNEUMA_GATE_IN_MOUNT="$work/mnt/in" PNEUMA_GATE_ENVS_MOUNT="$work/mnt/envs" \
@@ -1099,7 +1104,8 @@ fresh_state
 # F4. the guard stops a unit only when its runner is POSITIVELY dead
 printf 'pneuma-gate-f4-unknown.service 1 256\npneuma-gate-f4-dead.service 1 256\n' > "$UNITS_FILE"
 printf 'pid=nonsense\npstart=1\ncores=1\nmem_mb=256\nstate=admitted\n' > "$PNEUMA_GATE_STATE_DIR/runs/f4-unknown"
-printf 'pid=999995\npstart=7\ncores=1\nmem_mb=256\nstate=admitted\n' > "$PNEUMA_GATE_STATE_DIR/runs/f4-dead"
+printf 'pid=999995\npstart=7\ncores=1\nmem_mb=256\nstate=admitted\nnonce=n-f4-dead\n' > "$PNEUMA_GATE_STATE_DIR/runs/f4-dead"
+printf 'pneuma-gate-f4-dead.service n-f4-dead\n' > "$UNIT_NONCES"
 : > "$SYSTEMCTL_RECORD"; "$RUNNER" guard >/dev/null 2>&1
 check "F4: guard stops the unit of a positively dead runner" grep -qx 'stop pneuma-gate-f4-dead.service' "$SYSTEMCTL_RECORD"
 check "F4: guard leaves the unit of a runner it cannot examine (it may be a healthy gate)" bash -c '! grep -q f4-unknown "$1"' _ "$SYSTEMCTL_RECORD"
@@ -1131,6 +1137,109 @@ printf 'garbage\n' > "$PNEUMA_GATE_BASE/queue/1-unk"
 check "F6: an unparseable ticket is kept by the janitor" test -e "$PNEUMA_GATE_BASE/queue/1-unk"
 check "F6: ...and is never the head of the queue" bash -c 'source "$1"; [ "$(first_live_waiter)" != 1-unk ]' _ "$RUNNER"
 rm -f "$PNEUMA_GATE_BASE"/queue/*; kill "$cf_pid" 2>/dev/null
+
+
+# ════ stale identity mappings: every binding carries the run's nonce, verified at use, released on proof of end ════
+# S1. the guard stops a unit for a dead runner only when the unit carries that reservation's nonce
+fresh_state
+printf 'pneuma-gate-s1-recycled.service 1 256\npneuma-gate-s1-match.service 1 256\npneuma-gate-s1-nomarker.service 1 256\n' > "$UNITS_FILE"
+printf 'pid=999990\npstart=7\ncores=1\nmem_mb=256\nstate=admitted\nnonce=nonce-A\n' > "$PNEUMA_GATE_STATE_DIR/runs/s1-recycled"
+printf 'pid=999991\npstart=7\ncores=1\nmem_mb=256\nstate=admitted\nnonce=nonce-M\n' > "$PNEUMA_GATE_STATE_DIR/runs/s1-match"
+printf 'pneuma-gate-s1-recycled.service nonce-B\npneuma-gate-s1-match.service nonce-M\npneuma-gate-s1-nomarker.service nonce-Z\n' > "$UNIT_NONCES"
+: > "$SYSTEMCTL_RECORD"; "$RUNNER" guard >/dev/null 2>&1
+check "S1: a unit under a RECYCLED name (another run's nonce) is NOT stopped for a dead reservation" bash -c '! grep -q s1-recycled "$1"' _ "$SYSTEMCTL_RECORD"
+check "S1: the unit that carries the reservation's nonce is stopped" grep -qx 'stop pneuma-gate-s1-match.service' "$SYSTEMCTL_RECORD"
+check "S1: a unit with no reservation at all (unaccounted capacity) is stopped" grep -qx 'stop pneuma-gate-s1-nomarker.service' "$SYSTEMCTL_RECORD"
+fresh_state; : > "$UNIT_NONCES"
+
+# S2. supersession stops a unit only when the record's nonce matches the unit's
+fresh
+printf 'pneuma-gate-s2-old.service 1 256\n' > "$UNITS_FILE"; printf 'pneuma-gate-s2-old.service\n' > "$SYSTEMCTL_ACTIVE"
+printf 'key=repoA/main\nhead=%s\npid=%s\npstart=%s\nsubmitter=%s\nunit=pneuma-gate-s2-old.service\nnonce=nonce-A\nsuperseded=\n' "$C1" "$$" "$(bash -c 'source "$1"; proc_start "$2"' _ "$RUNNER" "$$")" "$SUB_A" > "$PNEUMA_GATE_DEDUP_DIR/s2-old"
+printf 'pneuma-gate-s2-old.service nonce-B\n' > "$UNIT_NONCES"; : > "$SYSTEMCTL_RECORD"
+ddo dedup_admit s2-new "$dstore" repoA main "$C2" "$SUB_A" >/dev/null 2>&1
+check "S2: a recycled unit name (nonce differs) is NOT stopped by a record that names it" bash -c '! grep -q s2-old "$1"' _ "$SYSTEMCTL_RECORD"
+fresh
+printf 'key=repoA/main\nhead=%s\npid=%s\npstart=%s\nsubmitter=%s\nunit=pneuma-gate-s2-old.service\nnonce=nonce-A\nsuperseded=\n' "$C1" "$$" "$(bash -c 'source "$1"; proc_start "$2"' _ "$RUNNER" "$$")" "$SUB_A" > "$PNEUMA_GATE_DEDUP_DIR/s2-old"
+printf 'pneuma-gate-s2-old.service nonce-A\n' > "$UNIT_NONCES"; : > "$SYSTEMCTL_RECORD"
+ddo dedup_admit s2-new2 "$dstore" repoA main "$C2" "$SUB_A" >/dev/null 2>&1
+check "S2: the unit that carries the record's nonce is stopped" grep -qx 'stop pneuma-gate-s2-old.service' "$SYSTEMCTL_RECORD"
+fresh; : > "$UNIT_NONCES"; : > "$SYSTEMCTL_ACTIVE"; : > "$UNITS_FILE"
+
+# S3. a run releases its bindings (reservation, submitter record, loopback address, bundle) ONLY on proof its unit is gone
+s3() {  # <active|inactive|broken>
+  fresh_state; fresh
+  : > "$IP_RECORD"; : > "$SYSTEMCTL_ACTIVE"
+  [ "$1" = active ] && printf 'pneuma-gate-s3-run.service\n' > "$SYSTEMCTL_ACTIVE"
+  printf 'pid=%s\npstart=1\ncores=1\nmem_mb=256\nstate=admitted\nloopback=127.66.1.1\nnonce=nonce-S3\n' "$$" > "$PNEUMA_GATE_STATE_DIR/runs/s3-run"
+  printf 'key=\nhead=%s\npid=%s\npstart=1\nsubmitter=s3\nunit=pneuma-gate-s3-run.service\nnonce=nonce-S3\nsuperseded=\n' "$C1" "$$" > "$PNEUMA_GATE_DEDUP_DIR/s3-run"
+  : > "$PNEUMA_GATE_STATE_DIR/in/s3-run.bundle"
+  SYSTEMCTL_IS_ACTIVE_BROKEN=$([ "$1" = broken ] && echo 1 || echo 0) bash -c 'source "$1"; RUN_ID=s3-run; UNIT=pneuma-gate-s3-run; DEDUP_ID=s3-run; LOOPBACK=127.66.1.1; BUNDLE_FILE="$STATE_DIR/in/s3-run.bundle"; cleanup' _ "$RUNNER" >/dev/null 2>&1
+}
+s3 active
+check "S3: while its unit is still active the run keeps its reservation, record, bundle..." bash -c 'test -e "$1/runs/s3-run" -a -e "$1/in/s3-run.bundle" -a -e "$2/s3-run"' _ "$PNEUMA_GATE_STATE_DIR" "$PNEUMA_GATE_DEDUP_DIR"
+check "S3: ...and its loopback address is NOT released (no route deletion)" bash -c '! grep -q "route del local 127.66.1.1" "$1"' _ "$IP_RECORD"
+s3 broken
+check "S3: a unit whose state cannot be read counts as not gone: nothing is released" bash -c 'test -e "$1/runs/s3-run" -a -e "$2/s3-run"' _ "$PNEUMA_GATE_STATE_DIR" "$PNEUMA_GATE_DEDUP_DIR"
+s3 inactive
+check "S3: once the unit is positively inactive everything is released" bash -c 'test ! -e "$1/runs/s3-run" -a ! -e "$1/in/s3-run.bundle" -a ! -e "$2/s3-run" && grep -q "route del local 127.66.1.1" "$3"' _ "$PNEUMA_GATE_STATE_DIR" "$PNEUMA_GATE_DEDUP_DIR" "$IP_RECORD"
+
+# S4. a loopback address stays bound while any reservation names it, even one whose runner is dead; a claim of a bound
+# address is refused (the recycled-address case); it frees only after the reservation goes on proof of death
+fresh_state; : > "$IP_RECORD"; : > "$IP_EXISTS"
+printf 'local 127.67.1.1 dev lo scope host src 127.67.1.1\n' > "$IP_ROUTES"
+printf 'pid=999989\npstart=7\ncores=1\nmem_mb=256\nstate=admitted\nloopback=127.67.1.1\nnonce=nonce-S4\n' > "$PNEUMA_GATE_STATE_DIR/runs/s4-old"
+printf 'pneuma-gate-s4-old.service\n' > "$SYSTEMCTL_ACTIVE"
+"$RUNNER" janitor >/dev/null 2>&1
+check "S4: a dead runner whose unit is still active keeps its reservation AND its address" bash -c 'test -e "$1/runs/s4-old" && ! grep -q "route del local 127.67.1.1" "$2"' _ "$PNEUMA_GATE_STATE_DIR" "$IP_RECORD"
+printf '127.67.1.1\n' > "$IP_EXISTS"
+claimed="$(bash -c 'source "$1"; run_loopback() { echo 127.67.1.1; }; loopback_claim s4-new' _ "$RUNNER")" && claim_rc=0 || claim_rc=$?
+check "S4: the bound address cannot be handed to a new run (the claim is refused)" bash -c '[ "$1" != 0 ] && [ -z "$2" ]' _ "$claim_rc" "$claimed"
+: > "$SYSTEMCTL_ACTIVE"; "$RUNNER" janitor >/dev/null 2>&1
+check "S4: after the unit is gone the reservation is reclaimed and the address released" bash -c 'test ! -e "$1/runs/s4-old" && grep -q "route del local 127.67.1.1" "$2"' _ "$PNEUMA_GATE_STATE_DIR" "$IP_RECORD"
+: > "$IP_EXISTS"; : > "$IP_ROUTES"; fresh_state
+
+# S5. the janitor reclaims dead submitter records and stale warm slots only on proof
+fresh
+printf 'key=\nhead=%s\npid=999988\npstart=7\nsubmitter=s5\nunit=pneuma-gate-s5-dead.service\nsuperseded=\n' "$C1" > "$PNEUMA_GATE_DEDUP_DIR/s5-dead"
+printf 'key=\nhead=%s\npid=nonsense\npstart=7\nsubmitter=s5\nunit=pneuma-gate-s5-unk.service\nsuperseded=\n' "$C1" > "$PNEUMA_GATE_DEDUP_DIR/s5-unk"
+mkdir -p "$PNEUMA_GATE_BASE/envs/fake/.slot-warm-1-1" "$PNEUMA_GATE_BASE/envs/fake/.slot-warm-2-2"
+printf 'pneuma-warm-warm-2-2-build.service\n' > "$SYSTEMCTL_ACTIVE"
+"$RUNNER" janitor >/dev/null 2>&1
+check "S5: a submitter record with runner and unit positively gone is reclaimed" test ! -e "$PNEUMA_GATE_DEDUP_DIR/s5-dead"
+check "S5: a record of unknown liveness is kept" test -e "$PNEUMA_GATE_DEDUP_DIR/s5-unk"
+check "S5: a stale warm slot (no live runner, units inactive) is reclaimed" test ! -d "$PNEUMA_GATE_BASE/envs/fake/.slot-warm-1-1"
+check "S5: a slot whose build unit is still active is kept" test -d "$PNEUMA_GATE_BASE/envs/fake/.slot-warm-2-2"
+rmdir "$PNEUMA_GATE_BASE/envs/fake/.slot-warm-2-2"; : > "$SYSTEMCTL_ACTIVE"; fresh
+
+# S6. the warm slot is frozen into the shared cache only if ONE dynamic uid owns every path
+slot_check() { bash -c 'source "$1"; slot_uids() { printf "%s\n" $UIDS; }; slot_owned_by_one_dynamic_uid /x' _ "$RUNNER"; }
+check "S6: a slot owned by one uid in the dynamic range is accepted" env UIDS="61500" PNEUMA_GATE_DYNAMIC_UID_MIN=61184 PNEUMA_GATE_DYNAMIC_UID_MAX=65519 bash -c "$(declare -f slot_check); RUNNER='$RUNNER'; slot_check"
+check "S6: a path of a second uid (a recycled uid wrote here) refuses the freeze" not env UIDS="61500 61501" PNEUMA_GATE_DYNAMIC_UID_MIN=61184 PNEUMA_GATE_DYNAMIC_UID_MAX=65519 bash -c "$(declare -f slot_check); RUNNER='$RUNNER'; slot_check"
+check "S6: a uid outside the dynamic range (a real user) refuses the freeze" not env UIDS="1000" PNEUMA_GATE_DYNAMIC_UID_MIN=61184 PNEUMA_GATE_DYNAMIC_UID_MAX=65519 bash -c "$(declare -f slot_check); RUNNER='$RUNNER'; slot_check"
+check "S6: an empty slot listing refuses the freeze" not env UIDS="" PNEUMA_GATE_DYNAMIC_UID_MIN=61184 PNEUMA_GATE_DYNAMIC_UID_MAX=65519 bash -c "$(declare -f slot_check); RUNNER='$RUNNER'; slot_check"
+
+# S7. the cluster that answers on the DSN must be THIS run's (nonce set at start, verified before use)
+cat > "$pgstub/psql" <<'STUB'
+#!/usr/bin/env bash
+[ "${PG_STUB_PSQL_FAIL:-0}" = 1 ] && exit 2
+echo "${PG_STUB_SERVER_NONCE:-}"
+STUB
+chmod +x "$pgstub/psql"
+pg_case nonce-ok
+s7_ok=$(PNEUMA_GATE_NONCE=run-n-1 PG_STUB_SERVER_NONCE=run-n-1 PATH="$pgstub:$PATH" PNEUMA_GATE_PG_BIN="$pgstub" bash -c 'source "$1"; _engine_pg_up "$2"; echo "rc=$?"; _engine_pg_down' _ "$ENGINE_PROFILE" "$PGRUN" 2>&1)
+check "S7: a server that answers with this run's nonce is used" bash -c 'grep -q "rc=0" <<<"$1" && grep -q "pneuma.run_nonce=run-n-1" "$2"' _ "$s7_ok" "$PG_STUB_CALLS"
+pg_case nonce-bad
+s7_bad=$(PNEUMA_GATE_NONCE=run-n-1 PG_STUB_SERVER_NONCE=another-run PATH="$pgstub:$PATH" PNEUMA_GATE_PG_BIN="$pgstub" bash -c 'source "$1"; _engine_pg_up "$2"; echo "rc=$?"' _ "$ENGINE_PROFILE" "$PGRUN" 2>&1)
+check "S7: a server on the recycled address that carries another run's nonce is REFUSED (rc=1, named)" bash -c 'grep -q "rc=1" <<<"$1" && grep -q "does not carry this run" <<<"$1"' _ "$s7_bad"
+check "S7: ...and the cluster that was started is stopped" grep -q "pg_ctl -D $PGRUN/pg/data -m immediate -w stop" "$PG_STUB_CALLS"
+pg_case nonce-none
+s7_none=$(PNEUMA_GATE_NONCE=run-n-1 PG_STUB_SERVER_NONCE= PATH="$pgstub:$PATH" PNEUMA_GATE_PG_BIN="$pgstub" bash -c 'source "$1"; _engine_pg_up "$2"; echo "rc=$?"' _ "$ENGINE_PROFILE" "$PGRUN" 2>&1)
+check "S7: a server that answers with no nonce (some other cluster) is refused" grep -q "rc=1" <<<"$s7_none"
+pg_case nonce-unit
+s7_unit=$(PNEUMA_GATE_REMOTE_RUN=1 PATH="$pgstub:$PATH" PNEUMA_GATE_PG_BIN="$pgstub" bash -c 'source "$1"; _engine_pg_up "$2"; echo "rc=$?"' _ "$ENGINE_PROFILE" "$PGRUN" 2>&1)
+check "S7: inside a gate unit a missing nonce is a refusal, never a pass" bash -c 'grep -q "rc=1" <<<"$1" && grep -q "no run nonce" <<<"$1"' _ "$s7_unit"
+check "S7: a unit gets a nonce on its command line (the thing the guard and supersession verify)" grep -q "PNEUMA_GATE_NONCE=" "$SCOPE_RECORD"
 
 
 exit "$fail"

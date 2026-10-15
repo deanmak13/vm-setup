@@ -90,11 +90,20 @@ state_init() {
   [ -L "$STATE_DIR" ] && return 1
   mkdir -p "$STATE_DIR/runs" "$STATE_DIR/in" && chmod 0700 "$STATE_DIR" "$STATE_DIR/runs" "$STATE_DIR/in"
 }
+# Every run has a NONCE, minted when the run starts. It is written into the run's reservation and its
+# submitter record and into the command line of its unit (PNEUMA_GATE_NONCE=...), so a record can be checked
+# against the unit it names before it is allowed to act on it: a unit name, a loopback address or a pid that
+# has been recycled for another run does not carry the nonce, and is refused.
+new_nonce() { head -c 12 /dev/urandom | od -An -tx1 | tr -d ' \n'; }
+unit_has_nonce() {  # <unit> <nonce>: the unit under this name was started for the run that holds this nonce
+  [ -n "$2" ] || return 1
+  "$SYSTEMCTL_BIN" show -p ExecStart --value "$1" 2>/dev/null | grep -qF "PNEUMA_GATE_NONCE=$2"
+}
 proc_start() { sed 's/.*) //' "/proc/$1/stat" 2>/dev/null | awk '{print $20}'; }   # starttime of a pid
-state_mark() {  # <run id> <runner pid> <cores> <mem_mb> <queued|admitted|warm> [loopback]: only an admitted marker holds capacity
+state_mark() {  # <run id> <runner pid> <cores> <mem_mb> <queued|admitted|warm> [loopback] [nonce]: only an admitted marker holds capacity
   local f="$STATE_DIR/runs/$1" tmp="$STATE_DIR/runs/.$1.$$"
   [ -L "$f" ] && return 1
-  printf 'pid=%s\npstart=%s\ncores=%s\nmem_mb=%s\nstate=%s\nloopback=%s\n' "$2" "$(proc_start "$2")" "$3" "$4" "${5:-admitted}" "${6:-}" > "$tmp" && mv -f "$tmp" "$f"
+  printf 'pid=%s\npstart=%s\ncores=%s\nmem_mb=%s\nstate=%s\nloopback=%s\nnonce=%s\n' "$2" "$(proc_start "$2")" "$3" "$4" "${5:-admitted}" "${6:-}" "${7:-}" > "$tmp" && mv -f "$tmp" "$f"
 }
 state_get() {  # <run id> <key>
   local f="$STATE_DIR/runs/$1"
@@ -214,7 +223,6 @@ cmd_janitor() {
   # not running, and keep-refs past two days.
   local f pid store ref ts id
   cmd_guard
-  loopback_sweep
   for f in "$BASE_DIR"/queue/*; do
     [ -e "$f" ] || continue
     [ "$(ticket_state "$f")" = dead ] && rm -f "$f"     # unknown stays: only a positive death frees a place
@@ -234,6 +242,21 @@ cmd_janitor() {
     [ "$(unit_state "pneuma-gate-$id.service")" = inactive ] || continue
     rm -f "$f"
   done
+  # submitter records: dropped only when the runner AND the unit are both positively gone
+  for f in "$DEDUP_DIR"/*; do
+    [ -f "$f" ] && [ ! -L "$f" ] || continue
+    [ "$(dedup_state "$(basename "$f")")" = dead ] && rm -f "$f"
+  done
+  # warm-env build slots left by a runner that died: only once the slot's runner and both units are gone
+  local slot sid
+  for slot in "$BASE_DIR"/envs/*/.slot-*; do
+    [ -d "$slot" ] && [ ! -L "$slot" ] || continue
+    sid="${slot##*/.slot-}"
+    runner_dead "$sid-build" && runner_dead "$sid-key" || continue
+    [ "$(unit_state "pneuma-warm-$sid-build.service")" = inactive ] && [ "$(unit_state "pneuma-warm-$sid-key.service")" = inactive ] || continue
+    rm -rf --one-file-system -- "$slot"
+  done
+  loopback_sweep   # after the reservations: an address is free only when no reservation still names it
   # keep-refs older than 2 days no longer pin their objects
   for store in "$BASE_DIR"/repos/*.git; do
     [ -d "$store" ] || continue
@@ -255,9 +278,15 @@ cmd_guard() {
   while read -r unit; do
     [ -n "$unit" ] || continue
     id="${unit#pneuma-gate-}"; id="${id%.service}"
-    if [ "$low" = 1 ] || runner_dead "$id"; then
-      log "guard: stopping $unit (${low:+disk low or }runner gone)"
-      "$SYSTEMCTL_BIN" stop "$unit" >/dev/null 2>&1
+    if [ "$low" = 1 ]; then
+      log "guard: stopping $unit (disk low)"; "$SYSTEMCTL_BIN" stop "$unit" >/dev/null 2>&1
+    elif runner_dead "$id"; then
+      # the reservation says its runner is gone; stop the unit only if it is the unit that run started
+      if [ ! -e "$STATE_DIR/runs/$id" ] || unit_has_nonce "$unit" "$(state_get "$id" nonce)"; then   # no reservation at all = unaccounted capacity
+        log "guard: stopping $unit (runner gone)"; "$SYSTEMCTL_BIN" stop "$unit" >/dev/null 2>&1
+      else
+        log "guard: NOT stopping $unit: it does not carry the nonce of the reservation that names it"
+      fi
     fi
   done < <("$SYSTEMCTL_BIN" list-units --plain --no-legend --state=active,activating,deactivating 'pneuma-gate-*.service' 2>/dev/null | awk '{print $1}')
   return 0
@@ -363,11 +392,10 @@ loopback_claim() {   # <run id> → prints a per-run loopback address that no ot
   return 1
 }
 loopback_down() { "$IP_BIN" route del local "$1/32" dev lo >/dev/null 2>&1; return 0; }
-loopback_sweep() {   # drop the per-run routes of runs that are gone
+loopback_sweep() {   # drop the per-run routes no reservation holds any more
   local keep="" r addr
   for r in "$STATE_DIR"/runs/*; do
     [ -f "$r" ] && [ ! -L "$r" ] || continue
-    runner_dead "$(basename "$r")" && continue
     keep="$keep"$'\n'"$(state_get "$(basename "$r")" loopback)"
   done
   "$IP_BIN" route show table local 2>/dev/null | awk '$1=="local" && $2 ~ /^127\.(1[6-9]|[2-9][0-9]|1[0-9][0-9]|2[01][0-9])\.[0-9]+\.[0-9]+$/ {print $2}' |
@@ -403,7 +431,7 @@ unit_props() {   # <loopback> → UNIT_PROPS
 }
 
 # ── run ──────────────────────────────────────────────────────────────────────
-DEDUP_ID=""; SUBMITTER=""; LOOPBACK=""; RUN_ID=""; QUEUE_FILE=""; START_TS=0; BUNDLE_FILE=""; UNIT=""; GUARD_PID=""; ABORT_FLAG=""
+RUN_NONCE=""; DEDUP_ID=""; SUBMITTER=""; LOOPBACK=""; RUN_ID=""; QUEUE_FILE=""; START_TS=0; BUNDLE_FILE=""; UNIT=""; GUARD_PID=""; ABORT_FLAG=""
 R_REPO=""; R_HEAD=""; R_TREE=""; R_PROFILE=""
 refuse() { log "REFUSED: $1"; result 75 "$1"; exit 75; }
 result() {   # result <exit> [reason]
@@ -425,9 +453,9 @@ refuse_noid() { echo "pneuma-gate-runner: refused: no submitter identity (only p
 # unknown, the run neither supersedes nor is superseded: the fail-safe is to cancel nothing.
 DEDUP_DIR="${PNEUMA_GATE_DEDUP_DIR:-/var/lib/pneuma-gate-dedup}"
 PER_SUBMITTER_CAP="${PNEUMA_GATE_PER_SUBMITTER_CAP:-3}"   # live gates one submitter may hold at once (queued + running)
-dedup_register() {  # <id> <key> <head> <submitter> <unit>
+dedup_register() {  # <id> <key> <head> <submitter> <unit> [nonce]
   mkdir -p "$DEDUP_DIR" && chmod 0700 "$DEDUP_DIR" || return 1
-  printf 'key=%s\nhead=%s\npid=%s\npstart=%s\nsubmitter=%s\nunit=%s\nsuperseded=\n' "$2" "$3" "$$" "$(proc_start "$$")" "$4" "$5" > "$DEDUP_DIR/$1"
+  printf 'key=%s\nhead=%s\npid=%s\npstart=%s\nsubmitter=%s\nunit=%s\nnonce=%s\nsuperseded=\n' "$2" "$3" "$$" "$(proc_start "$$")" "$4" "$5" "${6:-}" > "$DEDUP_DIR/$1"
 }
 # A record is live while its runner is the SAME process (pid + start time, so a recycled pid is not
 # mistaken for it) or its unit is active. A record without a start time (older runner) falls back to the pid.
@@ -485,7 +513,10 @@ dedup_supersede() {  # <id> <store> <key> <head> <submitter>
     fi
     dedup_set "$other" superseded "$4"
     unit="$(dedup_field "$other" unit)"
-    if [ -n "$unit" ]; then "$SYSTEMCTL_BIN" stop "$unit" >/dev/null 2>&1 || true; fi
+    if [ -n "$unit" ]; then
+      if unit_has_nonce "$unit" "$(dedup_field "$other" nonce)"; then "$SYSTEMCTL_BIN" stop "$unit" >/dev/null 2>&1 || true
+      else log "not stopping $unit for run $other: the unit does not carry that run's nonce (a recycled name, or an unverifiable record)"; fi
+    fi
   done
 }
 
@@ -506,13 +537,13 @@ dedup_count_submitter() {  # <submitter>: live gates (queued or running) that su
 # enforces the submitter's cap and records the run, before the runner reads a byte of the bundle, promotes
 # anything or touches the store, so an over-cap submitter costs the host nothing. DECIDE runs once the bundle
 # is in the store (ancestry needs it) and supersedes the older gates.
-dedup_hold() {  # <id> <repo> <branch> <head> <submitter>: 0 recorded, 2 over the submitter's cap
+dedup_hold() {  # <id> <repo> <branch> <head> <submitter> [nonce]: 0 recorded, 2 over the submitter's cap
   (
     mkdir -p "$DEDUP_DIR" && chmod 0700 "$DEDUP_DIR" || exit 1
     exec 8>"$DEDUP_DIR/.lock"
     flock 8 || exit 1
     [ "$(dedup_count_submitter "$5")" -lt "$PER_SUBMITTER_CAP" ] || exit 2
-    dedup_register "$1" "${3:+$2/$3}" "$4" "$5" "pneuma-gate-$1.service" || exit 1
+    dedup_register "$1" "${3:+$2/$3}" "$4" "$5" "pneuma-gate-$1.service" "${6:-}" || exit 1
   )
 }
 dedup_decide() {  # <id> <store> <repo> <branch> <head> <submitter>
@@ -582,7 +613,7 @@ reserve_capacity() {   # <cores> <mem_mb>: 0 when this run holds a reservation
     flock 9 || exit 1
     [ "$(first_live_waiter)" = "$(basename "$QUEUE_FILE")" ] || exit 1
     can_admit "$cores" "$mem" || exit 1
-    state_mark "$RUN_ID" "$$" "$cores" "$mem" admitted "$LOOPBACK" || exit 1
+    state_mark "$RUN_ID" "$$" "$cores" "$mem" admitted "$LOOPBACK" "$RUN_NONCE" || exit 1
   )
 }
 
@@ -590,12 +621,21 @@ reserve_capacity() {   # <cores> <mem_mb>: 0 when this run holds a reservation
 # per-run directories belong to systemd and go with the unit.
 cleanup() {
   [ -n "$QUEUE_FILE" ] && rm -f "$QUEUE_FILE"
+  [ -n "$GUARD_PID" ] && kill "$GUARD_PID" 2>/dev/null
+  [ -n "$ABORT_FLAG" ] && rm -f "$ABORT_FLAG"
+  # The run's identity bindings (reservation, submitter record, loopback address, staged bundle) are released
+  # only on POSITIVE proof that its unit is gone. A unit that is still active, or whose state cannot be read,
+  # keeps them: the address cannot be handed to another run while the old unit can still reach it, and the
+  # submitter's cap keeps counting it. The janitor releases them once the unit is positively inactive.
+  if [ -n "$UNIT" ] && [ "$(unit_state "$UNIT.service")" != inactive ]; then
+    log "unit $UNIT is not confirmed gone: its reservation, record, address and bundle stay until it is"
+    return 0
+  fi
   [ -n "$BUNDLE_FILE" ] && rm -f "$BUNDLE_FILE"
   [ -n "$DEDUP_ID" ] && dedup_remove "$DEDUP_ID"
   [ -n "$LOOPBACK" ] && loopback_down "$LOOPBACK"
-  [ -n "$GUARD_PID" ] && kill "$GUARD_PID" 2>/dev/null
-  [ -n "$ABORT_FLAG" ] && rm -f "$ABORT_FLAG"
   [ -n "$RUN_ID" ] && state_remove "$RUN_ID"
+  return 0
 }
 # A gate's private disk (workspace, env, PG data, venv) is bounded only by the host: while the
 # unit runs, stop it if free space on the builder falls to the abort line, so one run cannot
@@ -674,12 +714,12 @@ cmd_run() {
   cores="$(profile_cores)"; mem="$(profile_mem_mb)"
   [[ "$cores" =~ ^[0-9]+$ && "$mem" =~ ^[0-9]+$ ]] || refuse "profile $profile has no numeric limits"
 
-  RUN_ID="$(date +%Y%m%dT%H%M%S)-$$"; UNIT="pneuma-gate-$RUN_ID"
+  RUN_ID="$(date +%Y%m%dT%H%M%S)-$$"; UNIT="pneuma-gate-$RUN_ID"; RUN_NONCE="$(new_nonce)"
   DEDUP_ID="$RUN_ID"          # also the gate's unit name: pneuma-gate-<id>
   # FIRST: the submitter's cap, and the record of this run. Nothing below (the store, the loopback route,
   # the bundle, the promote unit) happens for a submitter that is over its cap.
   log "gate for ${repo:-?} branch ${branch:-(detached)} head ${head:0:12} submitter $SUBMITTER"
-  dedup_hold "$DEDUP_ID" "$repo" "$branch" "$head" "$SUBMITTER"
+  dedup_hold "$DEDUP_ID" "$repo" "$branch" "$head" "$SUBMITTER" "$RUN_NONCE"
   case $? in
     0) ;;
     2) DEDUP_ID=""; refuse "submitter already holds $PER_SUBMITTER_CAP queued or running gates; wait for them";;
@@ -689,11 +729,11 @@ cmd_run() {
   if [ ! -d "$store" ]; then as_gate git init -q --bare "$store" || refuse "cannot init object store"; fi
   # A queued marker (pid + start time) exists before anything is staged, so the janitor never takes
   # a waiting runner's bundle; it holds no capacity until admit() makes it an admitted marker.
-  state_mark "$RUN_ID" "$$" "$cores" "$mem" queued || refuse "cannot record the run"
+  state_mark "$RUN_ID" "$$" "$cores" "$mem" queued "" "$RUN_NONCE" || refuse "cannot record the run"
   # The run's own loopback address: claimed with `ip route add`, which fails if any other run holds it.
   local loopback; loopback="$(loopback_claim "$RUN_ID")" || refuse "cannot claim a loopback address for the run"
   LOOPBACK="$loopback"
-  state_mark "$RUN_ID" "$$" "$cores" "$mem" queued "$loopback" || refuse "cannot record the run"
+  state_mark "$RUN_ID" "$$" "$cores" "$mem" queued "$loopback" "$RUN_NONCE" || refuse "cannot record the run"
   unit_props "$loopback" || refuse "cannot build the unit's properties (network allow list or write cap): see the message above"
   # The bundle is only staged, read-only, for the unit to unpack. The file is world-readable so
   # the unit's own uid can read it, but it sits in a 0700 root directory: the only way to it
@@ -734,7 +774,7 @@ cmd_run() {
       PNEUMA_GATE_RUN_DIR="$run_dir" PNEUMA_GATE_WORK_DIR="$work_dir" \
       PNEUMA_GATE_PROFILE_DIR="$PROFILE_DIR" PNEUMA_GATE_IN_MOUNT="$IN_MOUNT" \
       PNEUMA_GATE_ENVS_MOUNT="$ENVS_MOUNT" PNEUMA_GATE_WHEELS_MOUNT="$WHEELS_MOUNT" \
-      PNEUMA_GATE_CORES="$cores" PNEUMA_GATE_LOOPBACK="$loopback" "${fwd_env[@]}" \
+      PNEUMA_GATE_CORES="$cores" PNEUMA_GATE_LOOPBACK="$loopback" PNEUMA_GATE_NONCE="$RUN_NONCE" "${fwd_env[@]}" \
     "$SELF" unit --profile "$profile" --head "$head" --base "$base" --tree "$tree" \
       --origin-main "$origin_main" --shallow "$shallow" --timeout "$GATE_TIMEOUT_S" \
       9>&- </dev/null 2>&1 | sed -u 's/^/  gate: /'
@@ -844,6 +884,11 @@ cmd_promote() {
 # operator builds the env for a TRUSTED ref (origin/main) in a sandboxed unit with the same
 # limits, then root freezes it into the read-only cache. Proto wheels are staged here as root
 # from a version string this runner validated (no PR code ever runs as root).
+slot_uids() { find "$1" -printf '%U\n' 2>/dev/null | sort -u; }
+slot_owned_by_one_dynamic_uid() {  # <slot>
+  local u; u="$(slot_uids "$1")"
+  [ "$(grep -c . <<<"$u")" = 1 ] && [[ "$u" =~ ^[0-9]+$ ]] && [ "$u" -ge "${PNEUMA_GATE_DYNAMIC_UID_MIN:-61184}" ] && [ "$u" -le "${PNEUMA_GATE_DYNAMIC_UID_MAX:-65519}" ]
+}
 cmd_warm_env() {
   local profile="" repo="" ref=""
   while [ $# -gt 0 ]; do
@@ -876,6 +921,9 @@ cmd_warm_env() {
   if ! warm_unit "$id-build" "$store" "$profile" "$ref" "$cores" "$mem" build "$slot:$ENVS_MOUNT/$key"; then
     rm -rf --one-file-system "$slot"; echo "environment build failed" >&2; return 75
   fi
+  # The slot must still belong to the ONE dynamic uid the build unit ran as: a path of another uid means the
+  # uid was recycled, or something else wrote here, and the build is not frozen into the shared cache.
+  slot_owned_by_one_dynamic_uid "$slot" || { rm -rf --one-file-system "$slot"; echo "the build slot is not owned by one dynamic uid: refusing to publish" >&2; return 75; }
   # Freeze: root-owned, read-only, .ready written last; renamed into place atomically.
   chown -R root:root "$slot" && touch "$slot/.ready" && chmod -R a-w,a+rX "$slot" && mv "$slot" "$BASE_DIR/envs/$profile/$key" \
     || { rm -rf --one-file-system "$slot"; return 75; }
@@ -885,7 +933,8 @@ cmd_warm_env() {
 warm_unit() {   # <id> <store> <profile> <ref> <cores> <mem> <key|build> <slot bind or empty>
   local id="$1" store="$2" profile="$3" ref="$4" cores="$5" mem="$6" mode="$7" slot="$8" binds=() lo
   lo="$(loopback_claim "$id")" || return 75
-  state_mark "$id" "$$" 0 0 warm "$lo" || { loopback_down "$lo"; return 75; }
+  local nonce; nonce="$(new_nonce)"
+  state_mark "$id" "$$" 0 0 warm "$lo" "$nonce" || { loopback_down "$lo"; return 75; }
   unit_props "$lo" || { loopback_down "$lo"; state_remove "$id"; return 75; }
   [ -n "$slot" ] && binds=(--property=BindPaths="$slot" --property=ExecStartPre="+$(command -v chown) --reference=$RUN_ROOT/$id ${slot#*:}")
   "$SYSTEMD_RUN_BIN" --unit="pneuma-warm-$id" --wait --collect --pipe --quiet "${SANDBOX_PROPS[@]}" "${UNIT_PROPS[@]}" \
@@ -896,10 +945,11 @@ warm_unit() {   # <id> <store> <profile> <ref> <cores> <mem> <key|build> <slot b
     --property=BindReadOnlyPaths="$BASE_DIR/wheels:$WHEELS_MOUNT" "${binds[@]}" -- \
     env -i PATH="$UNIT_PATH" LANG=C.UTF-8 PNEUMA_GATE_RUN_DIR="$RUN_ROOT/$id" PNEUMA_GATE_WORK_DIR="$UNIT_WORK/$id" \
       PNEUMA_GATE_PROFILE_DIR="$PROFILE_DIR" PNEUMA_GATE_IN_MOUNT="$IN_MOUNT" PNEUMA_GATE_ENVS_MOUNT="$ENVS_MOUNT" \
-      PNEUMA_GATE_WHEELS_MOUNT="$WHEELS_MOUNT" PNEUMA_GATE_LOOPBACK="$lo" \
+      PNEUMA_GATE_WHEELS_MOUNT="$WHEELS_MOUNT" PNEUMA_GATE_LOOPBACK="$lo" PNEUMA_GATE_NONCE="$nonce" \
     "$SELF" warm-unit "$mode" --profile "$profile" --ref "$ref" </dev/null
   local rc=$?
-  loopback_down "$lo"; state_remove "$id"
+  # release the address and the reservation only once the unit is positively gone
+  if [ "$(unit_state "pneuma-warm-$id.service")" = inactive ]; then loopback_down "$lo"; state_remove "$id"; fi
   return "$rc"
 }
 

@@ -140,6 +140,19 @@ _engine_pg_assert_loopback() {  # <port>
   [ "$bad" = 0 ] || { echo "live-pg: FAILED — the cluster listens beyond $host: $lines" >&2; return 1; }
 }
 
+# The server that answers on this address and port must be THIS run's cluster: it was started with the run's
+# nonce, and it must say so before any test is pointed at it. A recycled address or port that now serves
+# another cluster (or none) fails here, not in a test. Inside a unit the nonce is mandatory.
+_engine_pg_assert_mine() {  # <password> <port>
+  local want="${PNEUMA_GATE_NONCE:-}" got
+  if [ -z "$want" ]; then
+    [ -z "${PNEUMA_GATE_REMOTE_RUN:-}" ] && return 0
+    echo "live-pg: FAILED — no run nonce in a gate unit: cannot prove the cluster is this run's" >&2; return 1
+  fi
+  [ -x "$ENGINE_PG_BIN/psql" ] || { echo "live-pg: FAILED — no psql to verify the cluster's run nonce" >&2; return 1; }
+  got="$(PGPASSWORD="$1" "$ENGINE_PG_BIN/psql" -h "$(_engine_pg_host)" -p "$2" -U gate -d postgres -Atc 'show pneuma.run_nonce' 2>/dev/null)"
+  [ "$got" = "$want" ] || { echo "live-pg: FAILED — the server on $(_engine_pg_host):$2 does not carry this run's nonce (a recycled address or port): refusing to use it" >&2; return 1; }
+}
 _engine_pg_up() {  # <run dir> — exports INTEGRATION_TEST + PGTEST_DSN; returns 1 on any failure
   local root="$1/pg" port pw
   if [ ! -x "$ENGINE_PG_BIN/initdb" ]; then
@@ -157,11 +170,12 @@ _engine_pg_up() {  # <run dir> — exports INTEGRATION_TEST + PGTEST_DSN; return
   printf 'host all all %s/32 scram-sha-256\n' "$(_engine_pg_host)" >> "$root/data/pg_hba.conf" || return 1
   "$ENGINE_PG_BIN/pg_ctl" -D "$root/data" -l "$root/server.log" -w \
     -o "-p $port -c listen_addresses=$(_engine_pg_host) -c unix_socket_directories= -c fsync=off \
-       -c shared_buffers=128MB -c work_mem=4MB -c maintenance_work_mem=64MB -c max_connections=50 -c max_wal_size=256MB" \
+       -c shared_buffers=128MB -c work_mem=4MB -c maintenance_work_mem=64MB -c max_connections=50 -c max_wal_size=256MB -c pneuma.run_nonce=${PNEUMA_GATE_NONCE:-none}" \
     start >/dev/null 2>&1 \
     || { echo "live-pg: FAILED — server did not start (see $root/server.log)" >&2; return 1; }
   _ENGINE_PG_ROOT="$root"
   if ! _engine_pg_assert_loopback "$port"; then _engine_pg_down; return 1; fi
+  if ! _engine_pg_assert_mine "$pw" "$port"; then _engine_pg_down; return 1; fi
   export INTEGRATION_TEST=1 PGTEST_DSN="postgresql://gate:$pw@$(_engine_pg_host):$port/postgres"
   echo "live-pg: native PostgreSQL 16 on $(_engine_pg_host):$port (per-run cluster, stopped on exit)"
 }
