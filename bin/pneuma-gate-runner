@@ -88,13 +88,34 @@ can_admit() {
 # ── repo store ───────────────────────────────────────────────────────────────
 safe_name() { [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]] && [ "$1" != . ] && [ "$1" != .. ]; }
 store_for() { printf '%s/repos/%s.git' "$BASE_DIR" "$1"; }
-# Fetch a submitted bundle's refs into the store's KEEP refs. The refspec is FORCED (+): a keep ref pins objects
-# and must follow the newest submission of each repo and branch. A new head is often NOT a descendant of the
-# previous one (a rebase, a sibling, a force-push), and a non-forced refspec rejects that update as
-# non-fast-forward. With -q the rejection was silent: every such gate was refused "bundle fetch failed".
-fetch_keep_refs() {  # <store> <bundle>
-  as_gate git --git-dir="$1" fetch "$2" "+refs/pneuma-gate/*:refs/gate-keep/*" 2>&1 | sed 's/^/  fetch: /'
+# Fetch a submitted bundle's KEEP refs into this repo's store. A keep ref is only a fetch anchor: it pins objects
+# against pruning and carries NO verdict meaning (the verdict is the job's result file; nothing reads a keep ref to
+# decide anything). The refspecs are FORCED (+) and SCOPED to the repo being submitted for: a keep ref follows the
+# newest submission, which is often not a descendant of the last one (a rebase, a sibling, a force-push). A bundle
+# can name only this repo's refs: refs/pneuma-gate/repo/<repo>, its branch, and the head/base/origin-main anchors.
+# Any other ref name in the bundle is never fetched. The fetch is NOT silenced: a rejected ref prints its reason.
+fetch_keep_refs() {  # <store> <bundle> <repo> <branch-or-empty>
+  local store="$1" bundle="$2" repo="$3" branch="$4" specs=()
+  safe_name "$repo" || return 1
+  specs+=("+refs/pneuma-gate/repo/$repo:refs/gate-keep/repo/$repo")
+  if [ -n "$branch" ]; then specs+=("+refs/pneuma-gate/branch/$branch:refs/gate-keep/branch/$branch"); fi
+  specs+=("+refs/pneuma-gate/head-*:refs/gate-keep/head-*" "+refs/pneuma-gate/base-*:refs/gate-keep/base-*" "+refs/pneuma-gate/om-*:refs/gate-keep/om-*")
+  as_gate git --git-dir="$store" fetch "$bundle" "${specs[@]}" 2>&1 | sed 's/^/  fetch: /'
   return "${PIPESTATUS[0]}"
+}
+# Record a submission's shallow boundary commits in the store's shallow file. Read-modify-write of one shared file, so
+# it runs under a lock, and the temp file is unique (mktemp in the same directory): two concurrent runs of the same
+# repo never share a temp name (the old fixed shallow.new made one run's mv fail: "cannot stat shallow.new").
+record_shallow() {  # <store> <csv of commit shas>
+  local store="$1" csv="$2" tmp
+  (
+    exec 7>"$store/.shallow.lock" || exit 1
+    flock 7 || exit 1
+    tmp="$(as_gate mktemp "$store/shallow.XXXXXX")" || exit 1
+    { cat "$store/shallow" 2>/dev/null; tr ',' '\n' <<<"$csv" | grep -E '^[0-9a-f]{40}$' || true; } \
+      | sort -u | as_gate tee "$tmp" >/dev/null || { as_gate rm -f "$tmp"; exit 1; }
+    as_gate mv -f "$tmp" "$store/shallow" || { as_gate rm -f "$tmp"; exit 1; }
+  )
 }
 
 cmd_have() {
@@ -458,8 +479,7 @@ cmd_run() {
   # A shallow dev-box clone cannot ship history past its boundary: record the
   # boundary commits so the store (and every workspace) accepts the cut.
   if [ -n "$shallow" ]; then
-    { cat "$store/shallow" 2>/dev/null; tr ',' '\n' <<<"$shallow" | grep -E '^[0-9a-f]{40}$'; } |
-      sort -u | as_gate tee "$store/shallow.new" >/dev/null && as_gate mv "$store/shallow.new" "$store/shallow"
+    record_shallow "$store" "$shallow" || refuse "cannot record the shallow boundary in the store"
   fi
   if [ "$bundle" = 1 ]; then
     local bf="$BASE_DIR/queue/in-$$.bundle"
@@ -469,7 +489,7 @@ cmd_run() {
     fi
     if [ -n "$RUN_AS" ]; then chown "$RUN_AS" "$bf"; fi
     log "received bundle ($(du -h "$bf" | cut -f1))"
-    fetch_keep_refs "$store" "$bf" || { rm -f "$bf"; refuse "bundle fetch failed"; }
+    fetch_keep_refs "$store" "$bf" "$repo" "$branch" || { rm -f "$bf"; refuse "bundle fetch failed"; }
     rm -f "$bf"
   fi
   local o
