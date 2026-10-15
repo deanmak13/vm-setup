@@ -27,6 +27,38 @@ RUNNER="${PNEUMA_GATE_RUNNER:-/usr/local/bin/pneuma-gate-runner}"
 SSH_OPTS=(-o BatchMode=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=6 -o ConnectTimeout=20)
 PROBE_DEPTH="${PNEUMA_GATE_PROBE_DEPTH:-300}"
 
+usage() {
+  cat <<'USAGE'
+usage:
+  pneuma-remote-gate [--repo-dir DIR] [--profile P] [--head SHA] [--base SHA] [--scope-only] [--host H] [--log-dir D]
+      run the gate for a commit on the builder (the default verb)
+  pneuma-remote-gate cancel [--repo-dir DIR] [--head SHA] [--host H]
+      cancel YOUR OWN queued or running gates for that repo and head (default head: HEAD). Other submitters' jobs
+      are never affected: the builder cancels only the submitter whose key this is.
+  pneuma-remote-gate --help
+USAGE
+}
+case "${1:-}" in
+  -h|--help) usage; exit 0;;
+  cancel)
+    shift
+    c_dir="" c_head=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --repo-dir) c_dir="$2"; shift 2;; --head) c_head="$2"; shift 2;; --host) HOST="$2"; shift 2;;
+        *) usage >&2; exit 2;;
+      esac
+    done
+    c_dir="${c_dir:-$(git rev-parse --show-toplevel 2>/dev/null)}"
+    [ -n "$c_dir" ] || { echo "pneuma-remote-gate: cancel: not inside a git repo (use --repo-dir)" >&2; exit 2; }
+    c_url="$(git -C "$c_dir" config --get remote.origin.url 2>/dev/null)" || { echo "pneuma-remote-gate: cancel: no origin remote" >&2; exit 2; }
+    c_repo="$(basename "$c_url" .git)"
+    c_head="${c_head:-$(git -C "$c_dir" rev-parse --verify --quiet 'HEAD^{commit}')}" || exit 2
+    [[ "$c_head" =~ ^[0-9a-f]{40}$ ]] || { echo "pneuma-remote-gate: cancel: --head must be a full commit SHA" >&2; exit 2; }
+    exec ssh "${SSH_OPTS[@]}" "$HOST" "$RUNNER cancel --repo $c_repo --head $c_head"
+    ;;
+esac
+
 head="" base="" repo_dir="" profile="" log_dir="" scope_only=0
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -161,7 +193,10 @@ fi
 echo "remote-gate: shipping $(du -h "$bundle" | cut -f1) bundle (builder already has ${prereq:+${prereq:0:12}}${prereq:+ and older}${prereq:-nothing yet})" >&2
 
 # 3) Run. Output streams back live; the verdict is the PNEUMA_GATE_RESULT marker.
-ssh "${SSH_OPTS[@]}" "$HOST" "$RUNNER run --profile $profile --repo $repo --head $head --base $base --tree $tree --bundle ${branch:+--branch $branch} ${shallow_args[*]:-} ${fwd_args[*]:-}" \
+# The LANE LABEL: a client-chosen name used only to count slots (the cap per lane). Never identity, never the verdict.
+lane="${PNEUMA_GATE_LANE:-$(basename "$repo_dir")}"
+lane="$(printf '%s' "$lane" | tr -c 'A-Za-z0-9._-' '-' | cut -c1-64)"
+ssh "${SSH_OPTS[@]}" "$HOST" "$RUNNER run --profile $profile --repo $repo --head $head --base $base --tree $tree --bundle ${branch:+--branch $branch} --label $lane ${shallow_args[*]:-} ${fwd_args[*]:-}" \
   < "$bundle" 2>&1 | tee "$log" >&2
 ssh_rc=${PIPESTATUS[0]}
 

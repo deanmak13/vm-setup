@@ -107,12 +107,16 @@ fetch_keep_refs() {  # <store> <bundle> <repo> <branch-or-empty>
 # it runs under a lock, and the temp file is unique (mktemp in the same directory): two concurrent runs of the same
 # repo never share a temp name (the old fixed shallow.new made one run's mv fail: "cannot stat shallow.new").
 record_shallow() {  # <store> <csv of commit shas>
-  local store="$1" csv="$2" tmp
+  local store="$1" csv="$2" tmp lock
+  # The lock lives in the ROOT-OWNED state dir, never in the gate-owned store. The existing file is read AS the gate
+  # user, so root never follows a path inside the store (a planted symlink there reads only what the gate user can).
+  install -d -m 0700 "$DEDUP_DIR" || return 1
+  lock="$DEDUP_DIR/shallow-$(basename "$store" .git).lock"
   (
-    exec 7>"$store/.shallow.lock" || exit 1
+    exec 7>"$lock" || exit 1
     flock 7 || exit 1
     tmp="$(as_gate mktemp "$store/shallow.XXXXXX")" || exit 1
-    { cat "$store/shallow" 2>/dev/null; tr ',' '\n' <<<"$csv" | grep -E '^[0-9a-f]{40}$' || true; } \
+    { as_gate cat "$store/shallow" 2>/dev/null || true; tr ',' '\n' <<<"$csv" | grep -E '^[0-9a-f]{40}$' || true; } \
       | sort -u | as_gate tee "$tmp" >/dev/null || { as_gate rm -f "$tmp"; exit 1; }
     as_gate mv -f "$tmp" "$store/shallow" || { as_gate rm -f "$tmp"; exit 1; }
   )
@@ -138,6 +142,7 @@ live_job_for_dir() {  # <id>: prints the id when its dedup record names a live p
 }
 cmd_janitor() {
   local d pid store ref ts f
+  reap_orphans   # a queued job whose client is gone (and unattached for DEDUP_ORPHAN_S) releases its slot
   for d in "$BASE_DIR"/runs/*/; do
     [ -d "$d" ] || continue
     pid="$(cat "$d/pid" 2>/dev/null || true)"
@@ -217,11 +222,18 @@ refuse_noid() { echo "pneuma-gate-runner: refused: no submitter identity (only p
 # sshd's own auth record (ExposeAuthInfo). It is never a field the client supplies. When it is
 # unknown, the run neither supersedes nor is superseded: the fail-safe is to cancel nothing.
 DEDUP_DIR="${PNEUMA_GATE_DEDUP_DIR:-/var/lib/pneuma-gate-dedup}"
-PER_SUBMITTER_CAP="${PNEUMA_GATE_PER_SUBMITTER_CAP:-3}"   # live gates one submitter may hold at once (queued + running)
+# Slots. The submitter (the SSH key) is the identity; ALL lanes of one dev box share one key, so the submitter cap is the
+# whole box's total (24). A LANE LABEL (untrusted, a client-chosen name) gets its own cap (3) so one lane cannot starve the
+# rest. The label only ever counts slots: it never affects identity, the verdict or what a job may supersede.
+PER_SUBMITTER_CAP="${PNEUMA_GATE_PER_SUBMITTER_CAP:-24}"  # live gates one submitter (key) may hold at once
+PER_LABEL_CAP="${PNEUMA_GATE_PER_LABEL_CAP:-3}"           # live gates one lane label of one submitter may hold at once
+DEDUP_ORPHAN_S="${PNEUMA_GATE_ORPHAN_S:-900}"             # a queued job whose client is gone and unattached this long is reaped
 SYSTEMCTL_BIN="${PNEUMA_GATE_SYSTEMCTL:-systemctl}"
-dedup_register() {  # <id> <key> <head> <submitter> <unit> [jobkey]
+dedup_register() {  # <id> <key> <head> <submitter> <unit> [jobkey] [label]
   mkdir -p "$DEDUP_DIR" && chmod 0700 "$DEDUP_DIR" || return 1
-  printf 'key=%s\nhead=%s\npid=%s\nsubmitter=%s\nunit=%s\njobkey=%s\nsuperseded=\n' "$2" "$3" "${WORKER_PID:-$$}" "$4" "$5" "${6:-}" > "$DEDUP_DIR/$1"
+  # client= is the connection's runner (this process, $$ from the admitting shell); touched= is the last attach or submit.
+  printf 'key=%s\nhead=%s\npid=%s\nsubmitter=%s\nunit=%s\njobkey=%s\nlabel=%s\nclient=%s\ntouched=%s\nsuperseded=\n' \
+    "$2" "$3" "${WORKER_PID:-$$}" "$4" "$5" "${6:-}" "${7:-default}" "$$" "$(date +%s)" > "$DEDUP_DIR/$1"
 }
 dedup_field() {  # <id> <field>
   local f="$DEDUP_DIR/$1"
@@ -268,26 +280,59 @@ dedup_supersede() {  # <id> <store> <key> <head> <submitter>
 # The admission decision for a submission: record it and supersede under ONE root lock, so
 # two simultaneous submissions cannot each miss the other (the later one wins). The lock lives
 # in a subshell whose fd dies with it, so no gate code ever runs while it is open.
-dedup_count_submitter() {  # <submitter>: live gates (queued or running) that submitter holds
+# Does this record hold a slot? Its worker must live. A RUNNING gate always holds one. A QUEUED one holds one while its
+# client is still connected, or it was attached/submitted within DEDUP_ORPHAN_S. A queued record whose client is gone
+# and that nobody attached to for that long holds nothing: it stays re-attachable until the janitor reaps it.
+dedup_holds() {  # <id>
+  local id="$1" pid unit client touched now
+  pid="$(dedup_field "$id" pid)"; unit="$(dedup_field "$id" unit)"
+  kill -0 "$pid" 2>/dev/null || "$SYSTEMCTL_BIN" is-active --quiet "$unit" 2>/dev/null || return 1
+  "$SYSTEMCTL_BIN" is-active --quiet "$unit" 2>/dev/null && return 0
+  client="$(dedup_field "$id" client)"; touched="$(dedup_field "$id" touched)"; now="$(date +%s)"
+  [ -n "$client" ] || return 0                                  # a legacy record without a client: fail safe, it counts
+  kill -0 "$client" 2>/dev/null && return 0                     # its client is still connected
+  [ -n "$touched" ] && [ $((now - touched)) -lt "$DEDUP_ORPHAN_S" ] && return 0
+  return 1
+}
+dedup_count() {  # <submitter> [label]: the slots this submitter (or one of its lane labels) holds
   local f other n=0
   for f in "$DEDUP_DIR"/*; do
     [ -f "$f" ] && [ ! -L "$f" ] || continue
     other="$(basename "$f")"
     [ "$(dedup_field "$other" submitter)" = "$1" ] || continue
-    if kill -0 "$(dedup_field "$other" pid)" 2>/dev/null || "$SYSTEMCTL_BIN" is-active --quiet "$(dedup_field "$other" unit)" 2>/dev/null; then
-      n=$((n + 1))
-    fi
+    [ -z "${2:-}" ] || [ "$(dedup_field "$other" label)" = "$2" ] || continue
+    dedup_holds "$other" && n=$((n + 1))
   done
   echo "$n"
 }
-dedup_admit() {  # <id> <store> <repo> <branch> <head> <submitter> [jobkey]: 0 recorded, 2 over the submitter's cap
+# The janitor's reaper: a QUEUED worker whose client is gone and that nobody attached to for DEDUP_ORPHAN_S is stopped.
+# Its own exit path removes its record. A running gate is never touched here.
+reap_orphans() {
+  local f id pid unit client touched now
+  now="$(date +%s)"
+  for f in "$DEDUP_DIR"/*; do
+    [ -f "$f" ] && [ ! -L "$f" ] || continue
+    id="$(basename "$f")"
+    pid="$(dedup_field "$id" pid)"; unit="$(dedup_field "$id" unit)"
+    "$SYSTEMCTL_BIN" is-active --quiet "$unit" 2>/dev/null && continue
+    kill -0 "$pid" 2>/dev/null || continue
+    client="$(dedup_field "$id" client)"; touched="$(dedup_field "$id" touched)"
+    [ -n "$client" ] || continue
+    kill -0 "$client" 2>/dev/null && continue
+    [ -n "$touched" ] && [ $((now - touched)) -lt "$DEDUP_ORPHAN_S" ] && continue
+    log "reaped orphaned queued job $id (client gone, nobody attached for ${DEDUP_ORPHAN_S}s)"
+    kill -TERM "$pid" 2>/dev/null || true
+  done
+}
+dedup_admit() {  # <id> <store> <repo> <branch> <head> <submitter> [jobkey] [label]: 0 recorded, 2 submitter cap, 3 label cap
   (
     mkdir -p "$DEDUP_DIR" && chmod 0700 "$DEDUP_DIR" || exit 1
     exec 8>"$DEDUP_DIR/.lock"
     flock 8 || exit 1
-    # Fairness: one submitter cannot fill the queue or the slots for the others.
-    [ "$(dedup_count_submitter "$6")" -lt "$PER_SUBMITTER_CAP" ] || exit 2
-    dedup_register "$1" "${4:+$3/$4}" "$5" "$6" "pneuma-gate-$1.service" "${7:-}" || exit 1
+    # Fairness: one submitter cannot fill the queue for the others; one lane label cannot fill its submitter's slots.
+    [ "$(dedup_count "$6")" -lt "$PER_SUBMITTER_CAP" ] || exit 2
+    [ "$(dedup_count "$6" "${8:-default}")" -lt "$PER_LABEL_CAP" ] || exit 3
+    dedup_register "$1" "${4:+$3/$4}" "$5" "$6" "pneuma-gate-$1.service" "${7:-}" "${8:-default}" || exit 1
     dedup_supersede "$1" "$2" "${4:+$3/$4}" "$5" "$6"
   )
 }
@@ -312,9 +357,14 @@ first_live_waiter() {
   done
 }
 
+# A queue ticket is named after the process that WAITS: the detached worker's own pid (BASHPID), not the parent's $$.
+# first_live_waiter drops a ticket whose pid is dead; a ticket named after a dead parent would strand a live worker.
+queue_ticket_name() { printf '%s/queue/%s-%s' "$BASE_DIR" "$(date +%s%N)" "${BASHPID:-$$}"; }
 admit() {   # admit <cores> <mem_mb> — block until admitted; creates RUN_DIR
   local cores="$1" mem="$2" waited=0
-  QUEUE_FILE="$BASE_DIR/queue/$(date +%s%N)-$$"; : > "$QUEUE_FILE"
+  # BASHPID is expanded HERE, in the waiting worker itself. Never through queue_ticket_name in a $(...): that subshell
+  # has its own pid, which exits at once, and first_live_waiter would drop the ticket as dead (nothing is ever admitted).
+  QUEUE_FILE="$BASE_DIR/queue/$(date +%s%N)-${BASHPID:-$$}"; : > "$QUEUE_FILE"
   exec 9>"$BASE_DIR/admit.lock"
   while :; do
     flock 9
@@ -427,7 +477,7 @@ cmd_cancel() {  # --repo R --head SHA: cancel THIS submitter's live jobs for tha
 }
 
 cmd_run() {
-  local profile="" repo="" head="" base="" tree="" bundle=0 shallow="" origin_main="" branch="" fwd_env=()
+  local profile="" repo="" head="" base="" tree="" bundle=0 shallow="" origin_main="" branch="" label="" fwd_env=()
   while [ $# -gt 0 ]; do
     case "$1" in
       --shallow) shallow="$2"; shift 2;;
@@ -439,12 +489,20 @@ cmd_run() {
       --head) head="$2"; shift 2;; --base) base="$2"; shift 2;;
       --tree) tree="$2"; shift 2;; --bundle) bundle=1; shift;;
       --branch) branch="$2"; shift 2;;
+      --label) label="$2"; shift 2;;
       *) echo "unknown arg $1" >&2; return 2;;
     esac
   done
   START_TS="$(date +%s)"; R_REPO="$repo"; R_HEAD="$head"; R_TREE="$tree"; R_PROFILE="$profile"
   trap cleanup EXIT
   { safe_name "$repo" && safe_name "$profile"; } || refuse "bad repo/profile name"
+  # the branch is validated HERE, before anything uses it (the bundle binding, the key, the supersede logic)
+  if [ -n "$branch" ] && { ! [[ "$branch" =~ ^[A-Za-z0-9._/-]{1,200}$ ]] || [[ "$branch" == *..* ]]; }; then
+    refuse "bad branch name"
+  fi
+  # the lane label only counts slots (untrusted: never identity, never the verdict); it must still be a plain name
+  if [ -n "$label" ] && ! [[ "$label" =~ ^[A-Za-z0-9._-]{1,64}$ ]]; then refuse "bad lane label"; fi
+  label="${label:-default}"
   [[ "$head" =~ ^[0-9a-f]{40}$ && "$base" =~ ^[0-9a-f]{40}$ && "$tree" =~ ^[0-9a-f]{40}$ ]] || refuse "head/base/tree must be 40-hex"
   check_host || refuse "host $(hostname) is not the approved builder ($EXPECT_HOST)"
   [ -r "$PROFILE_DIR/$profile.sh" ] || refuse "no gate profile '$profile' in $PROFILE_DIR"
@@ -456,6 +514,8 @@ cmd_run() {
   local live_id; live_id="$(live_job_for_key "$JOB_KEY")"
   if [ -n "$live_id" ]; then
     [ "$bundle" = 1 ] && cat >/dev/null          # the live job already holds this head
+    # the attach refreshes the record: this client is connected to it now (a queued job stays claimed while followed)
+    dedup_set "$live_id" client "$$"; dedup_set "$live_id" touched "$(date +%s)"
     log "attached to live job $live_id (same scope key ${JOB_KEY:0:12}): following it, not queued again"
     follow_job "$(dedup_field "$live_id" pid)" "$JOBS_DIR/$live_id/log"
     return "$(job_exit "$live_id")"
@@ -519,14 +579,15 @@ run_job() {   # the detached worker: admission, workspace, the gate, the verdict
   # the gate's unit is named after the job: pneuma-gate-<JOB_ID>
   # Every run is recorded under its submitter (the fairness cap applies to all of them). Only a
   # run with a branch has a key, and only a key ever supersedes: a detached run supersedes nothing.
-  if [ -n "$branch" ] && ! [[ "$branch" =~ ^[A-Za-z0-9._/-]{1,200}$ ]] || [[ "$branch" == *..* ]]; then
+  if [ -n "$branch" ] && { ! [[ "$branch" =~ ^[A-Za-z0-9._/-]{1,200}$ ]] || [[ "$branch" == *..* ]]; }; then
     refuse "bad branch name"
   fi
   log "gate for ${repo:-?} branch ${branch:-(detached)} head ${head:0:12} submitter $SUBMITTER"
-  dedup_admit "$DEDUP_ID" "$store" "$repo" "$branch" "$head" "$SUBMITTER" "$JOB_KEY"
+  dedup_admit "$DEDUP_ID" "$store" "$repo" "$branch" "$head" "$SUBMITTER" "$JOB_KEY" "$label"
   case $? in
     0) ;;
     2) refuse "submitter already holds $PER_SUBMITTER_CAP queued or running gates; wait for them";;
+    3) refuse "this lane ($label) already holds $PER_LABEL_CAP queued or running gates; wait for them";;
     *) refuse "cannot record the gate";;
   esac
   admit "$cores" "$mem"
@@ -562,6 +623,8 @@ run_job() {   # the detached worker: admission, workspace, the gate, the verdict
   # The gate runs as a transient UNIT named by this runner. A newer head cancels it by that
   # name (systemctl stop); no pid is stored or signalled (GATE-DEDUP-1, pid reuse).
   command -v "$scope_bin" >/dev/null 2>&1 || refuse "no $scope_bin: the gate's unit is required"
+  # The gate unit's NETWORK POLICY is owned by vm-setup #17 (public egress, per-run loopback, deny for host/k3s/wg0).
+  # This is the only systemd-run in the runner; tests/remote-gate.test.sh enumerates it and asserts it carries no allow-all.
   "$scope_bin" --unit="pneuma-gate-$DEDUP_ID" --wait --collect --quiet -- \
     ${RUN_AS:+runuser -u "$RUN_AS" --} env -i PATH=/usr/local/bin:/usr/bin:/bin HOME="$RUN_DIR/home" TMPDIR="$RUN_DIR/tmp" LANG=C.UTF-8 \
     PNEUMA_GATE_REMOTE_RUN=1 PNEUMA_GATE_RUN_DIR="$RUN_DIR" PNEUMA_GATE_CORES="$cores" "${fwd_env[@]}" \

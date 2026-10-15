@@ -117,9 +117,11 @@ export PNEUMA_GATE_RESULTS_DIR="$work/results"   # the root-owned verdict files:
 # the gate runs as a unit: stand-ins for systemd-run (runs the command inline) and systemctl
 cat > "$work/bin/systemd-run-stub" <<'STUB'
 #!/usr/bin/env bash
+printf '%s\n' "$*" >> "$SYSTEMD_RECORD"   # every systemd-run invocation is recorded; the network-policy test reads it
 while [ $# -gt 0 ] && [ "$1" != -- ]; do shift; done; shift
 exec "$@"
 STUB
+export SYSTEMD_RECORD="$work/systemd-run.record"; : > "$SYSTEMD_RECORD"
 cat > "$work/bin/systemctl-dedup-stub" <<'STUB'
 #!/usr/bin/env bash
 case "$1" in is-active) exit 1;; stop) echo "stop $2" >> "$WORK_STOPS"; exit 0;; esac
@@ -220,7 +222,6 @@ check "scope report: a killed selector yields no services line (no false selecti
 
 # ── client end to end ────────────────────────────────────────────────────────
 out=$("$CLIENT" --repo-dir "$src" --profile fake --head "$head" --base "$base" --log-dir "$work/logs" 2>&1) && rc=0 || rc=$?
-echo "DBG:$out" >&2
 expect_eq "client: green gate exits 0" 0 "$rc"
 check "runner: the profile scope report opens the log" grep -q "scope: fake-scope base=" <<<"$out"
 check "client: log names the exact head and tree" grep -q "$head" <<<"$out"
@@ -414,7 +415,7 @@ flock -u 7; exec 7>&-; wait "$lock_pid" 2>/dev/null || true
 # fairness: submitter A at its cap is refused; submitter B is still admitted; neither cancels the other
 fresh
 rec2 a-1 repoA/q1 "$C1" "$SUB_A"; rec2 a-2 repoA/q2 "$C1" "$SUB_A"; rec2 a-3 repoA/q3 "$C1" "$SUB_A"
-rc_capped=0; ddo dedup_admit flood-a "$dstore" repoA main "$C2" "$SUB_A" || rc_capped=$?
+rc_capped=0; PNEUMA_GATE_PER_SUBMITTER_CAP=3 ddo dedup_admit flood-a "$dstore" repoA main "$C2" "$SUB_A" || rc_capped=$?
 check "fairness: a submitter at its cap is refused (exit 2), not queued" test "$rc_capped" = 2
 rc_b=0; ddo dedup_admit b-1 "$dstore" repoA main "$C2" "$SUB_B" || rc_b=$?
 check "fairness: another submitter is still admitted while A is at its cap" test "$rc_b" = 0
@@ -693,5 +694,58 @@ fetch_race_ok() {
   [ "$(grep -c '^0$' "$rcs")" = 8 ]
 }
 check "keep fetch race: 8 concurrent keep-ref fetches of one repo all succeed (no silent rejection)" fetch_race_ok
+
+# the shallow lock lives in the ROOT-OWNED state dir, never in the gate-owned store
+check "shallow lock: lives in the state dir, not in the store" \
+  bash -c 'ls "$1"/shallow-*.lock >/dev/null 2>&1 && ! test -e "$2/.shallow.lock"' _ "$PNEUMA_GATE_DEDUP_DIR" "$sstore"
+
+# the runner validates --branch itself, before anything uses it (not only the client does)
+for badb in 'a..b' 'a b' 'a;rm'; do
+  check "branch: the runner refuses a bad --branch '$badb' before any work" \
+    bash -c 'out="$("$1" run --submitter test-lane --profile fake --repo fakerepo --head "$2" --base "$3" --tree "$4" --branch "$5" 2>&1)"; test $? = 75 && grep -q "bad branch name" <<<"$out"' _ "$RUNNER" "$head" "$base" "$tree" "$badb"
+done
+
+# a queue ticket is named after the WAITING process (the worker's own pid), never the parent's
+tkname_ok() {
+  bash -c 'source "$1"; ( queue_ticket_name > "$2"; echo "$BASHPID" > "$3" )' _ "$RUNNER" "$work/tk-name" "$work/tk-pid" || return 1
+  local name; name="$(cat "$work/tk-name")"
+  [ "${name##*-}" = "$(cat "$work/tk-pid")" ]
+}
+check "queue: a ticket is named after the waiting worker's own pid" tkname_ok
+
+# PER-LANE CAP: one lane label of a submitter holds at most 3 slots; another label of the same key is still admitted.
+# (All lanes of a dev box share one key, so the lane label is what keeps one lane from starving the others.)
+fresh
+# three LIVE gates of lane laneX (their workers are this test shell's pid, so they hold slots while it runs)
+rec_lane() {  # rec_lane <id> <branch> <label>
+  mkdir -p "$PNEUMA_GATE_DEDUP_DIR"
+  printf 'key=repoA/%s\nhead=%s\npid=%s\nsubmitter=%s\nunit=pneuma-gate-%s.service\njobkey=\nlabel=%s\nclient=%s\ntouched=%s\nsuperseded=\n' \
+    "$2" "$C2" "$$" "$SUB_A" "$1" "$3" "$$" "$(date +%s)" > "$PNEUMA_GATE_DEDUP_DIR/$1"
+}
+rec_lane lane-1 b1 laneX; rec_lane lane-2 b2 laneX; rec_lane lane-3 b3 laneX
+lane4_rc=0; PNEUMA_GATE_PER_LABEL_CAP=3 ddo dedup_admit lane-4 "$dstore" repoA b4 "$C2" "$SUB_A" "" laneX || lane4_rc=$?
+check "per-lane cap: the 4th gate of one lane label is refused (exit 3)" test "$lane4_rc" = 3
+lane5_rc=0; PNEUMA_GATE_PER_LABEL_CAP=3 ddo dedup_admit lane-5 "$dstore" repoA b5 "$C2" "$SUB_A" "" laneY || lane5_rc=$?
+check "per-lane cap: another lane label of the same key is still admitted" test "$lane5_rc" = 0
+
+# ADMISSION: a worker is admitted through ITS OWN queue ticket (the ticket is named after the waiting process, so it is
+# not dropped as dead). A worker that never gets admitted would hang here until the timeout.
+mkdir -p "$work/qadm/queue" "$work/qadm/runs"
+check "admission: a worker with free capacity is admitted through its own queue ticket" \
+  bash -c 'out="$(env PNEUMA_GATE_BASE="$1" PNEUMA_GATE_NPROC=64 PNEUMA_GATE_RESERVE_MEM_MB=0 PNEUMA_GATE_MEMINFO="$2" PNEUMA_GATE_LOADAVG="$3" timeout 30 bash -c '"'"'source "$1"; admit 1 100 && echo admitted'"'"' _ "$4" 2>&1)"; grep -q "^admitted$" <<<"$out"' _ "$work/qadm" "$work/qmeminfo" "$work/qloadavg" "$RUNNER"
+
+# CLIENT: --help documents the verbs; `cancel` sends the cancel verb for THIS repo and HEAD through the forced command.
+check "client: --help documents the cancel verb" bash -c '"$1" --help 2>&1 | grep -q "pneuma-remote-gate cancel"' _ "$CLIENT"
+mkdir -p "$work/rec-ssh"; printf '%s\n' '#!/usr/bin/env bash' 'printf "%s\n" "$*" >> "$WORK_SSH_RECORD"' > "$work/rec-ssh/ssh"; chmod +x "$work/rec-ssh/ssh"
+export WORK_SSH_RECORD="$work/ssh-rec.txt"; : > "$WORK_SSH_RECORD"
+check "client: cancel sends the cancel verb for this repo and HEAD" bash -c 'PATH="$1:$PATH" PNEUMA_GATE_RUNNER=pneuma-gate-runner "$2" cancel --repo-dir "$3" >/dev/null 2>&1; grep -q "cancel --repo fakerepo --head $4" "$5"' _ "$work/rec-ssh" "$CLIENT" "$src" "$head" "$WORK_SSH_RECORD"
+
+# NETWORK POLICY enumeration (the policy itself is vm-setup #17's): the runner has exactly one systemd-run call site,
+# and no invocation the suite recorded carries an allow-all (an IPAddressAllow of 0.0.0.0/0 or ::/0). #17 adds the
+# allow-list assertion for every recorded invocation here.
+check "network: the runner has exactly one systemd-run call site (enumerated)" \
+  bash -c 'test "$(grep -c "\"\$scope_bin\" --unit=" "$1")" = 1' _ "$RUNNER"
+check "network: no recorded systemd-run invocation grants an allow-all" \
+  bash -c '! grep -q "IPAddressAllow=0\.0\.0\.0/0\|IPAddressAllow=::/0\|IPAddressAllow=any" "$1"' _ "$SYSTEMD_RECORD"
 
 exit "$fail"

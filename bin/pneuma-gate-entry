@@ -35,7 +35,7 @@ esac
 verb="${words[0]}"; words=("${words[@]:1}")
 
 # every option: name -> its value pattern. A value-less option is listed with an empty pattern.
-declare -A allowed=([--profile]='^[a-z0-9][a-z0-9-]{0,62}$' [--repo]='^[A-Za-z0-9._-]{1,100}$' [--head]='^[0-9a-f]{40}$' [--base]='^[0-9a-f]{40}$' [--tree]='^[0-9a-f]{40}$' [--origin-main]='^[0-9a-f]{40}$' [--shallow]='^([0-9a-f]{40},?)+$' [--branch]='^[A-Za-z0-9._/-]{1,200}$' [--env]='^PNEUMA_PREPUSH_(FULL|NO_CACHE)=[01]$' [--bundle]='')
+declare -A allowed=([--label]='^[A-Za-z0-9._-]{1,64}$' [--profile]='^[a-z0-9][a-z0-9-]{0,62}$' [--repo]='^[A-Za-z0-9._-]{1,100}$' [--head]='^[0-9a-f]{40}$' [--base]='^[0-9a-f]{40}$' [--tree]='^[0-9a-f]{40}$' [--origin-main]='^[0-9a-f]{40}$' [--shallow]='^([0-9a-f]{40},?)+$' [--branch]='^[A-Za-z0-9._/-]{1,200}$' [--env]='^PNEUMA_PREPUSH_(FULL|NO_CACHE)=[01]$' [--bundle]='')
 case "$verb" in
   run) ;;
   have) allowed=([--repo]="${allowed[--repo]}");;
