@@ -14,7 +14,7 @@
 #      There is no path that leaves an old or partial config live without saying so.
 #
 # Scope: the sshd drop-in ends with `Match all`, so the override cannot reach any other user; the sudoers
-# rule names exactly the three verbs of the runner. Temp files are mktemp names inside the root-owned
+# rule names exactly the four verbs of the runner (status, have, run, cancel). Temp files are mktemp names inside the root-owned
 # staging dir or beside their target (dot-prefixed, so sudo and sshd ignore them if left behind).
 set -euo pipefail
 
@@ -28,11 +28,11 @@ RUNNER=/usr/local/bin/pneuma-gate-runner
 
 die() { echo "refused: $*" >&2; exit 1; }
 
-# The ONE sudo rule: the entry may run exactly the three verbs of the runner, nothing else. Rendered here
+# The ONE sudo rule: the entry may run exactly the four verbs of the runner (status, have, run, cancel), nothing else. Rendered here
 # and only here; tests/gate-real-sudo.check.sh reads it back through --render-sudoers (no copy elsewhere).
 render_sudoers() {
-  printf 'Defaults!%s env_reset\npneuma-submit ALL=(root) NOPASSWD: %s status *, %s have *, %s run *\n' \
-    "$RUNNER" "$RUNNER" "$RUNNER" "$RUNNER" > "$1"
+  printf 'Defaults!%s env_reset\npneuma-submit ALL=(root) NOPASSWD: %s status *, %s have *, %s run *, %s cancel *\n' \
+    "$RUNNER" "$RUNNER" "$RUNNER" "$RUNNER" "$RUNNER" > "$1"
 }
 
 # A from-address must be one IPv4/IPv6 address or CIDR from a strict allowlist. Anything else (a quote, a comma,
