@@ -1677,4 +1677,21 @@ check "promotion (f): the runner never ignores a failed promotion (no '|| true' 
   bash -c '! grep -q "promote_bundle.*|| *true" "$1"' _ "$RUNNER"
 rm -rf "$PNEUMA_GATE_DEDUP_DIR"; mkdir -p "$PNEUMA_GATE_DEDUP_DIR"
 
+
+# ════ VM17 third pass (e-g, warm audit): dedup, promotion, fetch isolation, warm marker ════
+# (g) fetch isolation: a repo-scoped keep fetch never touches ANOTHER repo's ref, even one already in the store and even
+# when the bundle carries that repo's ref at a different commit. Its own keep ref is written.
+iso="$work/isostore.git"; git init -q --bare "$iso"
+dgit push -q "$iso" "$C1:refs/gate-keep/repo/otherrepo"
+dgit update-ref refs/pneuma-gate/repo/isoA "$CX"
+dgit update-ref refs/pneuma-gate/repo/otherrepo "$C3"
+dgit bundle create "$work/iso.bundle" refs/pneuma-gate/repo/isoA refs/pneuma-gate/repo/otherrepo >/dev/null 2>&1
+dgit update-ref -d refs/pneuma-gate/repo/isoA; dgit update-ref -d refs/pneuma-gate/repo/otherrepo
+iso_ok() {
+  ddo fetch_keep_refs "$iso" "$work/iso.bundle" isoA "" >/dev/null 2>&1 \
+    && [ "$(git --git-dir="$iso" rev-parse refs/gate-keep/repo/otherrepo)" = "$C1" ] \
+    && [ "$(git --git-dir="$iso" rev-parse refs/gate-keep/repo/isoA)" = "$CX" ]
+}
+check "fetch isolation (g): a repo-scoped keep fetch leaves another repo's keep ref untouched and writes its own" iso_ok
+
 exit "$fail"
