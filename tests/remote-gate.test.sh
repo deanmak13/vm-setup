@@ -1637,4 +1637,25 @@ check "unknown (d): ...and the unknown record is neither deleted nor superseded"
 kill "$rd_pid" 2>/dev/null; wait "$rd_pid" 2>/dev/null || true
 rm -rf "$PNEUMA_GATE_DEDUP_DIR"; mkdir -p "$PNEUMA_GATE_DEDUP_DIR"
 
+
+# ════ VM17 third pass (e-g, warm audit): dedup, promotion, fetch isolation, warm marker ════
+# (e) concurrent identical submissions attach to ONE job. Six admissions of one scope key race for the root lock: one
+# registers, the other five are told the live job's id and start nothing (none is refused by the submitter cap either).
+rm -rf "$PNEUMA_GATE_DEDUP_DIR"; mkdir -p "$PNEUMA_GATE_DEDUP_DIR"
+ek="$(jk fakerepo "$C2" "$T2" test-lane-e fake "$C1" "" "")"
+ep=()
+for k in 1 2 3 4 5 6; do
+  bash -c 'source "$1"; dedup_hold "$2" repoA main "$3" test-lane-e "$4" "nonce-$2" "$5"; echo "rc=$?"' _ "$RUNNER" "e$k" "$C2" "$$" "$ek" \
+    > "$work/e$k.out" 2>&1 &
+  ep+=($!)
+done
+wait "${ep[@]}" 2>/dev/null || true
+expect_eq "concurrent (e): exactly one of six identical submissions registers the scope" 1 "$(grep -l '^rc=0$' "$work"/e?.out | wc -l)"
+expect_eq "concurrent (e): the other five attach to it (exit 3)" 5 "$(grep -l '^rc=3$' "$work"/e?.out | wc -l)"
+expect_eq "concurrent (e): one run record exists for the scope" 1 "$(ls -A "$PNEUMA_GATE_DEDUP_DIR" | grep -vc '^\.')"
+winner="$(ls -A "$PNEUMA_GATE_DEDUP_DIR" | grep -v '^\.')"
+check "concurrent (e): every attach names that one job" \
+  bash -c 'for f in "$1"/e?.out; do grep -q "^rc=3$" "$f" && { grep -qxF "$2" "$f" || exit 1; }; done' _ "$work" "$winner"
+rm -rf "$PNEUMA_GATE_DEDUP_DIR"; mkdir -p "$PNEUMA_GATE_DEDUP_DIR"
+
 exit "$fail"
