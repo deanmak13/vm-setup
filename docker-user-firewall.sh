@@ -27,8 +27,9 @@
 #   --dry-run (default)   print the rules/commands and validate loadability (iptables-restore --test)
 #   --render              print only the rule body
 #   --apply [--pre-docker] [--rollback-timer SECONDS]
-#                         apply v4+v6 and verify; --pre-docker skips the FORWARD-jump check (boot,
-#                         before docker.service); the timer schedules --remove after SECONDS
+#                         apply v4+v6 and verify; --pre-docker skips the FORWARD-jump check and every
+#                         Docker CLI query (boot, before docker.service: docker.sock cannot answer yet);
+#                         the timer schedules --remove after SECONDS
 #   --confirm             cancel the rollback timer and start the reconcile timer
 #   --verify              check jump-first + FORWARD->DOCKER-USER + DROP in v4 and v6 (exit code)
 #   --reconcile           --verify; re-apply when it fails (run by a timer and after docker start)
@@ -53,6 +54,10 @@ IPT6_RESTORE="${DOCKER_FW_IP6TABLES_RESTORE:-ip6tables-restore}"
 SYSTEMCTL="${DOCKER_FW_SYSTEMCTL:-systemctl}"
 SYSFS_NET="${DOCKER_FW_SYSFS_NET:-/sys/class/net}"
 IFACE_RE='^[A-Za-z0-9_.-]+$'
+PRE_DOCKER=""   # set to 1 by --apply --pre-docker; read by docker_cli_usable and apply_v6
+# Docker CLI budget: all Docker queries in one run share 10 s (see docker_bounded).
+DOCKER_BUDGET=10
+DOCKER_T0=$SECONDS
 
 # Explicit grammar: no wildcard other than the exact `br-+`, never the external interface.
 TRUST_SET="lo docker0 br-+ docker_gwbridge cni0 flannel.1 wg0"
@@ -91,15 +96,39 @@ entries() {
     awk -v role="$1" -v kind="$2" -f "$HERE/docker-user-firewall.entries.awk" "$ALLOWLIST"
 }
 
+# docker_cli_usable: 0 only when the Docker CLI may be queried now. Never in --pre-docker mode:
+# docker.sock is socket-activated by docker.service, which is ordered AFTER this unit, so any
+# Docker CLI call before docker.service starts blocks forever (boot deadlock). Every Docker query
+# in this script must pass this gate.
+docker_cli_usable() { [[ -z "${PRE_DOCKER:-}" ]] && command -v docker >/dev/null; }
+
+# docker_bounded ARGS...: the only way to run the Docker CLI. The whole run gets DOCKER_BUDGET
+# seconds (wall clock, via bash SECONDS, so it also holds inside $(...)); each call is
+# `timeout --kill-after=2 <remaining>`. Once the budget is spent the call returns 124 without running.
+# A timed-out or failed call makes callers take their existing safe fallbacks (no custom bridge
+# names, no network warning, [::] check reported as before).
+docker_bounded() {
+    local left=$(( DOCKER_BUDGET - (SECONDS - DOCKER_T0) ))
+    (( left > 0 )) || return 124
+    timeout --kill-after=2 "$left" docker "$@"
+}
+
+# docker_budget_start: opens a fresh DOCKER_BUDGET window for ONE phase. Phases do not share time:
+# the [::] security check, the custom-bridge lookup and the macvlan/ipvlan warning each get their own
+# window, so a slow bridge lookup can never starve the security verdict. Normal-mode worst case, per
+# run: bridge lookup <= 12 s, [::] check <= 12 s (only when ip6tables is missing), warning <= 12 s.
+docker_budget_start() { DOCKER_T0=$SECONDS; }
+
 # Docker networks with a custom bridge name (com.docker.network.bridge.name) are trusted as
 # SOURCES when they are real bridge devices; the default-deny already covers them as destinations.
 docker_bridge_names() {
-    command -v docker >/dev/null || return 0
+    docker_cli_usable || return 0
+    docker_budget_start
     local ids n
-    ids="$(docker network ls -q --filter driver=bridge 2>/dev/null)" || return 0
+    ids="$(docker_bounded network ls -q --filter driver=bridge 2>/dev/null)" || return 0
     [[ -n "$ids" ]] || return 0
     # shellcheck disable=SC2086
-    docker network inspect -f '{{index .Options "com.docker.network.bridge.name"}}' $ids 2>/dev/null | while read -r n; do
+    docker_bounded network inspect -f '{{index .Options "com.docker.network.bridge.name"}}' $ids 2>/dev/null | while read -r n; do
         if [[ "$n" =~ $IFACE_RE && -d "$SYSFS_NET/$n/bridge" ]]; then echo "$n"; fi
     done
 }
@@ -207,15 +236,36 @@ apply_v6() {
     if command -v "$IPT6" >/dev/null && command -v "$IPT6_RESTORE" >/dev/null; then
         apply_family ip6tables "$IPT6" "$IPT6_RESTORE" "$rules"; return
     fi
-    if command -v docker >/dev/null && docker ps --format '{{.Ports}}' | grep -q '\[::\]'; then
+    # --pre-docker (boot, before dockerd): the [::] publish check needs the Docker CLI, which must not
+    # be called here. Without ip6tables no IPv6 filter can ever exist, and dockerd would start unfiltered
+    # on [::] later, so REFUSE: exit non-zero, and the docker.service ExecStartPre stops the daemon start.
+    if [[ -n "${PRE_DOCKER:-}" ]]; then
+        warn "no ip6tables/ip6tables-restore at pre-docker: REFUSING startup (IPv6 would be unfiltered)"; return 1
+    fi
+    # Normal mode, no ip6tables: IPv6 publishes can only be ruled out by asking Docker. FAIL CLOSED:
+    # only a query that succeeds (rc 0) and shows no [::] publish passes. No CLI, daemon unreachable,
+    # timeout or error all mean "cannot verify" and fail.
+    if ! docker_cli_usable; then
+        warn "cannot verify [::] publishes (no ip6tables; Docker CLI unavailable): failing"; return 1
+    fi
+    local out rc
+    docker_budget_start
+    out="$(docker_bounded ps --format '{{.Ports}}' 2>/dev/null)"; rc=$?
+    if (( rc != 0 )); then
+        warn "cannot verify [::] publishes (no ip6tables; docker ps rc=$rc): failing"; return 1
+    fi
+    if grep -q '\[::\]' <<<"$out"; then
         warn "no ip6tables but Docker publishes on [::]: IPv6 bypass, failing"; return 1
     fi
-    warn "no ip6tables; asserted no container publishes on [::]"
+    warn "no ip6tables; verified no container publishes on [::]"
 }
 
 warn_unfilterable_networks() {
-    command -v docker >/dev/null || return 0
-    if [[ -n "$(docker network ls -q --filter driver=macvlan 2>/dev/null; docker network ls -q --filter driver=ipvlan 2>/dev/null)" ]]; then
+    # --pre-docker: no macvlan/ipvlan network can exist yet, and the CLI must not be called. The warning
+    # is emitted by the post-start apply (ExecStartPost), which runs with the daemon up.
+    docker_cli_usable || return 0
+    docker_budget_start
+    if [[ -n "$(docker_bounded network ls -q --filter driver=macvlan 2>/dev/null; docker_bounded network ls -q --filter driver=ipvlan 2>/dev/null)" ]]; then
         warn "macvlan/ipvlan Docker networks exist: their traffic never crosses host netfilter and is NOT covered"
     fi
 }
@@ -280,7 +330,6 @@ install_all() {
 
 if [[ "${1:-}" == "--role" ]]; then DOCKER_FW_ROLE="${2:?--role needs a value}"; shift 2; fi
 MODE="${1:---dry-run}"
-PRE_DOCKER=""
 case "$MODE" in
     --dry-run) dry_run ;;
     --render)  rules="$(plan_rules)" || exit 1; echo "$rules" ;;
