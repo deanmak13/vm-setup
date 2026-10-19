@@ -165,8 +165,11 @@ ssh "${SSH_OPTS[@]}" "$HOST" "$RUNNER run --profile $profile --repo $repo --head
   < "$bundle" 2>&1 | tee "$log" >&2
 ssh_rc=${PIPESTATUS[0]}
 
+# The verdict is the LAST marker, and it must be the stream's last line: the runner prints it after the job has
+# ended, and every job line is prefixed by the runner, so an earlier or mid-stream marker is never the verdict.
 marker=$(grep '^PNEUMA_GATE_RESULT ' "$log" | tail -1)
 [ -n "$marker" ] || nogate "no PNEUMA_GATE_RESULT marker (ssh exit $ssh_rc) — treating as NOT green; log $log"
+[ "$(tail -n 1 "$log")" = "$marker" ] || nogate "the verdict is not the stream's final line (ssh exit $ssh_rc) — NOT green; log $log"
 field() { printf '%s' "$marker" | tr ' ' '\n' | sed -n "s/^$1=//p" | head -1; }
 # Must match the runner's job_key byte for byte: the scope key that binds a verdict's fields.
 job_key() {  # <repo> <head> <tree> <submitter> <profile> <base> <origin_main> <env>
@@ -185,8 +188,12 @@ job_key() {  # <repo> <head> <tree> <submitter> <profile> <base> <origin_main> <
 [ -n "$(field jobkey)" ] && [ "$(field jobkey)" = "$(job_key "$repo" "$head" "$tree" "$(field submitter)" "$profile" "$base" "$origin_main" "$env_s")" ] \
   || nogate "result's job key does not bind its fields — NOT green; log $log"
 rc="$(field exit)"
+# The transport must agree with the verdict: the runner exits with the verdict's own status. A green verdict
+# needs ssh exit 0; a red one takes ssh exit 0 or 1 (the runner's own red status). Anything else is no verdict.
 case "$rc" in
-  0) echo "remote-gate: GREEN for ${head:0:12} on $(field host) in $(field elapsed)  (log $log)" >&2; exit 0;;
-  1) echo "remote-gate: RED for ${head:0:12} on $(field host) in $(field elapsed)  (log $log)" >&2; exit 1;;
+  0) [ "$ssh_rc" = 0 ] || nogate "the transport exited $ssh_rc but the verdict is green — NOT green; log $log"
+     echo "remote-gate: GREEN for ${head:0:12} on $(field host) in $(field elapsed)  (log $log)" >&2; exit 0;;
+  1) [ "$ssh_rc" = 0 ] || [ "$ssh_rc" = 1 ] || nogate "the transport exited $ssh_rc, not the verdict's status — NOT green; log $log"
+     echo "remote-gate: RED for ${head:0:12} on $(field host) in $(field elapsed)  (log $log)" >&2; exit 1;;
   *) nogate "no verdict (exit=$rc $(printf '%s' "$marker" | sed -n 's/.*\(reason=.*\)/\1/p')) — NOT green; log $log";;
 esac
