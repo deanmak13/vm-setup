@@ -1455,7 +1455,7 @@ rec_of() {  # <submitter>: the id of a run record that submitter holds (empty un
   local f; for f in "$PNEUMA_GATE_DEDUP_DIR"/*; do [ -f "$f" ] && grep -qx "submitter=$1" "$f" && { basename "$f"; return 0; }; done
   return 0
 }
-rec_field() { sed -n "s/^$2=//p" "$PNEUMA_GATE_DEDUP_DIR/$1" | head -1; }   # <id> <field>
+rec_field() { sed -n "s/^$2=//p" "$PNEUMA_GATE_DEDUP_DIR/$1" 2>/dev/null | head -1 || true; }   # <id> <field>
 HUP_INT_TERM=16387   # 0x4003
 
 # (a1) queued: capacity is zero, so the job waits in the queue while the parent is signalled
@@ -1465,14 +1465,14 @@ PNEUMA_GATE_MAX_CONCURRENT=0 PNEUMA_GATE_POLL_S=1 "$RUNNER" run --submitter test
 dq=$!
 for _ in $(seq 1 30); do [ -n "$(rec_of test-lane-dq)" ] && break; sleep 1; done
 dqid="$(rec_of test-lane-dq)"; dqw="$(rec_field "$dqid" pid)"
-kill -HUP "$dq" 2>/dev/null; kill -TERM "$dq" 2>/dev/null; kill -INT "$dq" 2>/dev/null
+kill -HUP "$dq" 2>/dev/null || true; kill -TERM "$dq" 2>/dev/null || true; kill -INT "$dq" 2>/dev/null || true
 sleep 2
 check "disconnect (queued): the parent ignores HUP, TERM and INT" sig_ignored "$dq" "$HUP_INT_TERM"
 check "disconnect (queued): the parent survives the signals" kill -0 "$dq"
 check "disconnect (queued): the detached worker survives the parent's signals" kill -0 "$dqw"
 check "disconnect (queued): the run record and the queue ticket are retained" \
   bash -c 'test -e "$1/$2" && test -n "$(ls "$3"/queue 2>/dev/null)"' _ "$PNEUMA_GATE_DEDUP_DIR" "$dqid" "$PNEUMA_GATE_BASE"
-kill -TERM "$dqw" 2>/dev/null; wait "$dq" 2>/dev/null || true   # the test's own teardown of the queued worker (its abandon path)
+kill -TERM "$dqw" 2>/dev/null || true; wait "$dq" 2>/dev/null || true   # the test's own teardown of the queued worker (its abandon path)
 
 # (a2) running: the job holds capacity and runs (6s profile); the parent is signalled mid-gate
 rm -rf "$PNEUMA_GATE_DEDUP_DIR" "$PNEUMA_GATE_BASE/jobs" "$PNEUMA_GATE_BASE/queue"; mkdir -p "$PNEUMA_GATE_DEDUP_DIR" "$PNEUMA_GATE_BASE/queue"
@@ -1482,7 +1482,7 @@ echo 6 > "$work/profiles/sleep"
 dr=$!
 for _ in $(seq 1 30); do [ -n "$(rec_of test-lane-dr)" ] && break; sleep 1; done
 drid="$(rec_of test-lane-dr)"; drw="$(rec_field "$drid" pid)"
-kill -HUP "$dr" 2>/dev/null; kill -TERM "$dr" 2>/dev/null; kill -INT "$dr" 2>/dev/null
+kill -HUP "$dr" 2>/dev/null || true; kill -TERM "$dr" 2>/dev/null || true; kill -INT "$dr" 2>/dev/null || true
 check "disconnect (running): the parent ignores HUP, TERM and INT" sig_ignored "$dr" "$HUP_INT_TERM"
 check "disconnect (running): the running worker is not stopped by the parent's signals" kill -0 "$drw"
 dr_rc=0; wait "$dr" || dr_rc=$?
