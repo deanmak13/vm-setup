@@ -1443,6 +1443,56 @@ scope_ok() {
 }
 check "keep scope: a bundle's refs for ANOTHER repo are never written; this repo's keep ref is" scope_ok
 
+# ════ VM17 third pass (a): an ssh disconnect never costs the job, queued or running ════
+# The detached worker owns the job. The ssh-attached parent only tails the log and ignores HUP, TERM and INT, so a
+# dropped connection or a stray signal to the parent leaves the worker, its record, its queue ticket and its verdict alone.
+sig_ignored() {  # <pid> <mask>: 0 when every signal bit in the mask is ignored by that process (HUP=1 INT=2 TERM=0x4000)
+  local m; m="$(awk '/^SigIgn:/ {print $2}' "/proc/$1/status" 2>/dev/null)"
+  [[ "$m" =~ ^[0-9a-f]+$ ]] || return 1
+  (( (16#$m & $2) == $2 ))
+}
+rec_of() {  # <submitter>: the id of a run record that submitter holds (empty until one exists)
+  local f; for f in "$PNEUMA_GATE_DEDUP_DIR"/*; do [ -f "$f" ] && grep -qx "submitter=$1" "$f" && { basename "$f"; return 0; }; done
+  return 0
+}
+rec_field() { sed -n "s/^$2=//p" "$PNEUMA_GATE_DEDUP_DIR/$1" | head -1; }   # <id> <field>
+HUP_INT_TERM=16387   # 0x4003
+
+# (a1) queued: capacity is zero, so the job waits in the queue while the parent is signalled
+rm -rf "$PNEUMA_GATE_DEDUP_DIR" "$PNEUMA_GATE_BASE/jobs" "$PNEUMA_GATE_BASE/queue"; mkdir -p "$PNEUMA_GATE_DEDUP_DIR" "$PNEUMA_GATE_BASE/queue"
+PNEUMA_GATE_MAX_CONCURRENT=0 PNEUMA_GATE_POLL_S=1 "$RUNNER" run --submitter test-lane-dq --profile fake --repo fakerepo \
+  --head "$head" --base "$base" --tree "$tree" --branch main > "$work/dq.out" 2>&1 &
+dq=$!
+for _ in $(seq 1 30); do [ -n "$(rec_of test-lane-dq)" ] && break; sleep 1; done
+dqid="$(rec_of test-lane-dq)"; dqw="$(rec_field "$dqid" pid)"
+kill -HUP "$dq" 2>/dev/null; kill -TERM "$dq" 2>/dev/null; kill -INT "$dq" 2>/dev/null
+sleep 2
+check "disconnect (queued): the parent ignores HUP, TERM and INT" sig_ignored "$dq" "$HUP_INT_TERM"
+check "disconnect (queued): the parent survives the signals" kill -0 "$dq"
+check "disconnect (queued): the detached worker survives the parent's signals" kill -0 "$dqw"
+check "disconnect (queued): the run record and the queue ticket are retained" \
+  bash -c 'test -e "$1/$2" && test -n "$(ls "$3"/queue 2>/dev/null)"' _ "$PNEUMA_GATE_DEDUP_DIR" "$dqid" "$PNEUMA_GATE_BASE"
+kill -TERM "$dqw" 2>/dev/null; wait "$dq" 2>/dev/null || true   # the test's own teardown of the queued worker (its abandon path)
+
+# (a2) running: the job holds capacity and runs (6s profile); the parent is signalled mid-gate
+rm -rf "$PNEUMA_GATE_DEDUP_DIR" "$PNEUMA_GATE_BASE/jobs" "$PNEUMA_GATE_BASE/queue"; mkdir -p "$PNEUMA_GATE_DEDUP_DIR" "$PNEUMA_GATE_BASE/queue"
+echo 6 > "$work/profiles/sleep"
+"$RUNNER" run --submitter test-lane-dr --profile fake --repo fakerepo --head "$head" --base "$base" --tree "$tree" \
+  --branch main > "$work/dr.out" 2>&1 &
+dr=$!
+for _ in $(seq 1 30); do [ -n "$(rec_of test-lane-dr)" ] && break; sleep 1; done
+drid="$(rec_of test-lane-dr)"; drw="$(rec_field "$drid" pid)"
+kill -HUP "$dr" 2>/dev/null; kill -TERM "$dr" 2>/dev/null; kill -INT "$dr" 2>/dev/null
+check "disconnect (running): the parent ignores HUP, TERM and INT" sig_ignored "$dr" "$HUP_INT_TERM"
+check "disconnect (running): the running worker is not stopped by the parent's signals" kill -0 "$drw"
+dr_rc=0; wait "$dr" || dr_rc=$?
+rm -f "$work/profiles/sleep"
+expect_eq "disconnect (running): the job completes green after the signals (parent exit 0)" 0 "$dr_rc"
+check "disconnect (running): the verdict is retained in the root-owned result file (exit=0)" \
+  bash -c 'grep -q " exit=0 " "$1/$2"' _ "$PNEUMA_GATE_RESULTS_DIR" "$drid"
+check "disconnect (running): the job log keeps the verdict line" \
+  bash -c 'grep -q "^PNEUMA_GATE_RESULT .* exit=0 " "$1/jobs/$2/log"' _ "$PNEUMA_GATE_BASE" "$drid"
+
 # CONCURRENCY (P0 follow-up): 24 runs record their shallow boundaries into ONE store at once. Each must succeed and
 # every boundary must be recorded. The old fixed temp name made concurrent runs' mv fail ("cannot stat shallow.new").
 sstore="$work/shstore.git"; git init -q --bare "$sstore"
