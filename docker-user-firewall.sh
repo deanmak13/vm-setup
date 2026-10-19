@@ -113,10 +113,17 @@ docker_bounded() {
     timeout --kill-after=2 "$left" docker "$@"
 }
 
+# docker_budget_start: opens a fresh DOCKER_BUDGET window for ONE phase. Phases do not share time:
+# the [::] security check, the custom-bridge lookup and the macvlan/ipvlan warning each get their own
+# window, so a slow bridge lookup can never starve the security verdict. Normal-mode worst case, per
+# run: bridge lookup <= 12 s, [::] check <= 12 s (only when ip6tables is missing), warning <= 12 s.
+docker_budget_start() { DOCKER_T0=$SECONDS; }
+
 # Docker networks with a custom bridge name (com.docker.network.bridge.name) are trusted as
 # SOURCES when they are real bridge devices; the default-deny already covers them as destinations.
 docker_bridge_names() {
     docker_cli_usable || return 0
+    docker_budget_start
     local ids n
     ids="$(docker_bounded network ls -q --filter driver=bridge 2>/dev/null)" || return 0
     [[ -n "$ids" ]] || return 0
@@ -235,16 +242,29 @@ apply_v6() {
     if [[ -n "${PRE_DOCKER:-}" ]]; then
         warn "no ip6tables/ip6tables-restore at pre-docker: REFUSING startup (IPv6 would be unfiltered)"; return 1
     fi
-    if docker_cli_usable && docker_bounded ps --format '{{.Ports}}' 2>/dev/null | grep -q '\[::\]'; then
+    # Normal mode, no ip6tables: IPv6 publishes can only be ruled out by asking Docker. FAIL CLOSED:
+    # only a query that succeeds (rc 0) and shows no [::] publish passes. No CLI, daemon unreachable,
+    # timeout or error all mean "cannot verify" and fail.
+    if ! docker_cli_usable; then
+        warn "cannot verify [::] publishes (no ip6tables; Docker CLI unavailable): failing"; return 1
+    fi
+    local out rc
+    docker_budget_start
+    out="$(docker_bounded ps --format '{{.Ports}}' 2>/dev/null)"; rc=$?
+    if (( rc != 0 )); then
+        warn "cannot verify [::] publishes (no ip6tables; docker ps rc=$rc): failing"; return 1
+    fi
+    if grep -q '\[::\]' <<<"$out"; then
         warn "no ip6tables but Docker publishes on [::]: IPv6 bypass, failing"; return 1
     fi
-    warn "no ip6tables; asserted no container publishes on [::]"
+    warn "no ip6tables; verified no container publishes on [::]"
 }
 
 warn_unfilterable_networks() {
     # --pre-docker: no macvlan/ipvlan network can exist yet, and the CLI must not be called. The warning
     # is emitted by the post-start apply (ExecStartPost), which runs with the daemon up.
     docker_cli_usable || return 0
+    docker_budget_start
     if [[ -n "$(docker_bounded network ls -q --filter driver=macvlan 2>/dev/null; docker_bounded network ls -q --filter driver=ipvlan 2>/dev/null)" ]]; then
         warn "macvlan/ipvlan Docker networks exist: their traffic never crosses host netfilter and is NOT covered"
     fi

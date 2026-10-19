@@ -228,15 +228,33 @@ reset; setrole dev-box
 PATH="$W/hang:$PATH" FAKE_RESTORE_FAIL_ONCE=iptables timeout -k 2 20 "$SCRIPT" --apply --pre-docker >/dev/null 2>&1; rc=$?
 [[ $rc -ne 0 ]] && is_baseline "$W/iptables.rules" && no_docker && ok "pre-docker, fresh-table restore failure: baseline fallback, no Docker call" || bad "pre-docker fallback touched Docker"
 
-# ---- normal mode with a hanging daemon: every Docker query is bounded (10 s budget per run), the
-# timed-out queries take the safe fallbacks, and the installed rules equal those of a healthy run.
+# ---- normal mode with a hanging daemon: each Docker phase is bounded (10 s budget + 2 s kill grace);
+# with ip6tables present the phases are bridge lookup + macvlan/ipvlan warning, so <= ~24 s. The timed-out
+# queries take the safe fallbacks, and the installed rules equal those of a healthy run.
 # Negative control (read, not run): call `docker` directly instead of docker_bounded and the run blocks
 # for the stub's 60 s, so the 40 s outer timeout fails the check.
 reset; setrole dev-box; "$SCRIPT" --apply >/dev/null 2>&1; cp "$W/iptables.chain" "$W/ref.v4"; cp "$W/ip6tables.chain" "$W/ref.v6"
 reset; setrole dev-box; t0=$SECONDS
 PATH="$W/hang:$PATH" timeout -k 2 40 "$SCRIPT" --apply >/dev/null 2>&1; rc=$?; el=$((SECONDS-t0))
-[[ $rc -eq 0 && $el -le 15 ]] && grep -q '^docker-hang network ls' "$W/log" && cmp -s "$W/iptables.chain" "$W/ref.v4" && cmp -s "$W/ip6tables.chain" "$W/ref.v6" \
+[[ $rc -eq 0 && $el -le 25 ]] && grep -q '^docker-hang network ls' "$W/log" && cmp -s "$W/iptables.chain" "$W/ref.v4" && cmp -s "$W/ip6tables.chain" "$W/ref.v6" \
     && ok "normal apply, hung docker: returns in ${el}s (bounded), same rules as a healthy run" || bad "normal apply with hung docker: rc=$rc ${el}s"
+
+# ---- no ip6tables, normal mode: IPv6 is verified only by a successful docker ps with no [::] publish.
+# Fail closed. Negative controls: the hang stub (cannot verify), a failing docker (rc != 0), and a
+# healthy docker publishing [::] must each exit non-zero; the healthy, nothing-on-[::] case stays zero
+# (covered above in "no ip6tables but IPv6 publishing off: ok").
+mkdir -p "$W/fail"; printf '#!/bin/bash\necho "docker-fail $*" >> "$FAKE_LOG"\nexit 1\n' > "$W/fail/docker"; chmod +x "$W/fail/docker"
+NO6=(DOCKER_FW_IP6TABLES=/nonexistent/ip6tables DOCKER_FW_IP6TABLES_RESTORE=/nonexistent/r6)
+reset; setrole dev-box; t0=$SECONDS
+env "${NO6[@]}" PATH="$W/hang:$PATH" timeout -k 2 40 "$SCRIPT" --apply >/dev/null 2>"$W/err"; rc=$?; el=$((SECONDS-t0))
+[[ $rc -ne 0 && $el -le 40 ]] && grep -q '^docker-hang ps' "$W/log" && has "$(cat "$W/err")" "cannot verify" \
+    && ok "missing ip6tables + hung docker: fails closed in ${el}s" || bad "missing ip6tables + hung docker: rc=$rc ${el}s"
+reset; setrole dev-box
+env "${NO6[@]}" PATH="$W/fail:$PATH" timeout -k 2 40 "$SCRIPT" --apply >/dev/null 2>"$W/err"; rc=$?
+[[ $rc -ne 0 ]] && has "$(cat "$W/err")" "docker ps rc=1" && ok "missing ip6tables + docker ps failing: fails closed" || bad "missing ip6tables + failing docker accepted"
+reset; setrole dev-box; printf '0.0.0.0:3000->3000/tcp, [::]:3000->3000/tcp\n' > "$W/dockerps"
+env "${NO6[@]}" "$SCRIPT" --apply >/dev/null 2>&1; rc=$?
+[[ $rc -ne 0 ]] && ok "missing ip6tables + healthy docker publishing [::]: non-zero" || bad "missing ip6tables + [::] publish accepted"
 
 # ---- unit files: the pre-policy gates every docker start; a failed post-start apply is visible
 S="$ROOT/systemd"
