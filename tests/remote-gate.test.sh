@@ -13,6 +13,8 @@
 #
 # Run: bash tests/remote-gate.test.sh
 set -euo pipefail
+# root-owned result files and directories are created 0644/0755 (never group-writable, which the runner refuses)
+umask 022
 
 TESTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(dirname "$TESTS_DIR")"
@@ -114,7 +116,8 @@ export SUDO_RECORD="$work/sudo-recorded.txt" PNEUMA_GATE_SUDO="$work/bin/sudo-st
 export ARGV_RECORD="$work/argv-recorded.txt"
 export PATH="$work/bin:$PATH" PNEUMA_GATE_RUNNER="$work/bin/gate-as-forced-command" PNEUMA_GATE_RUNNER_BIN="$RUNNER" PNEUMA_GATE_HOST=fakehost
 export PNEUMA_GATE_DEDUP_DIR="$work/dedup"   # GATE-DEDUP-1 state: never under /var/lib in tests
-export PNEUMA_GATE_RESULTS_DIR="$work/results"   # the root-owned verdict files: never under /var/lib in tests
+export PNEUMA_GATE_RESULTS_DIR="$work/results"
+export PNEUMA_GATE_RESULTS_UID="$(id -u)"   # the expected owner of result files in tests (root on the builder)   # the root-owned verdict files: never under /var/lib in tests
 # systemd-run stand-in: records its arguments, makes each BindPaths / BindReadOnlyPaths mount
 # visible as a symlink for the duration of the command, then runs the command after `--`.
 # the gate runs as a unit: stand-ins for systemd-run (runs the command inline) and systemctl
@@ -1504,7 +1507,7 @@ rb_key="$(jk fakerepo "$head" "$tree" test-lane-rb fake "$base" "" "")"   # exac
 printf 'key=fakerepo/main\nhead=%s\npid=%s\npstart=%s\nsubmitter=test-lane-rb\nunit=pneuma-gate-job-rb.service\nnonce=nonce-rb\njobkey=%s\nsuperseded=\n' \
   "$head" "$rb_pid" "$rb_start" "$rb_key" > "$PNEUMA_GATE_DEDUP_DIR/job-rb"
 printf 'the job is running\n' > "$PNEUMA_GATE_BASE/jobs/job-rb/log"
-printf 'PNEUMA_GATE_RESULT repo=fakerepo head=%s exit=1 elapsed=1s host=h\n' "$head" > "$PNEUMA_GATE_RESULTS_DIR/job-rb"
+printf 'PNEUMA_GATE_RESULT repo=fakerepo head=%s tree=%s profile=fake base=%s origin_main= env= submitter=test-lane-rb jobkey=%s exit=1 elapsed=1s host=h\n' "$head" "$tree" "$base" "$rb_key" > "$PNEUMA_GATE_RESULTS_DIR/job-rb"
 "$RUNNER" run --submitter test-lane-rb --profile fake --repo fakerepo --head "$head" --base "$base" --tree "$tree" \
   > "$work/rb.out" 2>&1 &
 rbr=$!
@@ -1602,12 +1605,18 @@ printf 'key=repoA/main\nhead=%s\npid=%s\nsubmitter=test-lane-cx\nunit=pneuma-gat
 printf 'key=repoA/main\nhead=%s\npid=%s\nsubmitter=test-lane-cx\nunit=pneuma-gate-job-cy.service\nnonce=n-y\nsuperseded=\n' "$C2" "$$" > "$PNEUMA_GATE_DEDUP_DIR/job-cy"
 printf 'key=repoA/main\nhead=%s\npid=%s\nsubmitter=test-lane-cx\nunit=pneuma-gate-job-cz.service\nsuperseded=\n' "$C2" "$$" > "$PNEUMA_GATE_DEDUP_DIR/job-cz"
 printf 'pneuma-gate-job-cx.service n-other\npneuma-gate-job-cy.service n-y\npneuma-gate-job-cz.service n-z\n' > "$UNIT_NONCES"
+# the recycled-name unit is ACTIVE (running under another run's nonce): that is the case the whole-refusal guards
+printf 'pneuma-gate-job-cx.service\npneuma-gate-job-cy.service\n' > "$SYSTEMCTL_ACTIVE"
+as_sub test-lane-cx --repo repoA --head "$C2" >/dev/null 2>&1 || true
+check "cancel (c): a unit carrying ANOTHER run's nonce (recycled name) refuses the WHOLE cancellation: nothing is stopped" \
+  bash -c '[ ! -s "$1" ]' _ "$SYSTEMCTL_RECORD"
+check "cancel (c): ...and no record is superseded (the owner's other gates are untouched)" \
+  bash -c '! grep -q "^superseded=cancelled" "$1/job-cx" && ! grep -q "^superseded=cancelled" "$1/job-cy" && ! grep -q "^superseded=cancelled" "$1/job-cz"' _ "$PNEUMA_GATE_DEDUP_DIR"
+rm -f "$PNEUMA_GATE_DEDUP_DIR/job-cx" "$PNEUMA_GATE_DEDUP_DIR/job-cz"
+: > "$SYSTEMCTL_ACTIVE"
+printf 'pneuma-gate-job-cy.service\n' > "$SYSTEMCTL_ACTIVE"
 as_sub test-lane-cx --repo repoA --head "$C2" >/dev/null 2>&1
-check "cancel (c): a unit that carries ANOTHER run's nonce (recycled name) is NOT stopped for this record" \
-  bash -c '! grep -q "job-cx" "$1"' _ "$SYSTEMCTL_RECORD"
-check "cancel (c): a record with no nonce at all is NOT stopped (its unit cannot be verified)" \
-  bash -c '! grep -q "job-cz" "$1"' _ "$SYSTEMCTL_RECORD"
-check "cancel (c): the unit that carries the record's own nonce IS stopped" \
+check "cancel (c): with the mismatched record gone, the unit that carries the record's own nonce IS stopped" \
   grep -qx "stop pneuma-gate-job-cy.service" "$SYSTEMCTL_RECORD"
 expect_eq "cancel (c): and it is the only unit stopped" 1 "$(wc -l < "$SYSTEMCTL_RECORD")"
 : > "$UNIT_NONCES"; : > "$SYSTEMCTL_RECORD"
@@ -1720,5 +1729,171 @@ expect_eq "warm-env audit: ...with that process's start time (pid + pstart ident
   "$(sed -n 's/^hstart=//p' <<<"$wa_out")" "$wa_start"
 expect_eq "warm-env audit: the marker is state=warm (holds no gate capacity)" warm "$wa_state"
 rm -rf "$PNEUMA_GATE_STATE_DIR/runs"; mkdir -p "$PNEUMA_GATE_STATE_DIR/runs"
+
+# ════ VM17 fourth pass (requirement 3): ONE authoritative verdict, validated, identical on attach and reattach ════
+ft="$work/fourth"; mkdir -p "$ft/logs" "$ft/results"
+fk() { bash -c 'source "$1"; job_key "${@:2}"' _ "$RUNNER" "$@"; }   # fk <repo> <head> <tree> <submitter> <profile> <base> <origin_main> <env>
+verdict_line() {  # verdict_line <exit> <jobkey> [submitter] [profile] [head]: a full, well-formed verdict line
+  printf 'PNEUMA_GATE_RESULT repo=fakerepo head=%s tree=%s profile=%s base=%s origin_main=%s env= submitter=%s jobkey=%s exit=%s elapsed=1s host=fakehost' \
+    "${5:-$head}" "$tree" "${4:-fake}" "$base" "$base" "${3:-test-lane}" "$2" "$1"
+}
+K="$(fk fakerepo "$head" "$tree" test-lane fake "$base" "$base" "")"   # exactly the key the client computes for this submission
+GREEN="$(verdict_line 0 "$K")"; RED="$(verdict_line 1 "$K")"
+
+# ── the client: the verdict is the stream's final authoritative line, and the transport must agree with it ──
+cat > "$work/bin/stream-runner" <<'STUB'
+#!/usr/bin/env bash
+# a runner stand-in for the client tests: `have` is empty; `run` replays $STREAM_FILE and exits $STREAM_RC
+[ "$1" = have ] && exit 0
+cat "$STREAM_FILE"; exit "$STREAM_RC"
+STUB
+chmod +x "$work/bin/stream-runner"
+stream_client() {  # stream_client <ssh rc> <stream file>: the client's exit for that stream
+  local rc=0
+  STREAM_RC="$1" STREAM_FILE="$2" PNEUMA_GATE_RUNNER="$work/bin/stream-runner" \
+    "$CLIENT" --repo-dir "$src" --profile fake --head "$head" --base "$base" --log-dir "$ft/logs" >/dev/null 2>&1 || rc=$?
+  echo "$rc"
+}
+printf '%s\n' "$GREEN" > "$ft/s-green"; printf '%s\n' "$RED" > "$ft/s-red"
+printf '%s\n' "$GREEN" "job output line" "$RED" > "$ft/s-forged-then-red"
+printf '%s\n' "$RED" "$GREEN" > "$ft/s-red-then-green"
+printf '%s\n' "$GREEN" "trailing job output" > "$ft/s-green-not-final"
+printf '%s\n' "$GREEN" "more output" > "$ft/s-injected-midlog"
+expect_eq "client: control: a consistent green verdict as the final line, transport 0, is green (0)" 0 "$(stream_client 0 "$ft/s-green")"
+expect_eq "client: a forged green line mid-stream and the authoritative RED last is RED (1)" 1 "$(stream_client 1 "$ft/s-forged-then-red")"
+expect_eq "client: a failed transport (ssh 255) with a green marker is NOT success (75)" 75 "$(stream_client 255 "$ft/s-green")"
+expect_eq "client: a nonzero runner exit (1) with a green marker is rejected (75)" 75 "$(stream_client 1 "$ft/s-green")"
+expect_eq "client: a green transport (0) with a RED marker is RED (1)" 1 "$(stream_client 0 "$ft/s-red")"
+expect_eq "client: multiple markers: only the final authoritative one counts (red forged earlier, green last = 0)" 0 "$(stream_client 0 "$ft/s-red-then-green")"
+expect_eq "client: a RED marker with a failed transport (ssh 255) is not a verdict (75)" 75 "$(stream_client 255 "$ft/s-red")"
+expect_eq "client: a marker that is not the stream's final line is not a verdict (75)" 75 "$(stream_client 0 "$ft/s-green-not-final")"
+expect_eq "client: a marker injected mid-log with no final verdict is ignored (75)" 75 "$(stream_client 0 "$ft/s-injected-midlog")"
+
+# ── the runner: replayed job lines are prefixed (no job line can start with the marker) ──
+sleep 0 & dead_pid=$!; wait "$dead_pid" || true
+printf '%s\n' "$GREEN" "plain job line" > "$ft/fj.log"
+fj_out="$(bash -c 'source "$1"; follow_job "$2" "$3"' _ "$RUNNER" "$dead_pid" "$ft/fj.log")"
+check "follow: a replayed job line that is a verdict marker is prefixed, so it never starts a line as a marker" \
+  bash -c '! grep -q "^PNEUMA_GATE_RESULT" <<<"$1"' _ "$fj_out"
+check "follow: every replayed job line carries the job prefix" \
+  bash -c '[ -n "$1" ] && [ -z "$(grep -v "^  job: " <<<"$1")" ]' _ "$fj_out"
+
+# ── the root-owned result file: its owner and mode are checked (job_exit and the completion path) ──
+printf '%s\n' "$GREEN" > "$ft/results/own-1"; chmod 0644 "$ft/results/own-1"
+expect_eq "owner: a result file owned by the runner's own uid is read (exit 0)" 0 \
+  "$(PNEUMA_GATE_RESULTS_DIR="$ft/results" bash -c 'source "$1"; job_exit own-1' _ "$RUNNER")"
+expect_eq "owner: a result file owned by another uid than the expected owner is never trusted (75)" 75 \
+  "$(PNEUMA_GATE_RESULTS_UID=4242 PNEUMA_GATE_RESULTS_DIR="$ft/results" bash -c 'source "$1"; job_exit own-1' _ "$RUNNER")"
+mkdir -p "$ft/results/dir-1"
+expect_eq "owner: a result that is a directory, not a regular file, is never trusted (75)" 75 \
+  "$(PNEUMA_GATE_RESULTS_DIR="$ft/results" bash -c 'source "$1"; job_exit dir-1' _ "$RUNNER")"
+chmod 0666 "$ft/results/own-1"
+expect_eq "owner: a group- or other-writable result file is never trusted (75)" 75 \
+  "$(PNEUMA_GATE_RESULTS_DIR="$ft/results" bash -c 'source "$1"; job_exit own-1' _ "$RUNNER")"
+chmod 0644 "$ft/results/own-1"
+
+# ── finish_job: the one verdict line, from the validated file, for THIS submission ──
+fin_run() {  # fin_run <results dir> <job id>: finish_job's output, then rc=<n>
+  PNEUMA_GATE_RESULTS_DIR="$1" bash -c '
+    source "$1"; R_REPO=fakerepo; R_HEAD="$2"; R_TREE="$3"; R_PROFILE=fake; R_BASE="$4"; R_ORIGIN="$4"
+    R_ENV=""; R_SUBMITTER=test-lane; R_JOBKEY="$5"; START_TS=$(date +%s)
+    finish_job "$6" "no result for the test"; echo "rc=$?"' _ "$RUNNER" "$head" "$tree" "$base" "$K" "$2" 2>&1
+}
+expect_eq "finish: a validated result file is THE verdict, printed verbatim (exit 0)" "$GREEN"$'\nrc=0' "$(fin_run "$ft/results" own-1)"
+printf '%s\n' "$(verdict_line 0 "$K" test-lane fake "$base")" > "$ft/results/scope-1"
+scope_out="$(fin_run "$ft/results" scope-1)"
+check "finish: a result for another head is never the verdict (75, no green line)" \
+  bash -c '[ "$(tail -n 1 <<<"$1")" = rc=75 ] && ! grep -q "exit=0 " <<<"$1"' _ "$scope_out"
+expect_eq "finish: a missing result is 75" "rc=75" "$(fin_run "$ft/results" nothing-1 | tail -1)"
+printf 'garbage\n' > "$ft/results/junk-1"
+expect_eq "finish: a malformed result is 75" "rc=75" "$(fin_run "$ft/results" junk-1 | tail -1)"
+
+# ── persistence: a green job whose verdict cannot be written is 75 and prints no green line ──
+REAL_MV="$(command -v mv)"; export REAL_MV
+cat > "$work/bin/mv" <<'STUB'
+#!/usr/bin/env bash
+# MV_FAIL=1 makes the verdict's write fail: a persistence failure, never a green one
+if [ "${MV_FAIL:-0}" = 1 ] && [[ "$*" == *"$PNEUMA_GATE_RESULTS_DIR"* ]]; then echo "mv: injected failure" >&2; exit 1; fi
+exec "$REAL_MV" "$@"
+STUB
+chmod +x "$work/bin/mv"
+pf_rc=0
+PNEUMA_PREPUSH_FULL=1 MV_FAIL=1 "$CLIENT" --repo-dir "$src" --profile fake --head "$head" --base "$base" \
+  --log-dir "$ft/logs" > "$ft/persist.out" 2>&1 || pf_rc=$?
+expect_eq "persistence: a green gate whose verdict cannot be persisted exits 75 (never green)" 75 "$pf_rc"
+check "persistence: no GREEN line is printed" not grep -q 'remote-gate: GREEN' "$ft/persist.out"
+
+# ── a red gate that prints a forged green marker: the authoritative red wins (end to end) ──
+cat > "$work/profiles/forge.sh" <<'PROFILE'
+profile_cores() { echo 2; }
+profile_mem_mb() { echo 512; }
+profile_scope_report() { echo "forge-scope"; }
+profile_env_key() { echo "forgekey1"; }
+profile_env_build() { mkdir -p "$1" && echo built > "$1/marker"; }
+profile_gate() {
+  echo 'PNEUMA_GATE_RESULT repo=fakerepo head=forged tree=forged profile=fake exit=0 elapsed=1s host=fakehost'
+  echo "forged green line printed by the gate"
+  return 1
+}
+PROFILE
+fg_rc=0
+"$CLIENT" --repo-dir "$src" --profile forge --head "$head" --base "$base" --log-dir "$ft/logs" > "$ft/forge.out" 2>&1 || fg_rc=$?
+expect_eq "end to end: a forged green line from the gate, with the authoritative red, is RED (1)" 1 "$fg_rc"
+
+# ── attach and reattach: two concurrent submissions attach to ONE live job and get the same verdict ──
+reattach() {  # reattach <job id> <exit> <file head>: the live job's file holds <exit> for <file head>; its log has a forged green
+  local id="$1" ex="$2" fhead="$3" pid rst key i c1 c2
+  rm -rf "$PNEUMA_GATE_DEDUP_DIR" "$PNEUMA_GATE_BASE/jobs" "$PNEUMA_GATE_BASE/queue" "$PNEUMA_GATE_RESULTS_DIR"
+  mkdir -p "$PNEUMA_GATE_DEDUP_DIR" "$PNEUMA_GATE_BASE/jobs/$id" "$PNEUMA_GATE_RESULTS_DIR"
+  sleep 120 & pid=$!
+  rst="$(bash -c 'source "$1"; proc_start "$2"' _ "$RUNNER" "$pid")"
+  key="$(fk fakerepo "$head" "$tree" test-lane fake "$base" "$base" "")"
+  printf 'key=fakerepo/main\nhead=%s\npid=%s\npstart=%s\nsubmitter=test-lane\nunit=pneuma-gate-%s.service\nnonce=nonce-%s\njobkey=%s\nsuperseded=\n' \
+    "$head" "$pid" "$rst" "$id" "$id" "$key" > "$PNEUMA_GATE_DEDUP_DIR/$id"
+  printf 'the job is running\n%s\n' "$(verdict_line 0 "$key")" > "$PNEUMA_GATE_BASE/jobs/$id/log"   # a forged green line in the LOG
+  printf '%s\n' "$(verdict_line "$ex" "$key" test-lane fake "$fhead")" > "$PNEUMA_GATE_RESULTS_DIR/$id"
+  "$CLIENT" --repo-dir "$src" --profile fake --head "$head" --base "$base" --log-dir "$ft/logs" > "$ft/$id-1.out" 2>&1 & c1=$!
+  "$CLIENT" --repo-dir "$src" --profile fake --head "$head" --base "$base" --log-dir "$ft/logs" > "$ft/$id-2.out" 2>&1 & c2=$!
+  for i in $(seq 1 30); do
+    [ "$(grep -l 'attached to live job' "$ft/$id-1.out" "$ft/$id-2.out" 2>/dev/null | wc -l)" = 2 ] && break; sleep 1
+  done
+  kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
+  REATT_RC1=0; wait "$c1" || REATT_RC1=$?
+  REATT_RC2=0; wait "$c2" || REATT_RC2=$?
+}
+reattach rA 1 "$head"
+expect_eq "reattach: the first attach's exit is the job's authoritative RED (1), not the forged green in its log" 1 "$REATT_RC1"
+expect_eq "reattach: the reattach's exit is the same RED (1)" 1 "$REATT_RC2"
+check "reattach: the attach and the reattach each print exactly one verdict marker" \
+  bash -c '[ "$(grep -c "^PNEUMA_GATE_RESULT" "$1")" = 1 ] && [ "$(grep -c "^PNEUMA_GATE_RESULT" "$2")" = 1 ]' _ "$ft/rA-1.out" "$ft/rA-2.out"
+check "reattach: the attach and the reattach print IDENTICAL verdict lines, equal to the job's result file" \
+  bash -c 'cmp -s <(grep "^PNEUMA_GATE_RESULT" "$1") <(grep "^PNEUMA_GATE_RESULT" "$2") && grep -qxF "$(cat "$3/rA")" "$1"' \
+  _ "$ft/rA-1.out" "$ft/rA-2.out" "$PNEUMA_GATE_RESULTS_DIR"
+reattach rW 0 "$base"
+expect_eq "reattach, wrong scope: a job whose result is for another head is 75 on the first attach" 75 "$REATT_RC1"
+expect_eq "reattach, wrong scope: and on the reattach too (75)" 75 "$REATT_RC2"
+check "reattach, wrong scope: no green verdict line is printed" not grep -q '^PNEUMA_GATE_RESULT .*exit=0 ' "$ft/rW-1.out"
+rm -rf "$PNEUMA_GATE_RESULTS_DIR"/rA "$PNEUMA_GATE_RESULTS_DIR"/rW
+
+# ── cancel: validate EVERY record (owner, nonce, identity) BEFORE any state change or unit stop ──
+ca_dir="$PNEUMA_GATE_DEDUP_DIR"; rm -rf "$ca_dir"; mkdir -p "$ca_dir"; : > "$SYSTEMCTL_RECORD"
+sleep 120 & ca_pid=$!
+ca_start="$(bash -c 'source "$1"; proc_start "$2"' _ "$RUNNER" "$ca_pid")"
+printf '%s\n' "pneuma-gate-ca-1.service" > "$SYSTEMCTL_ACTIVE"; printf 'pneuma-gate-ca-1.service nonce-OTHER\n' > "$UNIT_NONCES"
+printf 'key=fakerepo/main\nhead=%s\npid=%s\npstart=%s\nsubmitter=test-lane\nunit=pneuma-gate-ca-1.service\nnonce=nonce-CA\njobkey=x\nsuperseded=\n' \
+  "$head" "$ca_pid" "$ca_start" > "$ca_dir/ca-1"
+ca_before="$(cat "$ca_dir/ca-1")"
+ca_rc=0; SUBMITTER=test-lane bash -c 'source "$1"; SUBMITTER=test-lane; cmd_cancel --repo fakerepo --head "$2"' _ "$RUNNER" "$head" >"$ft/ca.out" 2>&1 || ca_rc=$?
+kill -0 "$ca_pid" 2>/dev/null && ca_alive=yes || ca_alive=no
+expect_eq "cancel (mismatch): a nonce mismatch refuses the cancellation (rc 1)" 1 "$ca_rc"
+check "cancel (mismatch): the record is UNCHANGED (not superseded)" bash -c '[ "$1" = "$(cat "$2/ca-1")" ]' _ "$ca_before" "$ca_dir"
+check "cancel (mismatch): the mismatched unit is NOT stopped (no stop recorded)" bash -c '! grep -q "pneuma-gate-ca-1" "$1"' _ "$SYSTEMCTL_RECORD"
+expect_eq "cancel (mismatch): the job's process is still running" yes "$ca_alive"
+printf 'pneuma-gate-ca-1.service nonce-CA\n' > "$UNIT_NONCES"
+ca2_rc=0; bash -c 'source "$1"; SUBMITTER=test-lane; cmd_cancel --repo fakerepo --head "$2"' _ "$RUNNER" "$head" >/dev/null 2>&1 || ca2_rc=$?
+expect_eq "cancel (matching): the same record with its own nonce is cancelled (rc 0)" 0 "$ca2_rc"
+check "cancel (matching): the record is superseded and its unit stopped" bash -c 'grep -qx "superseded=cancelled-by-submitter" "$1/ca-1" && grep -q "^stop pneuma-gate-ca-1.service" "$2"' _ "$ca_dir" "$SYSTEMCTL_RECORD"
+kill "$ca_pid" 2>/dev/null || true; wait "$ca_pid" 2>/dev/null || true
+rm -rf "$ca_dir"; mkdir -p "$ca_dir"
 
 exit "$fail"
