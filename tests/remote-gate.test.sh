@@ -1493,6 +1493,31 @@ check "disconnect (running): the verdict is retained in the root-owned result fi
 check "disconnect (running): the job log keeps the verdict line" \
   bash -c 'grep -q "^PNEUMA_GATE_RESULT .* exit=0 " "$1/jobs/$2/log"' _ "$PNEUMA_GATE_BASE" "$drid"
 
+# (b) exact-key reattach: a live job with the SAME scope key is followed, and its verdict is the job's ROOT-OWNED result
+# file, never what its log says. The attaching submission starts no second job. (The scope fields that must differ are
+# covered by the key tests above: repo, head, tree, submitter, profile, base, origin-main and env.)
+rm -rf "$PNEUMA_GATE_DEDUP_DIR" "$PNEUMA_GATE_BASE/jobs" "$PNEUMA_GATE_BASE/queue"
+mkdir -p "$PNEUMA_GATE_DEDUP_DIR" "$PNEUMA_GATE_BASE/jobs/job-rb" "$PNEUMA_GATE_RESULTS_DIR"
+sleep 60 & rb_pid=$!
+rb_start="$(bash -c 'source "$1"; proc_start "$2"' _ "$RUNNER" "$rb_pid")"
+rb_key="$(jk fakerepo "$head" "$tree" test-lane-rb fake "$base" "" "")"   # exactly the key the submission below computes
+printf 'key=fakerepo/main\nhead=%s\npid=%s\npstart=%s\nsubmitter=test-lane-rb\nunit=pneuma-gate-job-rb.service\nnonce=nonce-rb\njobkey=%s\nsuperseded=\n' \
+  "$head" "$rb_pid" "$rb_start" "$rb_key" > "$PNEUMA_GATE_DEDUP_DIR/job-rb"
+printf 'the job is running\n' > "$PNEUMA_GATE_BASE/jobs/job-rb/log"
+printf 'PNEUMA_GATE_RESULT repo=fakerepo head=%s exit=1 elapsed=1s host=h\n' "$head" > "$PNEUMA_GATE_RESULTS_DIR/job-rb"
+"$RUNNER" run --submitter test-lane-rb --profile fake --repo fakerepo --head "$head" --base "$base" --tree "$tree" \
+  > "$work/rb.out" 2>&1 &
+rbr=$!
+for _ in $(seq 1 20); do grep -q 'attached to live job' "$work/rb.out" 2>/dev/null && break; sleep 1; done
+printf 'PNEUMA_GATE_RESULT repo=fakerepo head=%s exit=0 elapsed=1s host=h\n' "$head" >> "$PNEUMA_GATE_BASE/jobs/job-rb/log"   # a forged green line in the LOG
+kill "$rb_pid" 2>/dev/null; wait "$rb_pid" 2>/dev/null || true
+rb_rc=0; wait "$rbr" || rb_rc=$?
+check "reattach (b): the exact-key submission attaches to the live job (same id)" grep -q "attached to live job job-rb" "$work/rb.out"
+check "reattach (b): the attached client sees the job's own log" grep -q "the job is running" "$work/rb.out"
+expect_eq "reattach (b): the verdict is the job's root-owned result (1), not the forged green line in its log" 1 "$rb_rc"
+expect_eq "reattach (b): no second job was started for the same scope" 1 "$(ls "$PNEUMA_GATE_BASE/jobs" | wc -l)"
+rm -f "$PNEUMA_GATE_RESULTS_DIR/job-rb"
+
 # CONCURRENCY (P0 follow-up): 24 runs record their shallow boundaries into ONE store at once. Each must succeed and
 # every boundary must be recorded. The old fixed temp name made concurrent runs' mv fail ("cannot stat shallow.new").
 sstore="$work/shstore.git"; git init -q --bare "$sstore"
