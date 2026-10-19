@@ -1658,4 +1658,23 @@ check "concurrent (e): every attach names that one job" \
   bash -c 'for f in "$1"/e?.out; do grep -q "^rc=3$" "$f" && { grep -qxF "$2" "$f" || exit 1; }; done' _ "$work" "$winner"
 rm -rf "$PNEUMA_GATE_DEDUP_DIR"; mkdir -p "$PNEUMA_GATE_DEDUP_DIR"
 
+
+# ════ VM17 third pass (e-g, warm audit): dedup, promotion, fetch isolation, warm marker ════
+# (f) a failed promotion refuses BEFORE any ancestry-dependent step: no supersession, no tree check, no gate unit. The
+# promotion is never ignored (no `|| true` after it).
+rm -rf "$PNEUMA_GATE_DEDUP_DIR" "$PNEUMA_GATE_BASE/jobs" "$PNEUMA_GATE_BASE/queue"; mkdir -p "$PNEUMA_GATE_DEDUP_DIR" "$PNEUMA_GATE_BASE/queue"
+printf 'not a git bundle at all\n' > "$work/bad.bundle"
+gates_before="$(grep -c -- '--unit=pneuma-gate-' "$SCOPE_RECORD" || true)"
+pf_rc=0
+pf_out="$("$RUNNER" run --submitter test-lane-f --profile fake --repo fakerepo --head "$head" --base "$base" --tree "$tree" \
+  --bundle < "$work/bad.bundle" 2>&1)" || pf_rc=$?
+expect_eq "promotion (f): a failed promotion is a refusal (exit 75)" 75 "$pf_rc"
+check "promotion (f): the refusal names the promotion" bash -c 'grep -q "bundle promotion failed" <<<"$1"' _ "$pf_out"
+check "promotion (f): no ancestry, supersession or tree check ran after it" \
+  bash -c '! grep -qE "not superseding|superseded run|not in the store|tree mismatch|launching unit" <<<"$1"' _ "$pf_out"
+expect_eq "promotion (f): no gate unit was launched for it" "$gates_before" "$(grep -c -- '--unit=pneuma-gate-' "$SCOPE_RECORD" || true)"
+check "promotion (f): the runner never ignores a failed promotion (no '|| true' after promote_bundle)" \
+  bash -c '! grep -q "promote_bundle.*|| *true" "$1"' _ "$RUNNER"
+rm -rf "$PNEUMA_GATE_DEDUP_DIR"; mkdir -p "$PNEUMA_GATE_DEDUP_DIR"
+
 exit "$fail"
