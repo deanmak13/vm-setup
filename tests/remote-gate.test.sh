@@ -1554,4 +1554,42 @@ fetch_race_ok() {
 }
 check "keep fetch race: 8 concurrent keep-ref fetches of one repo all succeed (no silent rejection)" fetch_race_ok
 
+
+# ════ VM17 third pass (h): a result that cannot be read is a refusal ════
+# (h) a missing, malformed or unreadable ROOT-OWNED result file is never a green verdict: job_exit returns 75, and an
+# attach that depends on such a file is refused the same way
+hr="$PNEUMA_GATE_RESULTS_DIR"; mkdir -p "$hr"
+printf 'PNEUMA_GATE_RESULT repo=x exit=0 elapsed=1s host=h\n' > "$hr/h-ok"
+printf 'garbage with no verdict\n' > "$hr/h-garbage"
+printf 'PNEUMA_GATE_RESULT repo=x exit=abc elapsed=1s host=h\n' > "$hr/h-badexit"
+printf 'PNEUMA_GATE_RESULT repo=x exit= elapsed=1s host=h\n' > "$hr/h-emptyexit"
+printf 'PNEUMA_GATE_RESULT repo=x exit=-1 elapsed=1s host=h\n' > "$hr/h-negative"
+: > "$hr/h-empty"
+printf 'PNEUMA_GATE_RESULT repo=x exit=0 elapsed=1s host=h\n' > "$work/h-target"; ln -sfn "$work/h-target" "$hr/h-link"
+hx() { bash -c 'source "$1"; job_exit "$2"' _ "$RUNNER" "$1"; }
+expect_eq "result (h): a well-formed root-owned result is read (exit 0)" 0 "$(hx h-ok)"
+expect_eq "result (h): a MISSING result file is 75, never green" 75 "$(hx h-missing)"
+expect_eq "result (h): a result file with no verdict line is 75" 75 "$(hx h-garbage)"
+expect_eq "result (h): an empty result file is 75" 75 "$(hx h-empty)"
+expect_eq "result (h): a non-numeric exit is 75" 75 "$(hx h-badexit)"
+expect_eq "result (h): an empty exit is 75" 75 "$(hx h-emptyexit)"
+expect_eq "result (h): a negative exit is 75" 75 "$(hx h-negative)"
+expect_eq "result (h): a symlinked result (its target says exit=0) is 75" 75 "$(hx h-link)"
+# the attached submission inherits the refusal: its job's result is malformed, so it exits 75 and says so
+sleep 60 & rh_pid=$!
+rh_start="$(bash -c 'source "$1"; proc_start "$2"' _ "$RUNNER" "$rh_pid")"
+rh_key="$(jk fakerepo "$head" "$tree" test-lane-rh fake "$base" "" "")"
+rm -rf "$PNEUMA_GATE_DEDUP_DIR" "$PNEUMA_GATE_BASE/jobs"; mkdir -p "$PNEUMA_GATE_DEDUP_DIR" "$PNEUMA_GATE_BASE/jobs/job-rh"
+printf 'key=fakerepo/main\nhead=%s\npid=%s\npstart=%s\nsubmitter=test-lane-rh\nunit=pneuma-gate-job-rh.service\nnonce=nonce-rh\njobkey=%s\nsuperseded=\n' \
+  "$head" "$rh_pid" "$rh_start" "$rh_key" > "$PNEUMA_GATE_DEDUP_DIR/job-rh"
+printf 'running\n' > "$PNEUMA_GATE_BASE/jobs/job-rh/log"
+printf 'PNEUMA_GATE_RESULT repo=fakerepo head=%s exit=zz elapsed=1s host=h\n' "$head" > "$hr/job-rh"
+"$RUNNER" run --submitter test-lane-rh --profile fake --repo fakerepo --head "$head" --base "$base" --tree "$tree" > "$work/rh.out" 2>&1 &
+rhr=$!
+for _ in $(seq 1 20); do grep -q 'attached to live job' "$work/rh.out" 2>/dev/null && break; sleep 1; done
+kill "$rh_pid" 2>/dev/null; wait "$rh_pid" 2>/dev/null || true
+rh_rc=0; wait "$rhr" || rh_rc=$?
+expect_eq "result (h): an attach onto a job whose result is malformed exits 75" 75 "$rh_rc"
+rm -f "$hr/job-rh"
+
 exit "$fail"
