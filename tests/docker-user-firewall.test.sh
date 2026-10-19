@@ -205,11 +205,50 @@ reset; "$SCRIPT" --apply >/dev/null 2>&1; rm="$("$SCRIPT" --remove 2>&1)"; rc=$?
 [[ $rc -ne 0 ]] && ok "remove that could not delete exits non-zero" || bad "remove lied"
 o="$(FAKE_NO_READ=1 "$SCRIPT" --remove 2>&1)"; has "$o" 'NOTHING removed' && ok "remove without access says nothing was removed" || bad "remove claims success without access"
 
-# ---- unit files: boot before docker, re-apply after every docker start, periodic reconcile
+# ---- boot path: pre-docker must never run the Docker CLI (docker.sock is socket-activated by
+# docker.service, which is queued behind this unit, so a Docker call here blocks forever).
+# Hang stub: every invocation is logged, then it blocks. A pre-docker path that calls docker never
+# returns, so the outer `timeout` kills the script (rc 124) and the check fails.
+# Negative control (read, not run as a hang): remove the PRE_DOCKER test in docker_cli_usable, and the
+# stub is invoked from docker_bridge_names/warn_unfilterable_networks, so the "no docker call" check fails.
+mkdir -p "$W/hang"; printf '#!/bin/bash\necho "docker-hang $*" >> "$FAKE_LOG"\nexec sleep 60\n' > "$W/hang/docker"; chmod +x "$W/hang/docker"
+no_docker() { ! grep -q '^docker' "$W/log"; }
+reset; setrole dev-box; printf '0.0.0.0:3000->3000/tcp, [::]:3000->3000/tcp\n' > "$W/dockerps"
+t0=$SECONDS; PATH="$W/hang:$PATH" timeout -k 2 20 "$SCRIPT" --apply --pre-docker >/dev/null 2>&1; rc=$?; el=$((SECONDS-t0))
+[[ $rc -eq 0 && $el -lt 5 ]] && no_docker && ok "pre-docker (IPv6 tools present): no Docker call, fast" || bad "pre-docker: rc=$rc ${el}s or Docker called"
+reset; setrole dev-box
+PATH="$W/hang:$PATH" DOCKER_FW_IP6TABLES=/nonexistent/ip6tables DOCKER_FW_IP6TABLES_RESTORE=/nonexistent/r6 \
+    timeout -k 2 20 "$SCRIPT" --apply --pre-docker >/dev/null 2>"$W/err"; rc=$?
+[[ $rc -ne 0 ]] && no_docker && has "$(cat "$W/err")" "REFUSING" && ok "pre-docker, missing ip6tables: refuses startup, no Docker call" || bad "pre-docker accepted missing IPv6 tools"
+reset; setrole 'bogus;'
+PATH="$W/hang:$PATH" timeout -k 2 20 "$SCRIPT" --apply --pre-docker >/dev/null 2>&1; rc=$?
+[[ $rc -ne 0 ]] && is_baseline "$W/iptables.rules" && is_baseline "$W/ip6tables.rules" && no_docker \
+    && ok "pre-docker, plan failure: baseline (no widened trust, no Docker call), non-zero" || bad "pre-docker baseline path touched Docker or was not baseline"
+reset; setrole dev-box
+PATH="$W/hang:$PATH" FAKE_RESTORE_FAIL_ONCE=iptables timeout -k 2 20 "$SCRIPT" --apply --pre-docker >/dev/null 2>&1; rc=$?
+[[ $rc -ne 0 ]] && is_baseline "$W/iptables.rules" && no_docker && ok "pre-docker, fresh-table restore failure: baseline fallback, no Docker call" || bad "pre-docker fallback touched Docker"
+
+# ---- normal mode with a hanging daemon: every Docker query is bounded (10 s budget per run), the
+# timed-out queries take the safe fallbacks, and the installed rules equal those of a healthy run.
+# Negative control (read, not run): call `docker` directly instead of docker_bounded and the run blocks
+# for the stub's 60 s, so the 40 s outer timeout fails the check.
+reset; setrole dev-box; "$SCRIPT" --apply >/dev/null 2>&1; cp "$W/iptables.chain" "$W/ref.v4"; cp "$W/ip6tables.chain" "$W/ref.v6"
+reset; setrole dev-box; t0=$SECONDS
+PATH="$W/hang:$PATH" timeout -k 2 40 "$SCRIPT" --apply >/dev/null 2>&1; rc=$?; el=$((SECONDS-t0))
+[[ $rc -eq 0 && $el -le 15 ]] && grep -q '^docker-hang network ls' "$W/log" && cmp -s "$W/iptables.chain" "$W/ref.v4" && cmp -s "$W/ip6tables.chain" "$W/ref.v6" \
+    && ok "normal apply, hung docker: returns in ${el}s (bounded), same rules as a healthy run" || bad "normal apply with hung docker: rc=$rc ${el}s"
+
+# ---- unit files: the pre-policy gates every docker start; a failed post-start apply is visible
 S="$ROOT/systemd"
 grep -q '^Before=docker.service' "$S/docker-user-firewall.service" && grep -q 'WantedBy=.*docker.service' "$S/docker-user-firewall.service" \
     && ok "unit runs Before=docker.service" || bad "boot ordering"
-grep -q '^ExecStartPost=-.*docker-user-firewall.sh --apply' "$S/docker.service.d/10-pneuma-docker-fw.conf" && ok "docker drop-in re-applies after every start (incl. crash restarts)" || bad "no re-apply hook"
+D="$S/docker.service.d/10-pneuma-docker-fw.conf"
+grep -qx 'ExecStartPre=/usr/local/lib/pneuma-docker-fw/docker-user-firewall.sh --apply --pre-docker' "$D" \
+    && grep -qx 'Requires=docker-user-firewall.service' "$D" && grep -qx 'After=docker-user-firewall.service' "$D" \
+    && ok "docker start requires a successful pre-policy (ExecStartPre, no '-'; Requires=)" || bad "docker start not gated by the pre-policy"
+grep -qE '^ExecStart(Pre|Post)=-' "$D" && bad "drop-in ignores a failure ('-' prefix)" || ok "no failure-ignoring '-' prefix in the drop-in"
+grep -qx 'ExecStartPost=/usr/local/lib/pneuma-docker-fw/docker-user-firewall.sh --apply' "$D" && ok "post-start apply re-runs on every start, failure visible" || bad "post-start apply missing or ignored"
+command -v systemd-analyze >/dev/null && { systemd-analyze verify "$S/docker-user-firewall.service" >"$W/va" 2>&1; ! grep -qi 'unknown\|invalid\|error' "$W/va" && ok "systemd-analyze verify: firewall unit parses"; } || true
 grep -q 'reconcile' "$S/docker-user-firewall-reconcile.service" && grep -q 'OnUnitActiveSec=1min' "$S/docker-user-firewall-reconcile.timer" && ok "reconcile timer present" || bad "no reconcile timer"
 bash -n "$SCRIPT" && ok "script parses" || bad "syntax"
 
