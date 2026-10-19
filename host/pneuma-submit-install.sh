@@ -14,7 +14,7 @@
 #      There is no path that leaves an old or partial config live without saying so.
 #
 # Scope: the sshd drop-in ends with `Match all`, so the override cannot reach any other user; the sudoers
-# rule names exactly the three verbs of the runner. Temp files are mktemp names inside the root-owned
+# rule names exactly the four verbs of the runner (status, have, run, cancel). Temp files are mktemp names inside the root-owned
 # staging dir or beside their target (dot-prefixed, so sudo and sshd ignore them if left behind).
 set -euo pipefail
 
@@ -28,20 +28,30 @@ RUNNER=/usr/local/bin/pneuma-gate-runner
 
 die() { echo "refused: $*" >&2; exit 1; }
 
-# The ONE sudo rule: the entry may run exactly the three verbs of the runner, nothing else. Rendered here
+# The ONE sudo rule: the entry may run exactly the four verbs of the runner (status, have, run, cancel), nothing else. Rendered here
 # and only here; tests/gate-real-sudo.check.sh reads it back through --render-sudoers (no copy elsewhere).
 render_sudoers() {
-  printf 'Defaults!%s env_reset\npneuma-submit ALL=(root) NOPASSWD: %s status *, %s have *, %s run *\n' \
-    "$RUNNER" "$RUNNER" "$RUNNER" "$RUNNER" > "$1"
+  printf 'Defaults!%s env_reset\npneuma-submit ALL=(root) NOPASSWD: %s status *, %s have *, %s run *, %s cancel *\n' \
+    "$RUNNER" "$RUNNER" "$RUNNER" "$RUNNER" "$RUNNER" > "$1"
 }
 
 # A from-address must be one IPv4/IPv6 address or CIDR from a strict allowlist. Anything else (a quote, a comma,
 # a space, a newline, a hostname) could change the key options, so it is refused, never escaped.
+# A prefix shorter than /16 (IPv4) or /32 (IPv6) is refused: that admits most of the internet, including
+# 0.0.0.0/0 and ::/0. A single address (no prefix) is always fine.
 valid_addr() {
-  local a="$1" oct='(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])' v4 v6
+  local a="$1" oct='(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])' v4 v6 prefix
   v4="^$oct\.$oct\.$oct\.$oct(/(3[0-2]|[12]?[0-9]))?$"
   v6='^[0-9A-Fa-f]{0,4}(:[0-9A-Fa-f]{0,4}){2,7}(/(12[0-8]|1[01][0-9]|[1-9]?[0-9]))?$'
-  [[ "$a" =~ $v4 || "$a" =~ $v6 ]]
+  if [[ "$a" =~ $v4 ]]; then
+    prefix="${a#*/}"; [ "$prefix" = "$a" ] && return 0
+    [ "$prefix" -ge 16 ]
+  elif [[ "$a" =~ $v6 ]]; then
+    prefix="${a#*/}"; [ "$prefix" = "$a" ] && return 0
+    [ "$prefix" -ge 32 ]
+  else
+    return 1
+  fi
 }
 
 # --render-sudoers OUT: write the candidate rule and exit. Touches nothing live; needs no staging dir.
@@ -63,7 +73,10 @@ done
 bash -n "$STAGE/pneuma-gate-entry" || die "staged entry does not parse"
 
 WORK="$(mktemp -d "$STAGE/work.XXXXXX")"
-trap 'rm -rf -- "$WORK"' EXIT
+KEEP_WORK=0
+RESCUE_ROOT=/var/lib/pneuma-gate-install-rescue
+RESCUE_DIR=""
+trap '[ "$KEEP_WORK" = 1 ] || rm -rf -- "$WORK"' EXIT
 SAVED="$WORK/saved"
 mkdir "$SAVED"
 
@@ -116,13 +129,14 @@ save() {
   if [ -e "$dest" ]; then cp -p -- "$dest" "$SAVED/$name"; : > "$SAVED/$name.exists"; fi
 }
 # Put a saved copy back (or remove the file if it did not exist before). Atomic where it writes.
+# Returns non-zero when the restore itself fails: the caller then keeps the saved copies.
 restore() {
   local dest="$1" name="$2" tmp
   if [ -e "$SAVED/$name.exists" ]; then
     tmp="$(mktemp "$(dirname "$dest")/.restore.XXXXXX")" || return 1
     cp -p -- "$SAVED/$name" "$tmp" && mv -f -- "$tmp" "$dest" || { rm -f -- "$tmp"; return 1; }
   else
-    rm -f -- "$dest"
+    rm -f -- "$dest" || return 1
   fi
 }
 # Write a candidate to its live path via a same-directory temp file and rename (never a partial file).
@@ -133,14 +147,45 @@ install_atomic() {
 }
 
 rollback() {
+  local failed=0
   echo "pneuma-submit-install: FAILED: $1; restoring the previous state" >&2
-  restore "$ENTRY" entry || echo "pneuma-submit-install: could not restore $ENTRY" >&2
-  restore "$KEYS" keys || echo "pneuma-submit-install: could not restore $KEYS" >&2
-  restore "$DROPIN" dropin || echo "pneuma-submit-install: could not restore $DROPIN" >&2
-  restore "$SUDOERS" sudoers || echo "pneuma-submit-install: could not restore $SUDOERS" >&2
+  restore "$ENTRY" entry || { failed=1; echo "pneuma-submit-install: RESTORE FAILED for $ENTRY" >&2; }
+  restore "$KEYS" keys || { failed=1; echo "pneuma-submit-install: RESTORE FAILED for $KEYS" >&2; }
+  restore "$DROPIN" dropin || { failed=1; echo "pneuma-submit-install: RESTORE FAILED for $DROPIN" >&2; }
+  restore "$SUDOERS" sudoers || { failed=1; echo "pneuma-submit-install: RESTORE FAILED for $SUDOERS" >&2; }
+  if [ "$failed" = 1 ]; then
+    # The saved copies are the only good record of the previous state. They move OUT of the staging dir (the
+    # caller removes that on exit) into a root-only rescue dir that survives the run. The rescue root sits
+    # outside the pneuma-gate user's tree, so that account cannot rename or remove it.
+    if persist_rescue; then
+      echo "pneuma-submit-install: the previous state is NOT fully restored. Saved copies kept at $RESCUE_DIR - restore them by hand before anything else" >&2
+    else
+      echo "pneuma-submit-install: the previous state is NOT fully restored AND the saved copies could not be persisted; they are being discarded with the staging dir. Restore by hand from the live files." >&2
+    fi
+  else
+    echo "pneuma-submit-install: previous state restored" >&2
+  fi
   exit 1
 }
 
+# Copy the saved copies to RESCUE_ROOT/<utc-timestamp>.XXXXXX (root 0700). Sets RESCUE_DIR and returns non-zero
+# if the copy fails. On success the staging copies are dropped, so only the rescue copy remains.
+persist_rescue() {
+  local ts
+  install -d -o root -g root -m 0700 "$RESCUE_ROOT" || return 1
+  ts="$(date -u +%Y%m%dT%H%M%SZ)"
+  RESCUE_DIR="$(mktemp -d "$RESCUE_ROOT/$ts.XXXXXX")" || return 1
+  cp -a -- "$SAVED"/. "$RESCUE_DIR"/ || return 1
+  # cp -a carries the saved directory's own mode onto the rescue dir: re-apply the root-only mode afterwards
+  chown root:root "$RESCUE_DIR" && chmod 0700 "$RESCUE_DIR" || return 1
+  KEEP_WORK=0
+  return 0
+}
+
+# The submitter account: a system account with a home, created once. It is never removed by this script, and it
+# has no password: the only way in is the forced-command key. Without it the entry cannot be reached at all.
+id pneuma-submit >/dev/null 2>&1 || useradd --system --create-home --home-dir /var/lib/pneuma-submit --shell /bin/bash pneuma-submit \
+  || die "cannot create the pneuma-submit account"
 install -d -o root -g root -m 0755 "$KEYS_DIR" || die "cannot create $KEYS_DIR"
 save "$ENTRY" entry
 save "$KEYS" keys

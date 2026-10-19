@@ -18,7 +18,7 @@
 # can read or write another's files, processes or sockets.
 set -euo pipefail
 STAGE="${1:?usage: ci-builder-gate-host.sh STAGE}"
-case "$STAGE" in /var/lib/pneuma-gate-install/stage.??????) ;; *) echo "refusing: bad stage $STAGE" >&2; exit 1;; esac
+[[ "$STAGE" =~ ^/var/lib/pneuma-gate-install/stage\.[A-Za-z0-9]{6}$ ]] || { echo "refusing: bad stage $STAGE" >&2; exit 1; }
 # [host-only-begin]
 id pneuma-gate >/dev/null 2>&1 || useradd --system --home-dir /var/lib/pneuma-gate --shell /usr/sbin/nologin pneuma-gate
 install -d -o root -g root -m 0755 /var/lib/pneuma-gate /var/lib/pneuma-gate/envs /var/lib/pneuma-gate/wheels /var/lib/pneuma-gate/queue
@@ -29,10 +29,39 @@ install -d -o root -g root -m 0700 /var/lib/pneuma-gate-state /var/lib/pneuma-ga
 chown -R root:root "$STAGE/profiles"
 find "$STAGE/profiles" -type d -exec chmod 0755 {} +
 find "$STAGE/profiles" -type f -exec chmod 0644 {} +
-install -d -o root -g root -m 0755 /usr/local/lib/pneuma-gate /usr/local/lib/pneuma-gate/profiles
-cp -a "$STAGE/profiles/." /usr/local/lib/pneuma-gate/profiles/
-find /usr/local/lib/pneuma-gate/profiles -mindepth 1 -maxdepth 1 -type f -name '*.sh' | while read -r f; do
-  [ -e "$STAGE/profiles/$(basename "$f")" ] || rm -f -- "$f"   # a profile that is no longer shipped
+# Profiles: one versioned directory per install under profiles.d/, and a live SYMLINK at profiles that is moved
+# by a single rename(2). The new tree is complete before the link moves, so the live path is never absent or
+# partial; a failed swap leaves the previous link live and says so. The runner reads through the link.
+ROOT=/usr/local/lib/pneuma-gate
+PROFILES="$ROOT/profiles"
+install -d -o root -g root -m 0755 "$ROOT" "$ROOT/profiles.d"
+if [ -d "$PROFILES" ] && [ ! -L "$PROFILES" ]; then
+  # one-time migration from the old real directory: kept as profiles.d/legacy, not deleted
+  mv -T -- "$PROFILES" "$ROOT/profiles.d/legacy"
+fi
+prev="$(readlink "$PROFILES" 2>/dev/null || true)"
+ver="$(mktemp -d "$ROOT/profiles.d/v.XXXXXX")"
+if ! rsync -a "$STAGE/profiles/" "$ver/"; then
+  rm -rf -- "$ver"
+  echo "refused: profiles copy failed; the live profiles are unchanged" >&2
+  exit 1
+fi
+new_link="$(mktemp -u "$ROOT/.profiles-link.XXXXXX")"
+ln -s -- "profiles.d/$(basename "$ver")" "$new_link"
+if ! mv -T -- "$new_link" "$PROFILES"; then
+  rm -f -- "$new_link"
+  rm -rf -- "$ver"
+  echo "refused: profiles swap failed; the previous profiles remain live (no change)" >&2
+  exit 1
+fi
+# keep the new version and the one before it (a hand rollback target); prune the rest, never legacy
+keep_new="$(basename "$ver")"
+keep_prev="$(basename "${prev:-none}")"
+for d in "$ROOT"/profiles.d/*; do
+  case "$(basename "$d")" in
+    "$keep_new"|"$keep_prev"|legacy) continue;;
+  esac
+  rm -rf -- "$d"
 done
 # The runner: atomic replace, mktemp beside the target.
 runner_tmp="$(mktemp /usr/local/bin/.pneuma-gate-runner.XXXXXX)"

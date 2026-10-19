@@ -109,11 +109,14 @@ grep -q '^from="10.0.0.7",restrict,command="/usr/local/bin/pneuma-gate-entry --s
 [ "$(stat -c '%U:%G:%a' "$KEYS")" = root:root:644 ] && pass "S1 keys file root-owned, outside the home" || bad "S1 keys mode/owner"
 grep -q '^Match all$' "$DROPIN" && grep -q '^Match User pneuma-submit$' "$DROPIN" \
   && pass "S1 drop-in closes its Match block (Match all)" || bad "S1 drop-in scope"
-sshd -T -C user=pneuma-submit,host=localhost,addr=127.0.0.1 2>/dev/null | grep -qx "authorizedkeysfile /etc/ssh/authorized_keys/%u" \
+eff_pn="$(sshd -T -C user=pneuma-submit,host=localhost,addr=127.0.0.1 2>/dev/null)"
+grep -qx "authorizedkeysfile /etc/ssh/authorized_keys/%u" <<<"$eff_pn" \
   && pass "S1 sshd gives pneuma-submit the submitter keys file" || bad "S1 sshd override missing for pneuma-submit"
-sshd -T -C user=root,host=localhost,addr=127.0.0.1 2>/dev/null | grep -q "^authorizedkeysfile /etc/ssh/authorized_keys/" \
+eff_root="$(sshd -T -C user=root,host=localhost,addr=127.0.0.1 2>/dev/null)"
+grep -q "^authorizedkeysfile /etc/ssh/authorized_keys/" <<<"$eff_root" \
   && bad "S1 override LEAKS to user root" || pass "S1 override does not reach user root (scope)"
-sshd -T -C user=dean-test,host=localhost,addr=127.0.0.1 2>/dev/null | grep -q "^authorizedkeysfile /etc/ssh/authorized_keys/" \
+eff_dt="$(sshd -T -C user=dean-test,host=localhost,addr=127.0.0.1 2>/dev/null)"
+grep -q "^authorizedkeysfile /etc/ssh/authorized_keys/" <<<"$eff_dt" \
   && bad "S1 override LEAKS to dean-test" || pass "S1 override does not reach other users (scope)"
 [ -z "$(ls -A "$s" | grep '^work\.')" ] && pass "S1 work dir removed on success" || bad "S1 work dir left behind"
 rm -rf "$s"
@@ -186,14 +189,14 @@ s13() { printf 'dean-devbox %s\n' "$KEY1" > "$1/gate-submit-keys"; }
 refuse_case "S13 key line without a from-name (from= mandatory)" s13
 
 # S14: the from.conf value must be an address/CIDR from the allowlist: a quote, comma, space or hostname is refused
-for bad in 'submit-test "10.0.0.1"' 'submit-test 10.0.0.1,10.0.0.2' 'submit-test 10.0.0.1 extra' 'submit-test host.example' 'submit-test 10.0.0.256' 'submit-test 10.0.0.1/33'; do
+for bad in 'submit-test "10.0.0.1"' 'submit-test 10.0.0.1,10.0.0.2' 'submit-test 10.0.0.1 extra' 'submit-test host.example' 'submit-test 10.0.0.256' 'submit-test 10.0.0.1/33' 'submit-test 0.0.0.0/0' 'submit-test ::/0' 'submit-test 10.0.0.0/8' 'submit-test 2001:db8::/31'; do
   printf '%s\n' "$bad" > /etc/pneuma-gate/from.conf; chmod 0600 /etc/pneuma-gate/from.conf
   s14() { printf 'ci-lane %s submit-test\n' "$KEY2" > "$1/gate-submit-keys"; }
   refuse_case "S14 from.conf value refused: $(printf '%s' "$bad" | tr -c '[:print:]' '?')" s14
 done
 
 # S15: IPv6 and CIDR addresses are accepted (installs, rc 0, and the rendered key line carries them)
-for good in '2001:db8::1' '10.0.0.0/8' '2001:db8::/32'; do
+for good in '2001:db8::1' '10.1.0.0/16' '2001:db8::/32'; do
   printf 'submit-test %s\n' "$good" > /etc/pneuma-gate/from.conf; chmod 0600 /etc/pneuma-gate/from.conf
   seed_old; s="$(new_stage)"; printf 'ci-lane %s submit-test\n' "$KEY2" > "$s/gate-submit-keys"
   run_install "$s"; rc=$?
@@ -202,6 +205,36 @@ for good in '2001:db8::1' '10.0.0.0/8' '2001:db8::/32'; do
   rm -rf "$s"
 done
 printf 'submit-test 10.0.0.7\n' > /etc/pneuma-gate/from.conf; chmod 0600 /etc/pneuma-gate/from.conf
+
+# S16: a restore that itself fails keeps the saved copies (the only record of the previous state), says where
+# they are, and fails loudly. A mv shim fails every rename onto the keys file: the forward install fails, and so
+# does the restore of the keys file.
+mkdir -p /shim/mv-fail-keys
+cat > /shim/mv-fail-keys/mv <<'S'
+#!/usr/bin/env bash
+for a; do last="$a"; done
+[ "$last" = /etc/ssh/authorized_keys/pneuma-submit ] && exit 1
+exec /bin/mv "$@"
+S
+chmod +x /shim/mv-fail-keys/mv
+seed_old; s="$(new_stage)"; keys_ok "$s"
+run_install "$s" /shim/mv-fail-keys; rc=$?
+kept="$(sed -n 's/.*Saved copies kept at \([^ ]*\).*/\1/p' "$LOG" | head -1)"
+if [ "$rc" != 0 ] && grep -q 'RESTORE FAILED for /etc/ssh/authorized_keys/pneuma-submit' "$LOG" \
+   && grep -q 'NOT fully restored' "$LOG" && [ -n "$kept" ] && [ -d "$kept" ] && [ "$(cat "$kept/keys" 2>/dev/null)" = OLD-KEYS ] \
+   && [ "$(stat -c '%U:%a' "$kept")" = root:700 ]; then
+  pass "S16 a failed restore persists the saved copies in the root-only rescue dir ($kept), says so loudly, rc $rc"
+else bad "S16 rc=$rc kept='$kept' ls=$(ls -la "$kept" 2>&1 | tr '\n' ' ') keys=$(cat "$kept/keys" 2>&1) mode=$(stat -c '%U:%a' "$kept" 2>&1) log: $(tail -3 "$LOG")"; fi
+rm -rf "$s" /var/lib/pneuma-gate-install-rescue
+
+# S17: the submit account is created by the installer when it is missing (the entry cannot be reached without it)
+userdel -r pneuma-submit >/dev/null 2>&1 || true
+seed_old; s="$(new_stage)"; printf 'dean-devbox %s submit-test\n' "$KEY1" > "$s/gate-submit-keys"
+run_install "$s"; rc=$?
+if [ "$rc" = 0 ] && id pneuma-submit >/dev/null 2>&1 && [ "$(getent passwd pneuma-submit | cut -d: -f7)" = /bin/bash ]; then
+  pass "S17 the installer creates the missing pneuma-submit account (rc 0)"
+else bad "S17 rc=$rc account: $(id pneuma-submit 2>&1) log: $(tail -2 "$LOG")"; fi
+rm -rf "$s"
 
 # ------------------------------------------------------------------ report
 if [ "$fails" = 0 ]; then echo "submit-install: all scenarios passed"; exit 0; fi
