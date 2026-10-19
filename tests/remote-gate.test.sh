@@ -1694,4 +1694,31 @@ iso_ok() {
 }
 check "fetch isolation (g): a repo-scoped keep fetch leaves another repo's keep ref untouched and writes its own" iso_ok
 
+
+# ════ VM17 third pass (e-g, warm audit): dedup, promotion, fetch isolation, warm marker ════
+# warm-env audit: warm-env participates in STATE only (no dedup, no queue ticket, no capacity). Its marker names the
+# warm-env process that holds it, by pid AND start time. The marker is written inside warm_unit's $(...) capture, where
+# $$ still names that holder (BASHPID would name the short-lived capture subshell), and a warm marker holds no gate capacity.
+cat > "$work/bin/peek-run" <<'STUB'
+#!/usr/bin/env bash
+# a systemd-run stand-in that copies the state marker as it stands while its unit "runs", then reports success
+cp -- "$PEEK_SRC" "$PEEK_DST" 2>/dev/null; exit 0
+STUB
+chmod +x "$work/bin/peek-run"
+rm -rf "$PNEUMA_GATE_STATE_DIR/runs"; mkdir -p "$PNEUMA_GATE_STATE_DIR/runs"
+wa_out="$(PNEUMA_GATE_SYSTEMD_RUN="$work/bin/peek-run" PEEK_SRC="$PNEUMA_GATE_STATE_DIR/runs/wtest-key" PEEK_DST="$work/peek-marker" \
+  STORE="$PNEUMA_GATE_BASE/repos/fakerepo.git" HEADREF="$head" RUNNER="$RUNNER" bash -c '
+    source "$RUNNER"; holder=$$
+    cap="$(warm_unit wtest-key "$STORE" fake "$HEADREF" 1 256 key "" 2>/dev/null)"
+    echo "holder=$holder"; echo "hstart=$(proc_start $$)"' 2>/dev/null)"
+wa_pid="$(sed -n 's/^pid=//p' "$work/peek-marker" 2>/dev/null | head -1)"
+wa_start="$(sed -n 's/^pstart=//p' "$work/peek-marker" 2>/dev/null | head -1)"
+wa_state="$(sed -n 's/^state=//p' "$work/peek-marker" 2>/dev/null | head -1)"
+expect_eq "warm-env audit: the warm marker names the warm-env process that holds it (pid)" \
+  "$(sed -n 's/^holder=//p' <<<"$wa_out")" "$wa_pid"
+expect_eq "warm-env audit: ...with that process's start time (pid + pstart identity)" \
+  "$(sed -n 's/^hstart=//p' <<<"$wa_out")" "$wa_start"
+expect_eq "warm-env audit: the marker is state=warm (holds no gate capacity)" warm "$wa_state"
+rm -rf "$PNEUMA_GATE_STATE_DIR/runs"; mkdir -p "$PNEUMA_GATE_STATE_DIR/runs"
+
 exit "$fail"
