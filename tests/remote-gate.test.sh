@@ -1592,4 +1592,24 @@ rh_rc=0; wait "$rhr" || rh_rc=$?
 expect_eq "result (h): an attach onto a job whose result is malformed exits 75" 75 "$rh_rc"
 rm -f "$hr/job-rh"
 
+
+# ════ VM17 third pass (h): a result that cannot be read is a refusal ════
+# (c) cancellation is guarded by identity: the owner's cancel stops a unit only when that unit carries the record's own
+# nonce. A unit under the same name that carries ANOTHER run's nonce (a recycled name) is not stopped, nor is a record
+# that has no nonce at all; the matching unit is stopped and nothing else is.
+rm -rf "$PNEUMA_GATE_DEDUP_DIR"; mkdir -p "$PNEUMA_GATE_DEDUP_DIR"; : > "$SYSTEMCTL_RECORD"
+printf 'key=repoA/main\nhead=%s\npid=%s\nsubmitter=test-lane-cx\nunit=pneuma-gate-job-cx.service\nnonce=n-mine\nsuperseded=\n' "$C2" "$$" > "$PNEUMA_GATE_DEDUP_DIR/job-cx"
+printf 'key=repoA/main\nhead=%s\npid=%s\nsubmitter=test-lane-cx\nunit=pneuma-gate-job-cy.service\nnonce=n-y\nsuperseded=\n' "$C2" "$$" > "$PNEUMA_GATE_DEDUP_DIR/job-cy"
+printf 'key=repoA/main\nhead=%s\npid=%s\nsubmitter=test-lane-cx\nunit=pneuma-gate-job-cz.service\nsuperseded=\n' "$C2" "$$" > "$PNEUMA_GATE_DEDUP_DIR/job-cz"
+printf 'pneuma-gate-job-cx.service n-other\npneuma-gate-job-cy.service n-y\npneuma-gate-job-cz.service n-z\n' > "$UNIT_NONCES"
+as_sub test-lane-cx --repo repoA --head "$C2" >/dev/null 2>&1
+check "cancel (c): a unit that carries ANOTHER run's nonce (recycled name) is NOT stopped for this record" \
+  bash -c '! grep -q "job-cx" "$1"' _ "$SYSTEMCTL_RECORD"
+check "cancel (c): a record with no nonce at all is NOT stopped (its unit cannot be verified)" \
+  bash -c '! grep -q "job-cz" "$1"' _ "$SYSTEMCTL_RECORD"
+check "cancel (c): the unit that carries the record's own nonce IS stopped" \
+  grep -qx "stop pneuma-gate-job-cy.service" "$SYSTEMCTL_RECORD"
+expect_eq "cancel (c): and it is the only unit stopped" 1 "$(wc -l < "$SYSTEMCTL_RECORD")"
+: > "$UNIT_NONCES"; : > "$SYSTEMCTL_RECORD"
+
 exit "$fail"
