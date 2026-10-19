@@ -1109,6 +1109,10 @@ warm_unit() {   # <id> <store> <profile> <ref> <cores> <mem> <key|build> <slot b
   local id="$1" store="$2" profile="$3" ref="$4" cores="$5" mem="$6" mode="$7" slot="$8" binds=() lo
   lo="$(loopback_claim "$id")" || return 75
   local nonce; nonce="$(new_nonce)"
+  # Identity audit (VM17 third pass): this warm marker is STATE only. It takes no dedup record, no queue ticket and no
+  # capacity (live_runs skips state=warm), so the worker-pid rule of the gate path does not apply. Its pid is the
+  # warm-env process that holds it: $$ inside warm_unit's $(...) capture still names that process, and state_mark records
+  # its start time beside it. BASHPID would name the short-lived capture subshell, which is the wrong holder.
   state_mark "$id" "$$" 0 0 warm "$lo" "$nonce" || { loopback_down "$lo"; return 75; }
   unit_props "$lo" || { loopback_down "$lo"; state_remove "$id"; return 75; }
   [ -n "$slot" ] && binds=(--property=BindPaths="$slot" --property=ExecStartPre="+$(command -v chown) --reference=$RUN_ROOT/$id ${slot#*:}")
