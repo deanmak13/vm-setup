@@ -1612,4 +1612,29 @@ check "cancel (c): the unit that carries the record's own nonce IS stopped" \
 expect_eq "cancel (c): and it is the only unit stopped" 1 "$(wc -l < "$SYSTEMCTL_RECORD")"
 : > "$UNIT_NONCES"; : > "$SYSTEMCTL_RECORD"
 
+
+# ════ VM17 third pass (h): a result that cannot be read is a refusal ════
+# (d) a recycled pid or unit is not the run it was. A record whose pid is alive but whose start time differs is DEAD,
+# and superseding it signals nothing; a record whose liveness cannot be read is UNKNOWN and stays OCCUPIED.
+sleep 60 & rd_pid=$!
+rd_start="$(bash -c 'source "$1"; proc_start "$2"' _ "$RUNNER" "$rd_pid")"
+rm -rf "$PNEUMA_GATE_DEDUP_DIR"; mkdir -p "$PNEUMA_GATE_DEDUP_DIR"; : > "$SYSTEMCTL_RECORD"; : > "$SYSTEMCTL_ACTIVE"
+printf 'key=repoA/main\nhead=%s\npid=%s\npstart=1\nsubmitter=test-lane-rd\nunit=pneuma-gate-rd1.service\nnonce=n-rd\nsuperseded=\n' \
+  "$C1" "$rd_pid" > "$PNEUMA_GATE_DEDUP_DIR/rd1"
+printf 'key=\nhead=%s\npid=nonsense\npstart=1\nsubmitter=test-lane-rd\nunit=pneuma-gate-ru1.service\nnonce=n-ru\nsuperseded=\n' \
+  "$C1" > "$PNEUMA_GATE_DEDUP_DIR/ru1"
+check "recycled (d): a live pid with ANOTHER start time is dead (not the run it names)" \
+  bash -c 'test "$(source "$1"; proc_state "$2" 1)" = dead' _ "$RUNNER" "$rd_pid"
+expect_eq "recycled (d): its record is dead, so it holds nothing" dead "$(bash -c 'source "$1"; dedup_state rd1' _ "$RUNNER")"
+expect_eq "unknown (d): a record whose pid cannot be read is UNKNOWN, not dead" unknown "$(bash -c 'source "$1"; dedup_state ru1' _ "$RUNNER")"
+expect_eq "unknown (d): unknown counts toward its submitter's cap; the dead recycled record does not (count 1)" 1 \
+  "$(bash -c 'source "$1"; dedup_count_submitter test-lane-rd' _ "$RUNNER")"
+ddo dedup_admit rd-new "$dstore" repoA main "$C3" test-lane-rd >/dev/null 2>&1
+check "recycled (d): superseding past the dead recycled record signals nothing (its process is alive, no unit stopped)" \
+  bash -c 'kill -0 "$1" 2>/dev/null && ! grep -q stop "$2"' _ "$rd_pid" "$SYSTEMCTL_RECORD"
+check "unknown (d): ...and the unknown record is neither deleted nor superseded" \
+  bash -c 'test -f "$1/ru1" && grep -qx "superseded=" "$1/ru1"' _ "$PNEUMA_GATE_DEDUP_DIR"
+kill "$rd_pid" 2>/dev/null; wait "$rd_pid" 2>/dev/null || true
+rm -rf "$PNEUMA_GATE_DEDUP_DIR"; mkdir -p "$PNEUMA_GATE_DEDUP_DIR"
+
 exit "$fail"
