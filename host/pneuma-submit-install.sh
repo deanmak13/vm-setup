@@ -25,6 +25,7 @@ KEYS="$KEYS_DIR/pneuma-submit"
 DROPIN=/etc/ssh/sshd_config.d/50-pneuma-submit.conf
 SUDOERS=/etc/sudoers.d/pneuma-submit
 RUNNER=/usr/local/bin/pneuma-gate-runner
+SUBMIT_HOME=/var/lib/pneuma-submit   # the ONE canonical home of the submitter account (never taken from passwd)
 
 die() { echo "refused: $*" >&2; exit 1; }
 
@@ -70,14 +71,22 @@ STAGE="$1"
 for f in "$STAGE/pneuma-gate-entry" "$STAGE/gate-submit-keys"; do
   [ -f "$f" ] && [ ! -L "$f" ] || die "missing or non-regular staged file $f"
 done
-# An EXISTING submitter account must be the account this script would create: locked or with no password, its
-# only group its own, and its home where the script puts it. Anything else is refused before any live change.
+# An EXISTING submitter account must be the account this script would create: its home is exactly the canonical
+# home and is a real directory (never a symlink), locked or with no password, and its only group its own.
+# With no account yet, the canonical home path must be absent or a real directory (never a symlink, file or other
+# entry), so the account is never created onto an unrelated tree. Anything else is refused before any live change.
 if id pneuma-submit >/dev/null 2>&1; then
+  [ "$(getent passwd pneuma-submit | cut -d: -f6)" = "$SUBMIT_HOME" ] || die "pneuma-submit home is '$(getent passwd pneuma-submit | cut -d: -f6)', not $SUBMIT_HOME; refusing to use it"
+  [ -d "$SUBMIT_HOME" ] && [ ! -L "$SUBMIT_HOME" ] || die "existing pneuma-submit home $SUBMIT_HOME is not a real directory; refusing"
   [ "$(id -nG pneuma-submit)" = "pneuma-submit" ] || die "pneuma-submit has extra groups ($(id -nG pneuma-submit)); refusing to use it"
   case "$(passwd -S pneuma-submit 2>/dev/null | awk '{print $2}')" in
     L|NP) ;;
     *) die "pneuma-submit has a usable password; lock it (passwd -l pneuma-submit) before install" ;;
   esac
+else
+  if [ -e "$SUBMIT_HOME" ] || [ -L "$SUBMIT_HOME" ]; then
+    [ -d "$SUBMIT_HOME" ] && [ ! -L "$SUBMIT_HOME" ] || die "$SUBMIT_HOME exists and is not a real directory (symlink, file or other entry) before the account is created; refusing"
+  fi
 fi
 bash -n "$STAGE/pneuma-gate-entry" || die "staged entry does not parse"
 
@@ -193,12 +202,11 @@ persist_rescue() {
 
 # The submitter account: a system account with a home, created once. It is never removed by this script, and it
 # has no password: the only way in is the forced-command key. Without it the entry cannot be reached at all.
-id pneuma-submit >/dev/null 2>&1 || useradd --system --create-home --home-dir /var/lib/pneuma-submit --shell /bin/bash pneuma-submit \
+id pneuma-submit >/dev/null 2>&1 || useradd --system --create-home --home-dir "$SUBMIT_HOME" --shell /bin/bash pneuma-submit \
   || die "cannot create the pneuma-submit account"
 # The account's home is ROOT-owned: the submitter account cannot write its own files there (nothing it needs is written there).
-submit_home="$(getent passwd pneuma-submit | cut -d: -f6)"
-[ -n "$submit_home" ] && [ -d "$submit_home" ] || die "pneuma-submit has no home directory"
-chown root:root "$submit_home" && chmod 0755 "$submit_home" || die "cannot make the submitter home root-owned"
+# Preflight proved SUBMIT_HOME is a real directory (or was created here); nothing else is ever chowned.
+chown root:root "$SUBMIT_HOME" && chmod 0755 "$SUBMIT_HOME" || die "cannot make the submitter home root-owned"
 install -d -o root -g root -m 0755 "$KEYS_DIR" || die "cannot create $KEYS_DIR"
 save "$ENTRY" entry
 save "$KEYS" keys
