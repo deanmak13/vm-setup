@@ -111,5 +111,26 @@ if ! grep -n '/tmp/pneuma' "$REPO/ci-builder-gate.sh" "$REPO/host/pneuma-submit-
   pass "no predictable /tmp/pneuma names in the install scripts"
 else bad "predictable /tmp names: $(grep -n '/tmp/pneuma' "$REPO/ci-builder-gate.sh" "$REPO/host/pneuma-submit-install.sh")"; fi
 
+# 5. --local-host (no approved-host check) is for the acceptance test: it needs --acceptance and never runs on the approved builder
+: > "$LOG"
+env PATH="$work/shim:$PATH" LOG_FILE="$LOG" PNEUMA_GATE_CLIENT_DEST="$work/dest" bash "$REPO/ci-builder-gate.sh" --local-host >"$work/out" 2>&1; rc=$?
+if [ "$rc" = 2 ] && grep -q "acceptance test only" "$work/out" && [ ! -e "$work/stage-made" ]; then pass "--local-host alone is refused (exit 2): the acceptance flag is required"
+else bad "--local-host without --acceptance (rc $rc): $(cat "$work/out")"; fi
+env PATH="$work/shim:$PATH" LOG_FILE="$LOG" PNEUMA_GATE_CLIENT_DEST="$work/dest" PNEUMA_GATE_EXPECT_HOST="$(hostname)" bash "$REPO/ci-builder-gate.sh" --local-host --acceptance >"$work/out" 2>&1; rc=$?
+if [ "$rc" = 2 ] && grep -q "IS the approved builder" "$work/out"; then pass "--local-host --acceptance is refused on the approved builder itself"
+else bad "--local-host --acceptance on the approved host (rc $rc): $(cat "$work/out")"; fi
+env PATH="$work/shim:$PATH" LOG_FILE="$LOG" PNEUMA_GATE_CLIENT_DEST="$work/dest" bash "$REPO/ci-builder-gate.sh" --acceptance --host-only >"$work/out" 2>&1; rc=$?
+if [ "$rc" = 2 ]; then pass "--acceptance without --local-host is refused"
+else bad "--acceptance alone (rc $rc)"; fi
+# the mutant: with the check removed --local-host is no longer refused. The install itself is cut (exit 99) in the
+# mutant so this test can never provision the machine it runs on, even as root.
+sed -e 's/\[ "\$acceptance" = 1 \] || { echo "refusing: --local-host is for/true || { echo "refusing: --local-host is for/' \
+    -e 's/^    STAGE="\$(set -euo pipefail; install -d/    exit 99; STAGE="$(set -euo pipefail; install -d/' "$REPO/ci-builder-gate.sh" > "$work/mut-gate.sh"
+if cmp -s "$REPO/ci-builder-gate.sh" "$work/mut-gate.sh" || ! grep -q "exit 99" "$work/mut-gate.sh"; then bad "mutant did not change the installer (no-op probe)"; else
+  env PATH="$work/shim:$PATH" LOG_FILE="$LOG" PNEUMA_GATE_CLIENT_DEST="$work/dest" bash "$work/mut-gate.sh" --local-host >"$work/out" 2>&1; mrc=$?
+  if [ "$mrc" = 99 ]; then pass "MUTANT (acceptance check removed): --local-host runs on (exit 99, the cut install) instead of being refused (exit 2) -> the check goes RED"
+  else bad "mutant outcome rc $mrc: $(cat "$work/out")"; fi
+fi
+
 if [ "$fails" = 0 ]; then echo "ci-builder-gate: all checks passed"; exit 0; fi
 echo "ci-builder-gate: $fails check(s) FAILED"; exit 1

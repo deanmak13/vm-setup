@@ -5,38 +5,63 @@
 # box's pneuma-remote-gate. Repo-specific knowledge lives in gate-profiles/*.sh
 # (one file per repo; adding a repo is adding a profile, never editing this).
 #
-#   pneuma-gate-runner have   --repo R <sha>...     print the commits the host holds
-#   pneuma-gate-runner run    --profile P --repo R --head SHA --base SHA --tree T
-#                             [--bundle]            (bundle on stdin; log on stdout)
+#   pneuma-gate-runner have     --repo R <sha>...   print the commits the host holds
+#   pneuma-gate-runner run      --profile P --repo R --head SHA --base SHA --tree T
+#                               [--bundle]          (bundle on stdin; log on stdout)
 #   pneuma-gate-runner status                       capacity / disk / live runs
 #   pneuma-gate-runner cancel --repo R --head SHA   cancel THIS submitter's jobs for that repo and head
-#   pneuma-gate-runner janitor                      reap dead runs + stale keep-refs
+#   pneuma-gate-runner janitor                      queue, reservation, staging and job-log housekeeping
+#   pneuma-gate-runner warm-env --profile P --repo R --ref SHA
+#                               publish the dependency env for a TRUSTED ref (operator command)
+#   pneuma-gate-runner unit ... / promote ...       internal: run inside the sandboxed units
 #
 # Verdict contract: the LAST stdout line of `run` is
 #   PNEUMA_GATE_RESULT repo=.. head=.. tree=.. exit=N ...
 # exit 0 = gate green for exactly that head+tree; 1 = gate RED; 75 = the gate
-# did not run to a verdict (refused / queue timeout / infra) — never green.
+# did not run to a verdict (refused / infra) — never green.
 #
-# Isolation: each run gets its own clone (alternates to the shared object
-# store), HOME, TMPDIR and gate lock; the dependency environment is an
-# immutable cache keyed by the profile's key. Everything per-run is deleted on
-# exit. The runner NEVER touches k3s or the GitHub runner services.
+# Isolation (GATE-PG-1). Each gate is a transient systemd SERVICE with DynamicUser=yes (a unique
+# uid per run), KillMode=control-group, MemoryMax/CPUQuota/TasksMax/RuntimeMaxSec, PrivateTmp,
+# ProtectSystem=strict, ProtectHome, NoNewPrivileges and its own RuntimeDirectory. ALL work on PR
+# content happens inside that unit: bundle unpack, checkout, pyproject / key derivation, the
+# dependency-env build, the tests and the per-run PostgreSQL. This root runner only places the
+# bundle read-only (BindReadOnlyPaths), applies FIXED per-profile limits from the root-owned
+# profile (never PR content) and launches. The shared env cache, the object store and the proto
+# wheels are read-only to units, so one run cannot poison another's inputs or forge its verdict.
+# systemd owns every per-run directory (RuntimeDirectory= and PrivateTmp=): nothing here deletes
+# one. The runner NEVER touches k3s, containerd, docker volumes or the GitHub runner services.
 set -uo pipefail
 
 BASE_DIR="${PNEUMA_GATE_BASE:-/var/lib/pneuma-gate}"
-RUN_AS="${PNEUMA_GATE_RUN_AS-pneuma-gate}"           # empty = no privilege drop (tests)
+RUN_ROOT="${PNEUMA_GATE_RUN_ROOT:-/run/pneuma-gate}"   # systemd creates each run's directory here (RuntimeDirectory=)
+RUN_AS="${PNEUMA_GATE_RUN_AS-pneuma-gate}"           # owner of the object store; empty = no privilege drop (unit tests only)
 PROFILE_DIR="${PNEUMA_GATE_PROFILE_DIR:-/usr/local/lib/pneuma-gate/profiles}"
 EXPECT_HOST="${PNEUMA_GATE_EXPECT_HOST-vmi3387590}"   # approved builder identity
+ABORT_FREE_GIB="${PNEUMA_GATE_ABORT_FREE_GIB:-35}"      # a running gate is stopped when free space falls below this (the kubelet evicts near ~29GiB; a unit writes at most IO_WRITE_MAX per poll)
+DISK_POLL_S="${PNEUMA_GATE_DISK_POLL_S:-1}"
+IO_WRITE_MAX="${PNEUMA_GATE_IO_WRITE_MAX:-200M}"          # per-unit write bandwidth cap on the disk that holds the unit's private tmp
+IO_DEVICE="${PNEUMA_GATE_IO_DEVICE:-}"                    # block device for the cap; empty = derived from the unit work area; "none" = an explicit, logged opt-out (tests only)
 MIN_FREE_GIB="${PNEUMA_GATE_MIN_FREE_GIB:-40}"          # absolute free-space floor on $BASE_DIR's filesystem; ci-builder also runs k3s, whose kubelet evicts below ~10% free (~29GiB of 290GiB) — 40 leaves room for one ~5GiB gate above that line
 RESERVE_CORES="${PNEUMA_GATE_RESERVE_CORES:-3}"       # left for runners + k3s
 RESERVE_MEM_MB="${PNEUMA_GATE_RESERVE_MEM_MB:-6144}"
 MAX_CONCURRENT="${PNEUMA_GATE_MAX_CONCURRENT:-4}"
+BUNDLE_MAX_MB="${PNEUMA_GATE_BUNDLE_MAX_MB:-4096}"      # a bundle past this is refused (disk DoS)
 GATE_TIMEOUT_S="${PNEUMA_GATE_TIMEOUT_S:-5400}"
 LOAD_CEILING_PCT="${PNEUMA_GATE_LOAD_CEILING_PCT:-150}" # % of nproc; only blocks stacking a 2nd gate
 POLL_S="${PNEUMA_GATE_POLL_S:-5}"
 NPROC="${PNEUMA_GATE_NPROC:-$(nproc)}"
 MEMINFO="${PNEUMA_GATE_MEMINFO:-/proc/meminfo}"
 LOADAVG="${PNEUMA_GATE_LOADAVG:-/proc/loadavg}"
+SYSTEMCTL_BIN="${PNEUMA_GATE_SYSTEMCTL:-systemctl}"
+SYSTEMD_RUN_BIN="${PNEUMA_GATE_SYSTEMD_RUN:-systemd-run}"
+JOURNALCTL_BIN="${PNEUMA_GATE_JOURNALCTL:-journalctl}"
+# Where the units see what the runner places for them (bind-mount targets inside the unit).
+IN_MOUNT="${PNEUMA_GATE_IN_MOUNT:-/run/pneuma-gate-in}"      # bundle, store/
+ENVS_MOUNT="${PNEUMA_GATE_ENVS_MOUNT:-/opt/gate-envs}"       # the profile's env cache (read-only)
+UNIT_WORK="${PNEUMA_GATE_UNIT_WORK:-/var/tmp/pneuma-gate}"   # the unit's private disk (PrivateTmp: systemd removes it)
+WHEELS_MOUNT="${PNEUMA_GATE_WHEELS_MOUNT:-/opt/gate-wheels}" # staged proto wheels (read-only)
+UNIT_PATH="/usr/local/bin:/usr/bin:/bin"
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 
 log() { printf '[gate-runner %s] %s\n' "$(date -u +%H:%M:%SZ)" "$*"; }
 as_gate() { if [ -n "$RUN_AS" ]; then runuser -u "$RUN_AS" -- "$@"; else "$@"; fi; }
@@ -54,23 +79,110 @@ disk_free_gib() { df -BG --output=avail "$BASE_DIR" 2>/dev/null | tail -1 | tr -
 # ── capacity ─────────────────────────────────────────────────────────────────
 mem_available_mb() { awk '/^MemAvailable:/ {print int($2/1024)}' "$MEMINFO"; }
 load1_x100() { awk '{printf "%d", $1*100}' "$LOADAVG"; }
-live_runs() {   # prints "<id> <cores> <mem_mb>" for each live run
-  local d pid
-  for d in "$BASE_DIR"/runs/*/; do
-    [ -f "$d/pid" ] || continue
-    pid="$(cat "$d/pid" 2>/dev/null)"
-    { [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; } || continue
-    printf '%s %s %s\n' "$(basename "$d")" "$(cat "$d/cores" 2>/dev/null || echo 1)" "$(cat "$d/mem_mb" 2>/dev/null || echo 2048)"
+# Admission counts, from systemd, the live gate SERVICES with their own configured limits, plus
+# the reservations of runners that are alive and have not started their unit yet. Both come from
+# root-owned state (systemd, and the 0700 state directory): nothing inside a run directory is read.
+# A reservation counts while its runner process is alive (pid + start time, so a recycled pid is
+# not mistaken for it), never by age: a slow start does not release capacity.
+STATE_DIR="${PNEUMA_GATE_STATE_DIR:-/var/lib/pneuma-gate-state}"
+
+state_init() {
+  [ -L "$STATE_DIR" ] && return 1
+  mkdir -p "$STATE_DIR/runs" "$STATE_DIR/in" && chmod 0700 "$STATE_DIR" "$STATE_DIR/runs" "$STATE_DIR/in"
+}
+# Every run has a NONCE, minted when the run starts. It is written into the run's reservation and its
+# submitter record and into the command line of its unit (PNEUMA_GATE_NONCE=...), so a record can be checked
+# against the unit it names before it is allowed to act on it: a unit name, a loopback address or a pid that
+# has been recycled for another run does not carry the nonce, and is refused.
+new_nonce() { head -c 12 /dev/urandom | od -An -tx1 | tr -d ' \n'; }
+unit_has_nonce() {  # <unit> <nonce>: the unit under this name was started for the run that holds this nonce
+  [ -n "$2" ] || return 1
+  "$SYSTEMCTL_BIN" show -p ExecStart --value "$1" 2>/dev/null | grep -qF "PNEUMA_GATE_NONCE=$2"
+}
+proc_start() { sed 's/.*) //' "/proc/$1/stat" 2>/dev/null | awk '{print $20}'; }   # starttime of a pid
+state_mark() {  # <run id> <runner pid> <cores> <mem_mb> <queued|admitted|warm> [loopback] [nonce]: only an admitted marker holds capacity
+  local f="$STATE_DIR/runs/$1" tmp="$STATE_DIR/runs/.$1.$$"
+  [ -L "$f" ] && return 1
+  printf 'pid=%s\npstart=%s\ncores=%s\nmem_mb=%s\nstate=%s\nloopback=%s\nnonce=%s\n' "$2" "$(proc_start "$2")" "$3" "$4" "${5:-admitted}" "${6:-}" "${7:-}" > "$tmp" && mv -f "$tmp" "$f"
+}
+state_get() {  # <run id> <key>
+  local f="$STATE_DIR/runs/$1"
+  [ -f "$f" ] && [ ! -L "$f" ] || return 1
+  sed -n "s/^$2=//p" "$f" | head -1
+}
+state_remove() { [ -L "$STATE_DIR/runs/$1" ] || rm -f "$STATE_DIR/runs/$1"; }
+# Liveness is three-valued. "dead" needs POSITIVE proof (the pid is not in /proc, or it is there with a
+# different start time); anything that cannot be parsed or read is "unknown", and unknown counts as
+# OCCUPIED: it holds its slot and its place, and only a positive "dead" lets a reservation, a ticket or a
+# record be reclaimed. A slot is never freed because its owner could not be examined.
+proc_state() {  # <pid> <pstart>: alive | dead | unknown
+  local pid="$1" pstart="$2" now
+  case "$pid" in ''|*[!0-9]*) echo unknown; return;; esac
+  [ -r /proc/self/stat ] || { echo unknown; return; }          # /proc itself is not usable: cannot tell
+  if [ ! -e "/proc/$pid" ]; then echo dead; return; fi          # no such process: positive proof
+  [ -n "$pstart" ] || { echo unknown; return; }
+  now="$(proc_start "$pid")"
+  [ -n "$now" ] || { echo unknown; return; }
+  if [ "$now" = "$pstart" ]; then echo alive; else echo dead; fi   # same pid, another start time: recycled
+}
+unit_state() {  # <unit>: active | inactive | unknown (systemctl is-active's own words; anything else is unknown)
+  local out; out="$("$SYSTEMCTL_BIN" is-active "$1" 2>/dev/null)"
+  case "$out" in
+    active|activating|deactivating|reloading|refreshing) echo active;;
+    inactive|failed) echo inactive;;
+    *) echo unknown;;
+  esac
+}
+ticket_state() {  # <ticket file>: its content is "<pid> <start time>"
+  local pid pstart
+  read -r pid pstart < "$1" 2>/dev/null || { echo unknown; return; }
+  proc_state "$pid" "$pstart"
+}
+runner_state() {  # <run id>: the runner that holds this reservation
+  local f="$STATE_DIR/runs/$1"
+  [ -L "$f" ] && { echo unknown; return; }
+  [ -e "$f" ] || { echo dead; return; }                          # no record at all: nothing holds it
+  [ -f "$f" ] || { echo unknown; return; }
+  proc_state "$(state_get "$1" pid)" "$(state_get "$1" pstart)"
+}
+runner_alive() { [ "$(runner_state "$1")" = alive ]; }
+runner_dead() { [ "$(runner_state "$1")" = dead ]; }
+
+live_runs() {   # prints "<id> <cores> <mem_mb>"
+  local unit id cores mem active f quota bytes
+  # If the units cannot be listed the capacity is UNKNOWN, not zero: fail (admission then refuses).
+  active="$("$SYSTEMCTL_BIN" list-units --plain --no-legend --state=active,activating,deactivating 'pneuma-gate-*.service' 2>/dev/null)" || return 1
+  active="$(awk '{print $1}' <<<"$active")"
+  while read -r unit; do
+    [ -n "$unit" ] || continue
+    id="${unit#pneuma-gate-}"; id="${id%.service}"
+    quota="$("$SYSTEMCTL_BIN" show -p CPUQuotaPerSecUSec --value "$unit" 2>/dev/null)"
+    bytes="$("$SYSTEMCTL_BIN" show -p MemoryMax --value "$unit" 2>/dev/null)"
+    # a quota that cannot be read is charged as the whole host, never as the smallest unit
+    cores="$(awk -v q="$quota" -v all="$NPROC" 'BEGIN { sub(/s$/, "", q); if (q !~ /^[0-9]+(\.[0-9]+)?$/) { print all; exit } c = int(q + 0.5); if (c < 1) c = 1; print c }')"
+    case "$bytes" in ''|*[!0-9]*) mem=0;; *) mem=$(( bytes / 1048576 ));; esac
+    printf '%s %s %s\n' "$id" "$cores" "$mem"
+  done <<< "$active"
+  [ -d "$STATE_DIR/runs" ] || return 0
+  for f in "$STATE_DIR"/runs/*; do
+    [ -f "$f" ] && [ ! -L "$f" ] || continue
+    id="$(basename "$f")"
+    grep -qx "pneuma-gate-$id.service" <<< "$active" && continue   # its unit is counted already
+    runner_dead "$id" && continue            # only a positively dead runner releases its reservation
+    case "$(state_get "$id" state)" in queued|warm) continue;; esac   # staged and waiting, or an operator build: holds no gate capacity
+    cores="$(state_get "$id" cores)"; case "$cores" in ''|*[!0-9]*) cores="$NPROC";; esac   # unreadable weight = the whole host
+    printf '%s %s %s\n' "$id" "$cores" "$(state_get "$id" mem_mb)"
   done
 }
-# can_admit <cores> <mem_mb> — true when this gate fits beside the live ones
-# AND beside whatever the host's runners/k3s are already using.
+
 can_admit() {
   local cores="$1" mem="$2" n=0 used_c=0 id c m
   while read -r id c m; do
     [ -n "$id" ] || continue
+    [ "$id" = LIVE-RUNS-UNKNOWN ] && return 1          # the units could not be listed: nothing is known to be free
+    case "$c" in ''|*[!0-9]*) c="$NPROC";; esac
     n=$((n + 1)); used_c=$((used_c + c))
-  done < <(live_runs)
+  done < <(live_runs || echo "LIVE-RUNS-UNKNOWN 0 0")
   [ "$n" -ge "$MAX_CONCURRENT" ] && return 1
   # Core budget = cores minus the reserve; one gate is always allowed to use
   # its own weight so a tiny host still makes progress.
@@ -81,7 +193,8 @@ can_admit() {
   [ $(($(mem_available_mb) - RESERVE_MEM_MB)) -lt "$mem" ] && return 1
   # Load: when the host is already saturated by runners/k3s, only the first
   # gate may start (never stack gates on a starved box).
-  if [ "$n" -gt 0 ] && [ "$(load1_x100)" -gt $((NPROC * LOAD_CEILING_PCT)) ]; then return 1; fi
+  local load; load="$(load1_x100)"; case "$load" in ''|*[!0-9]*) load=999999999;; esac   # unreadable load = saturated
+  if [ "$n" -gt 0 ] && [ "$load" -gt $((NPROC * LOAD_CEILING_PCT)) ]; then return 1; fi
   return 0
 }
 
@@ -100,7 +213,7 @@ fetch_keep_refs() {  # <store> <bundle> <repo> <branch-or-empty>
   specs+=("+refs/pneuma-gate/repo/$repo:refs/gate-keep/repo/$repo")
   if [ -n "$branch" ]; then specs+=("+refs/pneuma-gate/branch/$branch:refs/gate-keep/branch/$branch"); fi
   specs+=("+refs/pneuma-gate/head-*:refs/gate-keep/head-*" "+refs/pneuma-gate/base-*:refs/gate-keep/base-*" "+refs/pneuma-gate/om-*:refs/gate-keep/om-*")
-  as_gate git --git-dir="$store" fetch "$bundle" "${specs[@]}" 2>&1 | sed 's/^/  fetch: /'
+  as_gate git -c transfer.fsckObjects=true --git-dir="$store" fetch "$bundle" "${specs[@]}" 2>&1 | sed 's/^/  fetch: /'
   return "${PIPESTATUS[0]}"
 }
 # Record a submission's shallow boundary commits in the store's shallow file. Read-modify-write of one shared file, so
@@ -126,29 +239,56 @@ cmd_have() {
   safe_name "$repo" || { echo "bad repo" >&2; return 2; }
   local store; store="$(store_for "$repo")"
   [ -d "$store" ] || return 0
-  printf '%s\n' "${shas[@]}" | git --git-dir="$store" cat-file --batch-check='%(objectname) %(objecttype)' 2>/dev/null | awk '$2=="commit"{print $1}'
+  printf '%s\n' "${shas[@]}" | as_gate git --git-dir="$store" cat-file --batch-check='%(objectname) %(objecttype)' 2>/dev/null | awk '$2=="commit"{print $1}'
 }
+
+command -v "$SYSTEMCTL_BIN" >/dev/null 2>&1 || { echo "pneuma-gate-runner: no systemctl ($SYSTEMCTL_BIN): admission and the gate unit need systemd" >&2; exit 75; }
 
 # ── janitor ──────────────────────────────────────────────────────────────────
 live_job_for_dir() {  # <id>: prints the id when its dedup record names a live pid or unit
   local id="$1" pid unit
   [ -f "$DEDUP_DIR/$id" ] || return 0
-  pid="$(dedup_field "$id" pid)"; unit="$(dedup_field "$id" unit)"
-  if kill -0 "$pid" 2>/dev/null || "$SYSTEMCTL_BIN" is-active --quiet "$unit" 2>/dev/null; then echo "$id"; fi
+  if [ "$(dedup_state "$id")" != dead ]; then echo "$id"; fi
 }
 cmd_janitor() {
-  local d pid store ref ts f
-  for d in "$BASE_DIR"/runs/*/; do
-    [ -d "$d" ] || continue
-    pid="$(cat "$d/pid" 2>/dev/null || true)"
-    if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
-      log "janitor: removing dead run $(basename "$d")"; rm -rf "$d"
-    fi
-  done
+  # Housekeeping only. Nothing here deletes a run directory or stops a unit: systemd owns both
+  # (RuntimeDirectory=, PrivateTmp=, KillMode=control-group). This removes the root runner's own
+  # leftovers: queue entries and reservation markers of dead runners, staged bundles whose unit is
+  # not running, and keep-refs past two days.
+  local f pid store ref ts id
+  cmd_guard
   for f in "$BASE_DIR"/queue/*; do
     [ -e "$f" ] || continue
-    case "$(basename "$f")" in in-*) [ -n "$(find "$f" -mmin +120 2>/dev/null)" ] && rm -f "$f"; continue;; esac
-    pid="${f##*-}"; kill -0 "$pid" 2>/dev/null || rm -f "$f"
+    [ "$(ticket_state "$f")" = dead ] && rm -f "$f"     # unknown stays: only a positive death frees a place
+  done
+  for f in "$STATE_DIR"/runs/*; do
+    [ -f "$f" ] && [ ! -L "$f" ] || continue
+    id="$(basename "$f")"
+    runner_dead "$id" || continue
+    [ "$(unit_state "pneuma-gate-$id.service")" = inactive ] || continue
+    rm -f "$f"
+  done
+  for f in "$STATE_DIR"/in/*; do
+    [ -f "$f" ] && [ ! -L "$f" ] || continue
+    id="$(basename "$f" .bundle)"
+    [ -f "$STATE_DIR/runs/$id" ] && continue
+    runner_dead "$id" || continue    # a queued runner has staged its bundle (its marker is "queued")
+    [ "$(unit_state "pneuma-gate-$id.service")" = inactive ] || continue
+    rm -f "$f"
+  done
+  # submitter records: dropped only when the runner AND the unit are both positively gone
+  for f in "$DEDUP_DIR"/*; do
+    [ -f "$f" ] && [ ! -L "$f" ] || continue
+    [ "$(dedup_state "$(basename "$f")")" = dead ] && rm -f "$f"
+  done
+  # warm-env build slots left by a runner that died: only once the slot's runner and both units are gone
+  local slot sid
+  for slot in "$BASE_DIR"/envs/*/.slot-*; do
+    [ -d "$slot" ] && [ ! -L "$slot" ] || continue
+    sid="${slot##*/.slot-}"
+    runner_dead "$sid-build" && runner_dead "$sid-key" || continue
+    [ "$(unit_state "pneuma-warm-$sid-build.service")" = inactive ] && [ "$(unit_state "pneuma-warm-$sid-key.service")" = inactive ] || continue
+    rm -rf --one-file-system -- "$slot"
   done
   # verdict files older than a week: their jobs are long finished (a live job's file is written at its end)
   [ -d "$RESULTS_DIR" ] && find "$RESULTS_DIR" -mindepth 1 -maxdepth 1 -type f -mtime +7 -delete 2>/dev/null
@@ -158,52 +298,255 @@ cmd_janitor() {
       [ -n "$(live_job_for_dir "$(basename "$j")")" ] || rm -rf -- "$j"
     done
   fi
+  loopback_sweep   # after the reservations: an address is free only when no reservation still names it
   # keep-refs older than 2 days no longer pin their objects
   for store in "$BASE_DIR"/repos/*.git; do
     [ -d "$store" ] || continue
-    git --git-dir="$store" for-each-ref --format='%(refname) %(committerdate:unix)' refs/gate-keep 2>/dev/null |
+    as_gate git --git-dir="$store" for-each-ref --format='%(refname) %(committerdate:unix)' refs/gate-keep 2>/dev/null |
       while read -r ref ts; do
-        [ $(($(date +%s) - ts)) -gt 172800 ] && git --git-dir="$store" update-ref -d "$ref"
+        [ $(($(date +%s) - ts)) -gt 172800 ] && as_gate git --git-dir="$store" update-ref -d "$ref"
       done
   done
+  return 0
+}
+
+# Units nobody supervises, and every unit when the disk is low. Runs from the janitor and from
+# cron every minute, so the runner's own 1s guard is not the only line: a SIGKILLed runner leaves
+# its unit running (bounded only by RuntimeMaxSec) with no one watching the disk.
+cmd_guard() {
+  local unit id free low=0
+  free="$(disk_free_gib)"
+  { [ -n "$free" ] && [ "$free" -lt "$ABORT_FREE_GIB" ]; } && low=1
+  while read -r unit; do
+    [ -n "$unit" ] || continue
+    id="${unit#pneuma-gate-}"; id="${id%.service}"
+    if [ "$low" = 1 ]; then
+      log "guard: stopping $unit (disk low)"; "$SYSTEMCTL_BIN" stop "$unit" >/dev/null 2>&1
+    elif runner_dead "$id"; then
+      # the reservation says its runner is gone; stop the unit only if it is the unit that run started
+      if [ ! -e "$STATE_DIR/runs/$id" ] || unit_has_nonce "$unit" "$(state_get "$id" nonce)"; then   # no reservation at all = unaccounted capacity
+        log "guard: stopping $unit (runner gone)"; "$SYSTEMCTL_BIN" stop "$unit" >/dev/null 2>&1
+      else
+        log "guard: NOT stopping $unit: it does not carry the nonce of the reservation that names it"
+      fi
+    fi
+  done < <("$SYSTEMCTL_BIN" list-units --plain --no-legend --state=active,activating,deactivating 'pneuma-gate-*.service' 2>/dev/null | awk '{print $1}')
   return 0
 }
 
 cmd_status() {
   echo "host=$(hostname) nproc=$NPROC mem_available_mb=$(mem_available_mb) load1=$(awk '{print $1}' "$LOADAVG") disk_pct=$(disk_pct) disk_free_gib=$(disk_free_gib)"
   echo "limits: disk_free>=${MIN_FREE_GIB}GiB reserve_cores=$RESERVE_CORES reserve_mem_mb=$RESERVE_MEM_MB max_concurrent=$MAX_CONCURRENT"
+  if [ "$IO_DEVICE" = none ]; then echo "io-cap: DISABLED (PNEUMA_GATE_IO_DEVICE=none)"
+  elif [ -n "$(io_device)" ]; then echo "io-cap: $(io_device) $IO_WRITE_MAX"
+  else echo "io-cap: NONE (the unit disk is not a block device; set PNEUMA_GATE_IO_DEVICE)"; fi
   live_runs | sed 's/^/live-run: /'
 }
 
+# The mount points the units' bind mounts land on, made here (idempotently, as root) so a unit's
+# start never depends on systemd creating them under a read-only /run.
+bind_points() {
+  mkdir -p "$IN_MOUNT/store" "$ENVS_MOUNT" "$WHEELS_MOUNT" 2>/dev/null
+  [ -e "$IN_MOUNT/bundle" ] || : > "$IN_MOUNT/bundle" 2>/dev/null
+  return 0
+}
+
+# ── the sandbox every unit gets ──────────────────────────────────────────────
+# A unique uid per run (DynamicUser), a read-only filesystem except its own directories, no
+# privilege gain, no devices, no kernel knobs, other runs' processes invisible.
+SANDBOX_PROPS=(
+  --property=DynamicUser=yes --property=KillMode=control-group
+  --property=PrivateTmp=yes --property=ProtectSystem=strict --property=ProtectHome=yes
+  --property=NoNewPrivileges=yes --property=PrivateDevices=yes --property=ProtectProc=invisible
+  --property=ProtectKernelTunables=yes --property=ProtectKernelModules=yes
+  --property=ProtectControlGroups=yes --property=RestrictSUIDSGID=yes --property=LockPersonality=yes
+  --property=RemoveIPC=yes --property=MemorySwapMax=0 --property=TimeoutStopSec=20
+)
+
+# The network a unit may use: the public internet a cache-miss env build needs (PyPI, npm, nodejs.org),
+# the system's DNS resolvers, and ONE per-run loopback address for the run's own PostgreSQL. Not
+# allowed: 127.0.0.1 and the rest of loopback (k3s API, kubelet), RFC1918/CGNAT/link-local (wg0, pod and
+# docker networks), and every address configured on this host (so its public address does not loop back
+# to host-local services). Deny-by-default; the allow list is the complement of those ranges.
+net_allow_list() {   # <per-run loopback address> → space separated CIDRs
+  local confs="${PNEUMA_GATE_RESOLV_CONFS:-/etc/resolv.conf /run/systemd/resolve/resolv.conf}" resolvers
+  # shellcheck disable=SC2086
+  resolvers="$(cat $confs 2>/dev/null | awk '$1=="nameserver"{print $2}' | tr '\n' ' ')"
+  # Every IPv4 token of every address line (local, peer and broadcast addresses alike: a point-to-point
+  # tunnel line carries a "peer" address that is just as host-local), as /32 exclusions.
+  "$IP_BIN" -4 -o addr show 2>/dev/null |
+    python3 -c '
+import ipaddress, re, sys
+lo, resolvers = sys.argv[1], sys.argv[2].split()
+local = set()
+for line in sys.stdin:
+    for tok in re.findall(r"\b\d{1,3}(?:\.\d{1,3}){3}\b", line):
+        try:
+            local.add(ipaddress.ip_address(tok))
+        except ValueError:
+            pass
+excl = [ipaddress.ip_network(n) for n in (
+    "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12",
+    "192.0.0.0/24", "192.168.0.0/16", "198.18.0.0/15", "224.0.0.0/3")]
+excl += [ipaddress.ip_network(f"{a}/32") for a in local]
+nets = [ipaddress.ip_network("0.0.0.0/0")]
+for e in excl:
+    nxt = []
+    for n in nets:
+        if not n.overlaps(e):
+            nxt.append(n)
+        elif e.subnet_of(n):
+            nxt.extend(n.address_exclude(e) if e != n else [])
+        # else: n is inside e, dropped
+    nets = nxt
+out = [str(n) for n in ipaddress.collapse_addresses(nets)]
+# A resolver is reachable on every port, so only one that is not this host qualifies: not one of the host
+# own addresses, and on loopback only the systemd-resolved stub (127.0.0.53, DNS only). A resolver on
+# 127.0.0.1 would open the host-local services; DNS then fails loudly instead.
+for r in resolvers:
+    try:
+        ip = ipaddress.ip_address(r)
+    except ValueError:
+        continue
+    if ip.version != 4 or ip in local:
+        continue
+    if ip.is_loopback and str(ip) != "127.0.0.53":
+        continue
+    out.append(f"{ip}/32")
+out.append(f"{lo}/32")
+print(" ".join(out))' "$1" "$resolvers"
+}
+run_loopback() {   # <run id> → a loopback address no other run uses and that is not 127.0.0.1
+  local h; h="$(printf '%s' "$1" | cksum | cut -d' ' -f1)"
+  printf '127.%d.%d.%d' $((16 + h % 200)) $((h / 200 % 250 + 1)) $((h / 50000 % 250 + 1))
+}
+# A client connecting to 127.x.y.z is sourced from 127.0.0.1 by default, and the unit's network filter
+# (rightly) does not allow 127.0.0.1. A host route per run makes the source the run's own address, so
+# only that address is ever used on loopback. Removed with the run; the janitor sweeps the stale ones.
+IP_BIN="${PNEUMA_GATE_IP:-ip}"
+loopback_claim() {   # <run id> → prints a per-run loopback address that no other run holds, route in place
+  local i addr
+  for i in 0 1 2 3 4 5 6 7; do
+    addr="$(run_loopback "$1.$i")"
+    # `route add` (not replace) fails when the address is already routed: a collision with another run
+    if "$IP_BIN" route add local "$addr/32" dev lo scope host src "$addr" 2>/dev/null; then printf '%s' "$addr"; return 0; fi
+  done
+  return 1
+}
+loopback_down() { "$IP_BIN" route del local "$1/32" dev lo >/dev/null 2>&1; return 0; }
+loopback_sweep() {   # drop the per-run routes no reservation holds any more
+  local keep="" r addr
+  for r in "$STATE_DIR"/runs/*; do
+    [ -f "$r" ] && [ ! -L "$r" ] || continue
+    keep="$keep"$'\n'"$(state_get "$(basename "$r")" loopback)"
+  done
+  "$IP_BIN" route show table local 2>/dev/null | awk '$1=="local" && $2 ~ /^127\.(1[6-9]|[2-9][0-9]|1[0-9][0-9]|2[01][0-9])\.[0-9]+\.[0-9]+$/ {print $2}' |
+    while read -r addr; do grep -qxF "$addr" <<<"$keep" || loopback_down "$addr"; done
+  return 0
+}
+io_device() {   # the block device that holds the units' private disk; nothing when it is not one
+  local dev="$IO_DEVICE"
+  [ -n "$dev" ] || dev="$(findmnt -no SOURCE -T /var/tmp 2>/dev/null)"
+  [ -b "$dev" ] && printf '%s' "$dev"
+}
+# the properties every gate/warm unit gets besides the sandbox: no network but the allow list, a
+# write-bandwidth cap on the disk, and a filesystem view without the gate's other state
+unit_props() {   # <loopback> → UNIT_PROPS
+  local allow dev
+  allow="$(net_allow_list "$1")" || return 1
+  [ -n "$allow" ] || return 1
+  UNIT_PROPS=(--property=IPAddressDeny=any --property=IPAddressAllow="$allow"
+              --property=TemporaryFileSystem="$BASE_DIR:ro" --property=TemporaryFileSystem="$STATE_DIR:ro")
+  # The write cap is part of the disk guard's arithmetic (the burst after the abort line). A host whose
+  # unit disk does not resolve to a block device must FAIL loudly, never run without the cap.
+  if [ "$IO_DEVICE" = none ]; then
+    log "WARNING: the write-bandwidth cap is disabled by PNEUMA_GATE_IO_DEVICE=none"
+  else
+    dev="$(io_device)"
+    if [ -z "$dev" ]; then
+      echo "pneuma-gate-runner: no block device for the unit disk (/var/tmp is on '$(findmnt -no SOURCE -T /var/tmp 2>/dev/null)'); set PNEUMA_GATE_IO_DEVICE=/dev/<disk>: refusing to run without IOWriteBandwidthMax" >&2
+      return 1
+    fi
+    UNIT_PROPS+=(--property=IOWriteBandwidthMax="$dev $IO_WRITE_MAX")
+  fi
+  return 0
+}
+
 # ── run ──────────────────────────────────────────────────────────────────────
-RUN_DIR=""; QUEUE_FILE=""; START_TS=0
-DEDUP_ID=""; JOB_ID=""; JOB_KEY=""; WORKER_PID=""   # set by cmd_run / run_job; empty until then (the EXIT trap reads them)
+RUN_NONCE=""; DEDUP_ID=""; SUBMITTER=""; LOOPBACK=""; RUN_ID=""; QUEUE_FILE=""; START_TS=0; BUNDLE_FILE=""; UNIT=""; GUARD_PID=""; ABORT_FLAG=""
+RUN_DIR=""; JOB_ID=""; JOB_KEY=""; WORKER_PID=""; WORKER_STARTED=0   # set by cmd_run / run_job; empty until then (the EXIT traps read them)
 R_REPO=""; R_HEAD=""; R_TREE=""; R_PROFILE=""; R_BASE=""; R_ORIGIN=""; R_ENV=""; R_SUBMITTER=""; R_JOBKEY=""
 # The verdict's root-owned result file: written by the job (never parsed back from the shared log).
 RESULTS_DIR="${PNEUMA_GATE_RESULTS_DIR:-/var/lib/pneuma-gate-results}"
+# the verdict files are written by the root runner: the expected owner is root (the test harness names its own uid)
+RESULTS_OWNER="${PNEUMA_GATE_RESULTS_UID:-0}"
 # job_key: the ONE identity of a verdict's scope. Everything that can change what the gate decides is in it:
 # repo, head, tree, submitter, profile, base, origin-main and the scope env flags (sorted, comma-joined).
 job_key() {  # <repo> <head> <tree> <submitter> <profile> <base> <origin_main> <env>
   printf 'pneuma-gate-job-v1|repo=%s|head=%s|tree=%s|submitter=%s|profile=%s|base=%s|origin_main=%s|env=%s' \
     "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" | sha256sum | cut -d' ' -f1
 }
-result() {   # result <exit> [reason]: the verdict is written to the result file, and the stream shows that file's line
-  local line tmp
-  line="$(printf 'PNEUMA_GATE_RESULT repo=%s head=%s tree=%s profile=%s base=%s origin_main=%s env=%s submitter=%s jobkey=%s exit=%s elapsed=%ss host=%s%s' \
+refuse() { log "REFUSED: $1"; result 75 "$1"; exit 75; }
+result_line() {   # result_line <exit> [reason]: the verdict line for this submission (no side effects)
+  printf 'PNEUMA_GATE_RESULT repo=%s head=%s tree=%s profile=%s base=%s origin_main=%s env=%s submitter=%s jobkey=%s exit=%s elapsed=%ss host=%s%s\n' \
     "$R_REPO" "$R_HEAD" "$R_TREE" "$R_PROFILE" "$R_BASE" "$R_ORIGIN" "$R_ENV" "$R_SUBMITTER" "$R_JOBKEY" \
-    "$1" "$(($(date +%s) - START_TS))" "$(hostname)" "${2:+ reason=\"$2\"}")"
+    "$1" "$(($(date +%s) - START_TS))" "$(hostname)" "${2:+ reason=\"$2\"}"
+}
+result() {   # result <exit> [reason]: the verdict is written to the job's result file; the worker's log shows that line
+  local line tmp
+  line="$(result_line "$@")"
   if [ -n "$JOB_ID" ] && [ -d "$RESULTS_DIR" ]; then
     tmp="$(mktemp "$RESULTS_DIR/.result.XXXXXX")" && printf '%s\n' "$line" > "$tmp" && mv -f -- "$tmp" "$RESULTS_DIR/$JOB_ID" \
       || log "WARNING: the verdict file for job $JOB_ID could not be written"
   fi
   printf '%s\n' "$line"
 }
-cleanup() {
-  [ -n "$QUEUE_FILE" ] && rm -f "$QUEUE_FILE"
-  [ -n "$RUN_DIR" ] && [ -d "$RUN_DIR" ] && rm -rf "$RUN_DIR"
-  [ -n "$DEDUP_ID" ] && dedup_remove "$DEDUP_ID"
+# A result file is trusted only when it is a regular file (not a symlink), owned by RESULTS_OWNER (root) and not
+# writable by group or other. Any mismatch fails closed: the caller treats it as no verdict (75).
+result_file_ok() {  # <path>
+  local f="$1" st
+  [ -f "$f" ] && [ ! -L "$f" ] || return 1
+  [ "$(stat -c %F -- "$f" 2>/dev/null)" = "regular file" ] || return 1
+  st="$(stat -c '%u %a' -- "$f" 2>/dev/null)" || return 1
+  [ "${st%% *}" = "$RESULTS_OWNER" ] && [ $(( 8#${st##* } & 022 )) -eq 0 ]
 }
-refuse() { log "REFUSED: $1"; result 75 "$1"; exit 75; }
+results_dir_ok() {
+  local st
+  [ -d "$RESULTS_DIR" ] && [ ! -L "$RESULTS_DIR" ] || return 1
+  st="$(stat -c '%u %a' -- "$RESULTS_DIR" 2>/dev/null)" || return 1
+  [ "${st%% *}" = "$RESULTS_OWNER" ] && [ $(( 8#${st##* } & 022 )) -eq 0 ]
+}
+# result_line_ok <line>: 0 only for a well-formed verdict whose every scope field is THIS submission's and whose
+# job key binds them. Sets RESULT_EXIT. Free text (the reason) is allowed only after the fixed fields.
+result_line_ok() {
+  local line="$1" body re='^PNEUMA_GATE_RESULT repo=([A-Za-z0-9._-]+) head=([0-9a-f]{40}) tree=([0-9a-f]{40}) profile=([A-Za-z0-9._-]+) base=([0-9a-f]{40}) origin_main=([0-9a-f]{0,40}) env=([A-Z0-9_=,]*) submitter=([a-z0-9][a-z0-9-]{0,62}) jobkey=([0-9a-f]{64}) exit=([0-9]{1,3}) elapsed=[0-9]+s host=[A-Za-z0-9._-]+$'
+  local -a m
+  body="${line%% reason=*}"; body="${body% }"
+  [[ "$body" =~ $re ]] || return 1
+  m=("${BASH_REMATCH[@]}")
+  [ "${m[1]}" = "$R_REPO" ] && [ "${m[2]}" = "$R_HEAD" ] && [ "${m[3]}" = "$R_TREE" ] && [ "${m[4]}" = "$R_PROFILE" ] \
+    && [ "${m[5]}" = "$R_BASE" ] && [ "${m[6]}" = "$R_ORIGIN" ] && [ "${m[7]}" = "$R_ENV" ] \
+    && [ "${m[8]}" = "$R_SUBMITTER" ] && [ "${m[9]}" = "$R_JOBKEY" ] || return 1
+  [ "${m[9]}" = "$(job_key "$R_REPO" "$R_HEAD" "$R_TREE" "$R_SUBMITTER" "$R_PROFILE" "$R_BASE" "$R_ORIGIN" "$R_ENV")" ] || return 1
+  RESULT_EXIT="${m[10]}"
+}
+# finish_job <job id> <why when no result>: prints THE authoritative verdict line of a job (the last line of the stream)
+# and returns its exit. The line is the job's root-owned result file, re-read and validated against this submission.
+# A missing, malformed, unpersisted or wrong-scope result is a 75 line, never green, whatever the job's log says.
+finish_job() {
+  local id="$1" why="$2" f="$RESULTS_DIR/$1" line
+  if results_dir_ok && result_file_ok "$f" && [ "$(grep -c '' -- "$f" 2>/dev/null)" = 1 ]; then
+    line="$(cat -- "$f")"
+    if result_line_ok "$line"; then printf '%s\n' "$line"; return "$RESULT_EXIT"; fi
+    why="result for job $id does not match this submission's scope"
+  else
+    why="${why:-no result file for job $id}"
+  fi
+  log "NO VERDICT: $why"
+  result_line 75 "$why"
+  return 75
+}
+
 refuse_noid() { echo "pneuma-gate-runner: refused: no submitter identity (only pneuma-gate-entry forces one)" >&2; exit 75; }
 
 # GATE-DEDUP-1. A gate for a repo and branch makes every older gate of that branch unusable.
@@ -218,11 +561,29 @@ refuse_noid() { echo "pneuma-gate-runner: refused: no submitter identity (only p
 # unknown, the run neither supersedes nor is superseded: the fail-safe is to cancel nothing.
 DEDUP_DIR="${PNEUMA_GATE_DEDUP_DIR:-/var/lib/pneuma-gate-dedup}"
 PER_SUBMITTER_CAP="${PNEUMA_GATE_PER_SUBMITTER_CAP:-3}"   # live gates one submitter may hold at once (queued + running)
-SYSTEMCTL_BIN="${PNEUMA_GATE_SYSTEMCTL:-systemctl}"
-dedup_register() {  # <id> <key> <head> <submitter> <unit> [jobkey]
+dedup_register() {  # <id> <key> <head> <submitter> <unit> <worker pid> <nonce> <jobkey>
+  # The identity is the WORKER's pid, never $$ (inside a subshell $$ is the top-level runner), plus its start time.
   mkdir -p "$DEDUP_DIR" && chmod 0700 "$DEDUP_DIR" || return 1
-  printf 'key=%s\nhead=%s\npid=%s\nsubmitter=%s\nunit=%s\njobkey=%s\nsuperseded=\n' "$2" "$3" "${WORKER_PID:-$$}" "$4" "$5" "${6:-}" > "$DEDUP_DIR/$1"
+  printf 'key=%s\nhead=%s\npid=%s\npstart=%s\nsubmitter=%s\nunit=%s\nnonce=%s\njobkey=%s\nsuperseded=\n' \
+    "$2" "$3" "$6" "$(proc_start "$6")" "$4" "$5" "$7" "$8" > "$DEDUP_DIR/$1"
 }
+# A record is live while its runner is the SAME process (pid + start time, so a recycled pid is not
+# mistaken for it) or its unit is active. A record without a start time (older runner) falls back to the pid.
+dedup_state() {  # <id>: alive | dead | unknown; dead needs the runner AND the unit both positively gone
+  local pid pstart ps us
+  [ -e "$DEDUP_DIR/$1" ] || { echo dead; return; }      # no record: nothing holds anything for it
+  pid="$(dedup_field "$1" pid)"; pstart="$(dedup_field "$1" pstart)"
+  # a record without a start time (older runner) is judged by the pid alone: present is alive, absent is dead
+  if [ -n "$pid" ] && [ -z "$pstart" ] && [[ "$pid" =~ ^[0-9]+$ ]]; then
+    if [ -e "/proc/$pid" ]; then ps=alive; else ps=dead; fi
+  else
+    ps="$(proc_state "$pid" "$pstart")"
+  fi
+  us="$(unit_state "$(dedup_field "$1" unit)")"
+  [ "$ps" = alive ] || [ "$us" = active ] && { echo alive; return; }
+  if [ "$ps" = dead ] && [ "$us" = inactive ]; then echo dead; else echo unknown; fi
+}
+dedup_alive() { [ "$(dedup_state "$1")" != dead ]; }    # unknown counts as live (occupied)
 dedup_field() {  # <id> <field>
   local f="$DEDUP_DIR/$1"
   [ -f "$f" ] && [ ! -L "$f" ] || return 0
@@ -244,9 +605,11 @@ dedup_supersede() {  # <id> <store> <key> <head> <submitter>
     [ "$(dedup_field "$other" submitter)" = "$5" ] || continue     # never another submitter's gate
     old="$(dedup_field "$other" head)"
     [ "$old" = "$4" ] && continue
-    if ! kill -0 "$(dedup_field "$other" pid)" 2>/dev/null && ! "$SYSTEMCTL_BIN" is-active --quiet "$(dedup_field "$other" unit)" 2>/dev/null; then
-      rm -f "$f"; continue                     # neither its runner nor its unit exists any more
-    fi
+    case "$(dedup_state "$other")" in
+      dead) rm -f "$f"; continue;;             # both its runner and its unit are positively gone
+      alive) ;;
+      *) log "not superseding run $other: its liveness is unknown"; continue;;   # unknown: cancel nothing, delete nothing
+    esac
     if git --git-dir="$store" merge-base --is-ancestor "$4" "$old" 2>/dev/null; then
       log "not superseding run $other: head ${4:0:12} is older than its head ${old:0:12}"
       continue                                  # an older commit never cancels a newer gate
@@ -261,7 +624,10 @@ dedup_supersede() {  # <id> <store> <key> <head> <submitter>
     fi
     dedup_set "$other" superseded "$4"
     unit="$(dedup_field "$other" unit)"
-    if [ -n "$unit" ]; then "$SYSTEMCTL_BIN" stop "$unit" >/dev/null 2>&1 || true; fi
+    if [ -n "$unit" ]; then
+      if unit_has_nonce "$unit" "$(dedup_field "$other" nonce)"; then "$SYSTEMCTL_BIN" stop "$unit" >/dev/null 2>&1 || true
+      else log "not stopping $unit for run $other: the unit does not carry that run's nonce (a recycled name, or an unverifiable record)"; fi
+    fi
   done
 }
 
@@ -274,20 +640,30 @@ dedup_count_submitter() {  # <submitter>: live gates (queued or running) that su
     [ -f "$f" ] && [ ! -L "$f" ] || continue
     other="$(basename "$f")"
     [ "$(dedup_field "$other" submitter)" = "$1" ] || continue
-    if kill -0 "$(dedup_field "$other" pid)" 2>/dev/null || "$SYSTEMCTL_BIN" is-active --quiet "$(dedup_field "$other" unit)" 2>/dev/null; then
-      n=$((n + 1))
-    fi
+    if dedup_alive "$other"; then n=$((n + 1)); fi
   done
   echo "$n"
 }
-dedup_admit() {  # <id> <store> <repo> <branch> <head> <submitter> [jobkey]: 0 recorded, 2 over the submitter's cap
+# The two halves of the admission decision, each under the root lock. HOLD runs first thing in the detached worker:
+# it enforces the submitter's cap, and attaches to a live job with the SAME scope key, before the runner touches
+# the store, promotes anything or takes capacity, so an over-cap or duplicate submission costs the host nothing.
+# DECIDE runs once the bundle is in the store (ancestry needs it) and supersedes the older gates.
+dedup_hold() {  # <id> <repo> <branch> <head> <submitter> <worker pid> <nonce> <jobkey>
+  # 0 recorded; 2 over the submitter's cap; 3 (stdout: the id) a live job already has this exact scope key; 1 failed
   (
     mkdir -p "$DEDUP_DIR" && chmod 0700 "$DEDUP_DIR" || exit 1
     exec 8>"$DEDUP_DIR/.lock"
     flock 8 || exit 1
-    # Fairness: one submitter cannot fill the queue or the slots for the others.
-    [ "$(dedup_count_submitter "$6")" -lt "$PER_SUBMITTER_CAP" ] || exit 2
-    dedup_register "$1" "${4:+$3/$4}" "$5" "$6" "pneuma-gate-$1.service" "${7:-}" || exit 1
+    dup="$(live_job_for_key "$8")"
+    [ -z "$dup" ] || { echo "$dup"; exit 3; }
+    [ "$(dedup_count_submitter "$5")" -lt "$PER_SUBMITTER_CAP" ] || exit 2
+    dedup_register "$1" "${3:+$2/$3}" "$4" "$5" "pneuma-gate-$1.service" "$6" "$7" "$8" || exit 1
+  )
+}
+dedup_decide() {  # <id> <store> <repo> <branch> <head> <submitter>
+  (
+    exec 8>"$DEDUP_DIR/.lock"
+    flock 8 || exit 1
     dedup_supersede "$1" "$2" "${4:+$3/$4}" "$5" "$6"
   )
 }
@@ -299,76 +675,99 @@ bundle_binds() {  # <bundle file> <repo> <branch> <head>
   local heads
   # from /, never the caller's directory: a stray .git there (a worktree's, say) must not decide
   heads="$(cd / && git bundle list-heads "$1" 2>/dev/null)" || return 1
-  grep -qx "$4 refs/pneuma-gate/repo/$2" <<< "$heads" && grep -qx "$4 refs/pneuma-gate/branch/$3" <<< "$heads"
+  grep -qxF "$4 refs/pneuma-gate/repo/$2" <<< "$heads" && grep -qxF "$4 refs/pneuma-gate/branch/$3" <<< "$heads"
 }
 dedup_remove() { [ -L "$DEDUP_DIR/$1" ] || rm -f "$DEDUP_DIR/$1"; }
 
-# first live waiter in the FIFO queue (dead waiters are dropped as we go)
 first_live_waiter() {
   local f
-  for f in $(ls "$BASE_DIR/queue" 2>/dev/null | grep -v '^in-' | sort); do
-    if kill -0 "${f##*-}" 2>/dev/null; then printf '%s' "$f"; return 0; fi
-    rm -f "$BASE_DIR/queue/$f"
+  for f in $(ls "$BASE_DIR/queue" 2>/dev/null | sort); do
+    case "$(ticket_state "$BASE_DIR/queue/$f")" in
+      alive) printf '%s' "$f"; return 0;;
+      dead) rm -f "$BASE_DIR/queue/$f";;
+    esac
   done
 }
 
-admit() {   # admit <cores> <mem_mb> — block until admitted; creates RUN_DIR
+admit() {   # admit <cores> <mem_mb>: block until this run holds a reservation
   local cores="$1" mem="$2" waited=0
-  QUEUE_FILE="$BASE_DIR/queue/$(date +%s%N)-$$"; : > "$QUEUE_FILE"
-  exec 9>"$BASE_DIR/admit.lock"
+  QUEUE_FILE="$BASE_DIR/queue/$(date +%s%N)-$WORKER_PID"; printf '%s %s\n' "$WORKER_PID" "$(proc_start "$WORKER_PID")" > "$QUEUE_FILE"
   while :; do
-    flock 9
     if [ -n "$DEDUP_ID" ] && [ -n "$(dedup_field "$DEDUP_ID" superseded)" ]; then
-      flock -u 9; refuse "superseded by $(dedup_field "$DEDUP_ID" superseded)"
+      refuse "superseded by $(dedup_field "$DEDUP_ID" superseded)"
     fi
-    if [ "$(first_live_waiter)" = "$(basename "$QUEUE_FILE")" ] && can_admit "$cores" "$mem"; then
-      RUN_DIR="$BASE_DIR/runs/$(date +%Y%m%dT%H%M%S)-$$"
-      mkdir -p "$RUN_DIR/work" "$RUN_DIR/tmp" "$RUN_DIR/home"
-      echo $$ > "$RUN_DIR/pid"; echo "$cores" > "$RUN_DIR/cores"; echo "$mem" > "$RUN_DIR/mem_mb"
-      if [ -n "$RUN_AS" ]; then chown -R "$RUN_AS" "$RUN_DIR"; fi
-      chmod 755 "$RUN_DIR"
-      rm -f "$QUEUE_FILE"; QUEUE_FILE=""
-      flock -u 9; exec 9>&-
-      log "admitted run $(basename "$RUN_DIR") after ${waited}s queued (cores=$cores mem=${mem}MB)"
-      return 0
-    fi
-    flock -u 9
+    if reserve_capacity "$cores" "$mem"; then break; fi
     if [ $((waited % 60)) -eq 0 ]; then
       log "queued: $(live_runs | wc -l) running, no capacity (nproc=$NPROC reserve=$RESERVE_CORES mem_avail=$(mem_available_mb)MB load1=$(awk '{print $1}' "$LOADAVG")) waited ${waited}s"
     fi
     sleep "$POLL_S"; waited=$((waited + POLL_S))
   done
+  rm -f "$QUEUE_FILE"; QUEUE_FILE=""
+  log "admitted run $RUN_ID after ${waited}s queued (cores=$cores mem=${mem}MB)"
 }
 
-ensure_env() {   # ensure_env <profile> <work> → sets ENV_DIR (immutable shared cache)
-  local profile="$1" work="$2" key
-  key="$(as_gate bash -c 'source "$1"; cd "$2"; profile_env_key' _ "$PROFILE_DIR/$profile.sh" "$work")" || refuse "profile_env_key failed"
-  [ -n "$key" ] || refuse "empty environment key"
-  ENV_DIR="$BASE_DIR/envs/$profile/$key"
-  [ -e "$ENV_DIR/.ready" ] && { log "environment $profile/$key ready (read-only shared cache)"; return 0; }
-  mkdir -p "$BASE_DIR/envs/$profile"
-  if [ -n "$RUN_AS" ]; then chown "$RUN_AS" "$BASE_DIR/envs/$profile"; fi
-  exec 8>"$BASE_DIR/envs/$profile/.build.lock"
-  log "environment $profile/$key not cached — waiting for the build lock"
-  flock 8
-  if [ ! -e "$ENV_DIR/.ready" ]; then
-    log "building environment $profile/$key (one-time per dependency set)"
-    ( source "$PROFILE_DIR/$profile.sh"; cd "$work" || exit 1
-      if declare -F profile_stage_root >/dev/null; then profile_stage_root "$BASE_DIR"; fi ) \
-      || { flock -u 8; refuse "profile_stage_root failed"; }
-    # Built IN PLACE (venv scripts embed their own path); the .ready marker is
-    # written last, so a crashed build is never mistaken for a usable one.
-    chmod -R u+w "$ENV_DIR" 2>/dev/null; rm -rf "$ENV_DIR"
-    as_gate bash -c 'source "$1"; cd "$2"; export PNEUMA_GATE_BASE="$4"; profile_env_build "$3"' \
-      _ "$PROFILE_DIR/$profile.sh" "$work" "$ENV_DIR" "$BASE_DIR" 2>&1 | sed 's/^/  env-build: /'
-    if [ "${PIPESTATUS[0]}" -ne 0 ]; then
-      chmod -R u+w "$ENV_DIR" 2>/dev/null; rm -rf "$ENV_DIR"; flock -u 8; refuse "environment build failed"
-    fi
-    as_gate bash -c 'touch "$1/.ready" && chmod -R a-w "$1"' _ "$ENV_DIR" \
-      || { flock -u 8; refuse "environment publish failed"; }
+# The admission lock covers only the decision and the reservation marker. It lives in a
+# subshell whose fd dies with it, so no gate code ever runs while the lock is open.
+reserve_capacity() {   # <cores> <mem_mb>: 0 when this run holds a reservation
+  local cores="$1" mem="$2"
+  (
+    exec 9>"$BASE_DIR/admit.lock"
+    flock 9 || exit 1
+    [ "$(first_live_waiter)" = "$(basename "$QUEUE_FILE")" ] || exit 1
+    can_admit "$cores" "$mem" || exit 1
+    state_mark "$RUN_ID" "$WORKER_PID" "$cores" "$mem" admitted "$LOOPBACK" "$RUN_NONCE" || exit 1
+  )
+}
+
+# The runner's own leftovers only: the queue entry, the staged bundle and the reservation. The
+# per-run directories belong to systemd and go with the unit.
+cleanup() {
+  [ -n "$QUEUE_FILE" ] && rm -f "$QUEUE_FILE"
+  [ -n "$GUARD_PID" ] && kill "$GUARD_PID" 2>/dev/null
+  [ -n "$ABORT_FLAG" ] && rm -f "$ABORT_FLAG"
+  # The run's identity bindings (reservation, submitter record, loopback address, staged bundle) are released
+  # only on POSITIVE proof that its unit is gone. A unit that is still active, or whose state cannot be read,
+  # keeps them: the address cannot be handed to another run while the old unit can still reach it, and the
+  # submitter's cap keeps counting it. The janitor releases them once the unit is positively inactive.
+  if [ -n "$UNIT" ] && [ "$(unit_state "$UNIT.service")" != inactive ]; then
+    log "unit $UNIT is not confirmed gone: its reservation, record, address and bundle stay until it is"
+    return 0
   fi
-  flock -u 8; exec 8>&-
-  log "environment $profile/$key ready (read-only shared cache)"
+  [ -n "$BUNDLE_FILE" ] && rm -f "$BUNDLE_FILE"
+  [ -n "$DEDUP_ID" ] && dedup_remove "$DEDUP_ID"
+  [ -n "$LOOPBACK" ] && loopback_down "$LOOPBACK"
+  [ -n "$RUN_ID" ] && state_remove "$RUN_ID"
+  return 0
+}
+# A gate's private disk (workspace, env, PG data, venv) is bounded only by the host: while the
+# unit runs, stop it if free space on the builder falls to the abort line, so one run cannot
+# starve k3s or the other runs. The flag file tells the verdict this was an abort, not a failure.
+disk_guard() {   # <unit> <flag>
+  while sleep "$DISK_POLL_S"; do
+    local free; free="$(disk_free_gib)"
+    if [ -n "$free" ] && [ "$free" -lt "$ABORT_FREE_GIB" ]; then
+      : > "$2"; "$SYSTEMCTL_BIN" stop "$1.service" >/dev/null 2>&1; return 0
+    fi
+  done
+}
+# An abandoned run (ssh gone, runner told to stop) must not keep its capacity: stop its unit.
+abandon() { [ -n "$UNIT" ] && "$SYSTEMCTL_BIN" stop "$UNIT.service" >/dev/null 2>&1; exit 75; }
+
+# Promote the received bundle into the shared object store so later bundles can be incremental.
+# Only this sandboxed unit (the static store owner, no network, writable store only) ever writes
+# the store: a gate unit cannot, so a run cannot alter an object another run will read.
+promote_bundle() {   # <store> <bundle> <shallow> <repo> <branch>: 0 only when the sandboxed promotion succeeded
+  local store="$1" bundle="$2" shallow="$3" repo="$4" branch="$5" user_args=()
+  [ -n "$RUN_AS" ] && user_args=(--property=User="$RUN_AS")
+  "$SYSTEMD_RUN_BIN" --unit="pneuma-promote-$RUN_ID" --wait --collect --quiet "${user_args[@]}" \
+    --property=KillMode=control-group --property=PrivateTmp=yes --property=ProtectSystem=strict \
+    --property=ProtectHome=yes --property=NoNewPrivileges=yes --property=PrivateNetwork=yes \
+    --property=PrivateDevices=yes --property=ReadWritePaths="$store" \
+    --property=BindReadOnlyPaths="$bundle:$IN_MOUNT/bundle" \
+    --property=MemoryMax=2G --property=CPUQuota=100% --property=TasksMax=64 --property=RuntimeMaxSec=900 -- \
+    env -i PATH="$UNIT_PATH" HOME=/nonexistent LANG=C.UTF-8 \
+    "$SELF" promote --store "$store" --bundle "$IN_MOUNT/bundle" --shallow "$shallow" --repo "$repo" --branch "$branch" </dev/null 2>&1 | sed 's/^/  promote: /'
+  return "${PIPESTATUS[0]}"
 }
 
 # ── GATE-QUEUE-1: a job outlives its connection; a same-head submission re-attaches ─────────
@@ -385,20 +784,24 @@ live_job_for_key() {  # <jobkey>: id of a live, unsuperseded job with exactly th
     id="$(basename "$f")"
     [ "$(dedup_field "$id" jobkey)" = "$1" ] || continue
     [ -z "$(dedup_field "$id" superseded)" ] || continue
-    if kill -0 "$(dedup_field "$id" pid)" 2>/dev/null || "$SYSTEMCTL_BIN" is-active --quiet "$(dedup_field "$id" unit)" 2>/dev/null; then
+    if [ "$(dedup_state "$id")" != dead ]; then
       echo "$id"; return 0
     fi
   done
   return 0
 }
 follow_job() {  # <worker pid> <log>: stream the job's log until the job ends; the job keeps running if this drops
-  tail -n +1 -f --pid="$1" "$2" 2>/dev/null || true
+  # EVERY replayed line is prefixed: a job line can never begin with the verdict marker, so nothing the job prints
+  # (or a replayed log line) can be mistaken for a verdict. Only finish_job's line starts with PNEUMA_GATE_RESULT.
+  tail -n +1 -f --pid="$1" "$2" 2>/dev/null | sed -u 's/^/  job: /' || true
 }
 job_exit() {  # <job id>: the exit in the job's ROOT-OWNED result file (75 when there is none: never green).
   # The shared log is never consulted: a log line can be written by anything that can write the log.
   local f="$RESULTS_DIR/$1"
-  [ -f "$f" ] && [ ! -L "$f" ] || { echo 75; return 0; }
-  sed -n 's/.* exit=\([0-9]*\).*/\1/p' "$f" | head -1
+  local ex
+  result_file_ok "$f" || { echo 75; return 0; }
+  ex="$(sed -n 's/.* exit=\([0-9]*\) .*/\1/p' "$f" | head -1)"
+  [[ "$ex" =~ ^[0-9]+$ ]] && echo "$ex" || echo 75      # malformed or missing: never a green
 }
 cmd_cancel() {  # --repo R --head SHA: cancel THIS submitter's live jobs for that repo and head
   local repo="" head="" n=0
@@ -409,7 +812,10 @@ cmd_cancel() {  # --repo R --head SHA: cancel THIS submitter's live jobs for tha
   mkdir -p "$DEDUP_DIR" && chmod 0700 "$DEDUP_DIR" || return 1
   (
     exec 8>"$DEDUP_DIR/.lock"; flock 8 || exit 1
-    local f id unit
+    local f id unit nonce st
+    local -a ids=() units=()
+    # PASS 1, no state change: every record this cancel would touch must pass its owner, nonce and identity checks.
+    # One mismatch refuses the WHOLE cancellation: nothing is superseded and no unit is stopped.
     for f in "$DEDUP_DIR"/*; do
       [ -f "$f" ] && [ ! -L "$f" ] || continue
       id="$(basename "$f")"
@@ -417,16 +823,31 @@ cmd_cancel() {  # --repo R --head SHA: cancel THIS submitter's live jobs for tha
       [ "$(dedup_field "$id" head)" = "$head" ] || continue
       [ "$(dedup_field "$id" submitter)" = "$SUBMITTER" ] || continue     # only the caller's own jobs
       [ -z "$(dedup_field "$id" superseded)" ] || continue
+      unit="$(dedup_field "$id" unit)"; nonce="$(dedup_field "$id" nonce)"
+      if [ -n "$unit" ]; then
+        st="$(unit_state "$unit")"
+        # a unit that is not positively inactive must carry THIS record's nonce, or the identity is not ours: refuse all
+        if [ "$st" != inactive ] && ! unit_has_nonce "$unit" "$nonce"; then
+          echo "refused: unit $unit does not carry the nonce of job $id; nothing was cancelled" >&2
+          exit 1
+        fi
+      fi
+      ids+=("$id"); units+=("$unit")
+    done
+    # PASS 2: every record validated; now mutate
+    local i
+    for i in "${!ids[@]}"; do
+      id="${ids[$i]}"; unit="${units[$i]}"
       dedup_set "$id" superseded "cancelled-by-submitter"
-      unit="$(dedup_field "$id" unit)"
-      if [ -n "$unit" ]; then "$SYSTEMCTL_BIN" stop "$unit" >/dev/null 2>&1 || true; fi
+      if [ -n "$unit" ] && unit_has_nonce "$unit" "$(dedup_field "$id" nonce)"; then
+        "$SYSTEMCTL_BIN" stop "$unit" >/dev/null 2>&1 || true
+      fi
       n=$((n + 1))
     done
     echo "cancelled $n job(s) for $repo ${head:0:12}"
   )
 }
-
-cmd_run() {
+cmd_run() {   # the ssh-attached parent: validate, stage the bundle, detach the worker, follow its log
   local profile="" repo="" head="" base="" tree="" bundle=0 shallow="" origin_main="" branch="" fwd_env=()
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -443,11 +864,21 @@ cmd_run() {
     esac
   done
   START_TS="$(date +%s)"; R_REPO="$repo"; R_HEAD="$head"; R_TREE="$tree"; R_PROFILE="$profile"
-  trap cleanup EXIT
+  # The ssh connection may drop at any point: this parent does not own the job. The job is detached and keeps
+  # running; its verdict goes to the root-owned result file. Only the worker runs cleanup.
+  trap '' HUP TERM INT
+  trap 'if [ "$WORKER_STARTED" != 1 ]; then [ -n "$BUNDLE_FILE" ] && rm -f -- "$BUNDLE_FILE"; [ -n "$JOB_ID" ] && state_remove "$JOB_ID"; fi' EXIT
   { safe_name "$repo" && safe_name "$profile"; } || refuse "bad repo/profile name"
   [[ "$head" =~ ^[0-9a-f]{40}$ && "$base" =~ ^[0-9a-f]{40}$ && "$tree" =~ ^[0-9a-f]{40}$ ]] || refuse "head/base/tree must be 40-hex"
+  [[ -z "$origin_main" || "$origin_main" =~ ^[0-9a-f]{40}$ ]] || refuse "bad --origin-main"
+  [[ -z "$shallow" || "$shallow" =~ ^[0-9a-f]{40}(,[0-9a-f]{40})*$ ]] || refuse "bad --shallow"
+  # a branch is a name the runner compares and records: validated here, before it is used anywhere
+  if [ -n "$branch" ]; then
+    [[ "$branch" =~ ^[A-Za-z0-9._/-]{1,200}$ && "$branch" != *..* ]] || refuse "bad branch name"
+  fi
   check_host || refuse "host $(hostname) is not the approved builder ($EXPECT_HOST)"
   [ -r "$PROFILE_DIR/$profile.sh" ] || refuse "no gate profile '$profile' in $PROFILE_DIR"
+  command -v "$SYSTEMD_RUN_BIN" >/dev/null 2>&1 || refuse "no $SYSTEMD_RUN_BIN: the gate's service unit is required"
   # GATE-QUEUE-1 / the scope key: every input that defines this verdict's scope is in ONE job key. A live job
   # with the same key is followed, never queued twice; anything that differs (even the base or an env flag) is a new job.
   local env_s; env_s="$(printf '%s\n' "${fwd_env[@]}" | sort | paste -sd, -)"
@@ -458,128 +889,338 @@ cmd_run() {
     [ "$bundle" = 1 ] && cat >/dev/null          # the live job already holds this head
     log "attached to live job $live_id (same scope key ${JOB_KEY:0:12}): following it, not queued again"
     follow_job "$(dedup_field "$live_id" pid)" "$JOBS_DIR/$live_id/log"
-    return "$(job_exit "$live_id")"
+    finish_job "$live_id" "attached job $live_id ended without a result"; return $?
   fi
   install -d -m 0700 "$RESULTS_DIR" 2>/dev/null || refuse "cannot create the results directory $RESULTS_DIR"
-  mkdir -p "$BASE_DIR/runs" "$BASE_DIR/repos" "$BASE_DIR/envs" "$BASE_DIR/wheels" "$BASE_DIR/queue" 2>/dev/null \
+  mkdir -p "$BASE_DIR/runs" "$BASE_DIR/repos" "$BASE_DIR/envs/$profile" "$BASE_DIR/wheels" "$BASE_DIR/queue" 2>/dev/null \
     || refuse "cannot create $BASE_DIR"
-  if [ -n "$RUN_AS" ]; then chown "$RUN_AS" "$BASE_DIR" "$BASE_DIR"/repos "$BASE_DIR"/envs "$BASE_DIR"/queue 2>/dev/null; fi
+  if [ -n "$RUN_AS" ]; then chown "$RUN_AS" "$BASE_DIR/repos" 2>/dev/null || refuse "cannot hand the object store to $RUN_AS"; fi
+  state_init || refuse "cannot create the root state directory $STATE_DIR"
+  bind_points
 
-  cmd_janitor >/dev/null 2>&1   # reap dead runs first so their space counts
+  cmd_janitor >/dev/null 2>&1   # housekeeping: stale queue entries, markers, staged bundles, expired keep-refs
   local free; free="$(disk_free_gib)"
   [ -n "$free" ] || refuse "cannot read disk usage for $BASE_DIR"
   [ "$free" -lt "$MIN_FREE_GIB" ] && refuse "disk free ${free}GiB < ${MIN_FREE_GIB}GiB floor — refusing to start"
 
+  # The limits are FIXED per profile, from the root-owned profile: never read from PR content.
   # shellcheck disable=SC1090
-  source "$PROFILE_DIR/$profile.sh" || refuse "profile $profile failed to load"
-  local cores mem; cores="$(profile_cores)"; mem="$(profile_mem_mb)"
+  local cores mem; { source "$PROFILE_DIR/$profile.sh"; } || refuse "profile $profile failed to load"
+  cores="$(profile_cores)"; mem="$(profile_mem_mb)"
+  [[ "$cores" =~ ^[0-9]+$ && "$mem" =~ ^[0-9]+$ ]] || refuse "profile $profile has no numeric limits"
 
-  local store; store="$(store_for "$repo")"
-  if [ ! -d "$store" ]; then as_gate git init -q --bare "$store" || refuse "cannot init object store"; fi
-  # A shallow dev-box clone cannot ship history past its boundary: record the
-  # boundary commits so the store (and every workspace) accepts the cut.
-  if [ -n "$shallow" ]; then
-    record_shallow "$store" "$shallow" || refuse "cannot record the shallow boundary in the store"
-  fi
-  if [ "$bundle" = 1 ]; then
-    local bf="$BASE_DIR/queue/in-$$.bundle"
-    cat > "$bf"
-    if [ -n "$branch" ]; then
-      bundle_binds "$bf" "$repo" "$branch" "$head" || refuse "bundle does not carry $repo branch $branch at $head"
-    fi
-    if [ -n "$RUN_AS" ]; then chown "$RUN_AS" "$bf"; fi
-    log "received bundle ($(du -h "$bf" | cut -f1))"
-    fetch_keep_refs "$store" "$bf" "$repo" "$branch" || { rm -f "$bf"; refuse "bundle fetch failed"; }
-    rm -f "$bf"
-  fi
-  local o
-  [[ -z "$origin_main" || "$origin_main" =~ ^[0-9a-f]{40}$ ]] || refuse "bad --origin-main"
-  for o in "$head" "$base" ${origin_main:+"$origin_main"}; do
-    as_gate git --git-dir="$store" cat-file -e "${o}^{commit}" 2>/dev/null || refuse "commit $o not in the store (ship a bundle)"
-  done
-  [ "$(as_gate git --git-dir="$store" rev-parse "${head}^{tree}")" = "$tree" ] || refuse "tree mismatch for $head"
+  # EARLY CAP: an over-cap submitter costs the host nothing, not even the bundle read (the worker re-checks under the lock).
+  [ "$(dedup_count_submitter "$SUBMITTER")" -lt "$PER_SUBMITTER_CAP" ] \
+    || refuse "submitter already holds $PER_SUBMITTER_CAP queued or running gates; wait for them"
 
-  # the job runs DETACHED: its output goes to its own log and this connection only tails it
   JOB_ID="$(date +%s%N)-$$"
   mkdir -p "$JOBS_DIR/$JOB_ID" && chmod 0755 "$JOBS_DIR/$JOB_ID" || refuse "cannot create the job directory"
   local job_log="$JOBS_DIR/$JOB_ID/log"; : > "$job_log"
   # the job log is readable by the submitter group only (0640); the verdict itself lives in the result file
   chmod 0640 "$job_log"; chgrp "${PNEUMA_GATE_SUBMIT_GROUP:-pneuma-submit}" "$job_log" 2>/dev/null || true
+
+  # BOUNDED ROOT-OWNED STAGING: the bundle is read here, capped, into the 0700 state directory (never a unit's view).
+  # This marker (held by this parent while it lives) keeps the janitor off the staged bundle until the worker takes over.
+  state_mark "$JOB_ID" "$$" "$cores" "$mem" queued "" "" || refuse "cannot record the job"
+  BUNDLE_FILE="$STATE_DIR/in/$JOB_ID.bundle"
+  if [ "$bundle" = 1 ]; then
+    head -c $((BUNDLE_MAX_MB * 1048576 + 1)) > "$BUNDLE_FILE"
+    [ "$(stat -c %s "$BUNDLE_FILE")" -le $((BUNDLE_MAX_MB * 1048576)) ] || refuse "bundle over ${BUNDLE_MAX_MB}MB"
+    chmod 0644 "$BUNDLE_FILE"
+    if [ -n "$branch" ]; then
+      bundle_binds "$BUNDLE_FILE" "$repo" "$branch" "$head" || refuse "bundle does not carry $repo branch $branch at $head"
+    fi
+    log "received bundle ($(du -h "$BUNDLE_FILE" | cut -f1))"
+  else
+    : > "$BUNDLE_FILE"; chmod 0644 "$BUNDLE_FILE"   # an empty bundle: the unit uses the store alone
+  fi
+
+  # the job runs DETACHED: its own process, its own log; this connection only tails that log
   ( run_job ) >>"$job_log" 2>&1 </dev/null &
   local worker=$!
+  WORKER_STARTED=1
   log "job $JOB_ID is running detached: a dropped connection no longer loses it"
   follow_job "$worker" "$job_log"
-  wait "$worker"; return $?
-
+  wait "$worker" 2>/dev/null || true
+  finish_job "$JOB_ID" "job $JOB_ID ended without a result"; return $?
 }
 
-run_job() {   # the detached worker: admission, workspace, the gate, the verdict (its stdout is its log)
-  WORKER_PID="$BASHPID"; DEDUP_ID="$JOB_ID"
+# attach_to_job <other id>: this job duplicates a live job with the same scope key (a concurrent identical submission
+# that lost the root lock). It takes that job's verdict; it never runs a second gate for the same scope.
+attach_to_job() {
+  local other="$1" ex
+  log "same scope key as live job $other: this job takes that job's verdict"
+  while [ "$(dedup_state "$other")" != dead ]; do sleep "$POLL_S"; done
+  ex="$(job_exit "$other")"
+  result "$ex" "same scope as job $other"
+  return "$ex"
+}
+
+run_job() {   # the detached worker: hold, promote, decide, admit, the gate, the verdict (its stdout is its log)
+  WORKER_PID="$BASHPID"
+  trap '' HUP                                   # the worker outlives the ssh connection
   trap cleanup EXIT
-  # the gate's unit is named after the job: pneuma-gate-<JOB_ID>
-  # Every run is recorded under its submitter (the fairness cap applies to all of them). Only a
-  # run with a branch has a key, and only a key ever supersedes: a detached run supersedes nothing.
-  if [ -n "$branch" ] && ! [[ "$branch" =~ ^[A-Za-z0-9._/-]{1,200}$ ]] || [[ "$branch" == *..* ]]; then
-    refuse "bad branch name"
-  fi
+  trap abandon TERM INT
+  RUN_ID="$JOB_ID"; DEDUP_ID="$JOB_ID"; UNIT="pneuma-gate-$RUN_ID"; RUN_NONCE="$(new_nonce)"
+  local store; store="$(store_for "$repo")"
   log "gate for ${repo:-?} branch ${branch:-(detached)} head ${head:0:12} submitter $SUBMITTER"
-  dedup_admit "$DEDUP_ID" "$store" "$repo" "$branch" "$head" "$SUBMITTER" "$JOB_KEY"
-  case $? in
+
+  # FIRST: the submitter's cap and the duplicate check, under the root lock, and the record of this run.
+  # Nothing below (the store, the loopback route, the promote unit) happens for an over-cap or duplicate submission.
+  local dup rc
+  dup="$(dedup_hold "$DEDUP_ID" "$repo" "$branch" "$head" "$SUBMITTER" "$WORKER_PID" "$RUN_NONCE" "$JOB_KEY")"; rc=$?
+  case $rc in
     0) ;;
-    2) refuse "submitter already holds $PER_SUBMITTER_CAP queued or running gates; wait for them";;
-    *) refuse "cannot record the gate";;
+    2) DEDUP_ID=""; refuse "submitter already holds $PER_SUBMITTER_CAP queued or running gates; wait for them";;
+    3) DEDUP_ID=""; attach_to_job "$dup"; return $?;;
+    *) DEDUP_ID=""; refuse "cannot record the gate";;
   esac
-  admit "$cores" "$mem"
 
-  # ── per-run workspace: its own .git, objects via alternates to the store ───
-  local work="$RUN_DIR/work"
-  as_gate bash -c '
-    set -e; cd "$1"; git init -q .; echo "$2/objects" > .git/objects/info/alternates
-    if [ -f "$2/shallow" ]; then cp "$2/shallow" .git/shallow; fi
-    git update-ref refs/gate/head "$3"; git update-ref refs/gate/base "$4"
-    # tests (e.g. the dead-SHA citation guard) resolve origin/main: give the
-    # workspace the same one the dev box had, never a guess.
-    if [ -n "$5" ]; then git update-ref refs/remotes/origin/main "$5"; fi
-    git -c advice.detachedHead=false checkout -q --detach "$3"' _ "$work" "$store" "$head" "$base" "$origin_main" \
-    || refuse "workspace checkout failed"
-  [ "$(as_gate git -C "$work" rev-parse 'HEAD^{tree}')" = "$tree" ] || refuse "workspace tree mismatch"
-  [ -z "$(as_gate git -C "$work" status --porcelain)" ] || refuse "workspace not clean after checkout"
-  # Optional profile hook: the scoping decision (diff size, selected services) at
-  # the top of the log, so a wrong selection is visible in every verdict.
-  if declare -F profile_scope_report >/dev/null; then
-    as_gate bash -c 'source "$1"; cd "$2"; profile_scope_report "$3" "$4"' _ \
-      "$PROFILE_DIR/$profile.sh" "$work" "$base" "$head" 2>&1 | sed 's/^/  scope: /' || true
+  if [ ! -d "$store" ]; then as_gate git init -q --bare "$store" || refuse "cannot init object store"; fi
+  # ISOLATED PROMOTION: the bundle and the shallow boundary enter the store only through the no-network promote unit.
+  # A failed promotion is a refusal, never ignored: the ancestry checks and the supersession below depend on it.
+  if [ "$bundle" = 1 ] || [ -n "$shallow" ]; then
+    promote_bundle "$store" "$BUNDLE_FILE" "$shallow" "$repo" "$branch" || refuse "bundle promotion failed"
   fi
+  local o
+  for o in "$head" "$base" ${origin_main:+"$origin_main"}; do
+    as_gate git --git-dir="$store" cat-file -e "${o}^{commit}" 2>/dev/null || refuse "commit $o not in the store (ship a bundle)"
+  done
+  [ "$(as_gate git --git-dir="$store" rev-parse "${head}^{tree}")" = "$tree" ] || refuse "tree mismatch for $head"
+  dedup_decide "$DEDUP_ID" "$store" "$repo" "$branch" "$head" "$SUBMITTER"
 
-  ENV_DIR=""
-  ensure_env "$profile" "$work"
+  # A queued marker (worker pid + start time) exists before capacity is taken; it holds nothing until admit() makes it admitted.
+  state_mark "$RUN_ID" "$WORKER_PID" "$cores" "$mem" queued "" "$RUN_NONCE" || refuse "cannot record the run"
+  # The run's own loopback address: claimed with `ip route add`, which fails if any other run holds it.
+  local loopback; loopback="$(loopback_claim "$RUN_ID")" || refuse "cannot claim a loopback address for the run"
+  LOOPBACK="$loopback"
+  state_mark "$RUN_ID" "$WORKER_PID" "$cores" "$mem" queued "$loopback" "$RUN_NONCE" || refuse "cannot record the run"
+  unit_props "$loopback" || refuse "cannot build the unit's properties (network allow list or write cap): see the message above"
+  admit "$cores" "$mem"   # reserves capacity (counted while this worker is alive); systemd creates the run's directories
 
-  # ── the gate itself, in a scrubbed environment (no ambient credentials) ────
-  local rc scope_bin="${PNEUMA_GATE_SYSTEMD_RUN:-systemd-run}"
-  if [ -n "$DEDUP_ID" ] && [ -n "$(dedup_field "$DEDUP_ID" superseded)" ]; then
-    result 75 "superseded by $(dedup_field "$DEDUP_ID" superseded)"; return 75
-  fi
-  # The gate runs as a transient UNIT named by this runner. A newer head cancels it by that
-  # name (systemctl stop); no pid is stored or signalled (GATE-DEDUP-1, pid reuse).
-  command -v "$scope_bin" >/dev/null 2>&1 || refuse "no $scope_bin: the gate's unit is required"
-  "$scope_bin" --unit="pneuma-gate-$DEDUP_ID" --wait --collect --quiet -- \
-    ${RUN_AS:+runuser -u "$RUN_AS" --} env -i PATH=/usr/local/bin:/usr/bin:/bin HOME="$RUN_DIR/home" TMPDIR="$RUN_DIR/tmp" LANG=C.UTF-8 \
-    PNEUMA_GATE_REMOTE_RUN=1 PNEUMA_GATE_RUN_DIR="$RUN_DIR" PNEUMA_GATE_CORES="$cores" "${fwd_env[@]}" \
-    bash -c 'source "$1"; cd "$2"; shift 2; profile_gate "$@"' _ \
-    "$PROFILE_DIR/$profile.sh" "$work" "$ENV_DIR" "$head" "$base" "$GATE_TIMEOUT_S" 2>&1
-  rc=$?
-  # the unit's output went to the journal under its unit name: keep it in this verdict's log
-  "${JOURNALCTL_BIN:-journalctl}" -u "pneuma-gate-$DEDUP_ID.service" --no-pager -o cat 2>/dev/null | sed 's/^/  gate: /' || true
-  if [ -n "$DEDUP_ID" ] && [ -n "$(dedup_field "$DEDUP_ID" superseded)" ]; then
+  local rc_unit run_dir="$RUN_ROOT/$RUN_ID" work_dir="$UNIT_WORK/$RUN_ID"
+  ABORT_FLAG="$STATE_DIR/abort-$RUN_ID"
+  disk_guard "$UNIT" "$ABORT_FLAG" & GUARD_PID=$!
+  log "launching unit $UNIT (cores=$cores mem=${mem}MB timeout=${GATE_TIMEOUT_S}s)"
+  # The unit's stdout is the log; every line is prefixed so PR code cannot print a fake verdict
+  # marker. Its exit status is the verdict. fd 9 (the admission lock) is not open here.
+  "$SYSTEMD_RUN_BIN" --unit="$UNIT" --wait --collect --pipe --quiet "${SANDBOX_PROPS[@]}" "${UNIT_PROPS[@]}" \
+    --property=MemoryMax="${mem}M" --property=CPUQuota="$((cores * 100))%" --property=TasksMax=512 \
+    --property=RuntimeMaxSec="$GATE_TIMEOUT_S" \
+    --property=RuntimeDirectory="pneuma-gate/$RUN_ID" --property=RuntimeDirectoryMode=0700 \
+    --property=BindReadOnlyPaths="$BUNDLE_FILE:$IN_MOUNT/bundle" \
+    --property=BindReadOnlyPaths="$store:$IN_MOUNT/store" \
+    --property=BindReadOnlyPaths="$BASE_DIR/envs/$profile:$ENVS_MOUNT" \
+    --property=BindReadOnlyPaths="$BASE_DIR/wheels:$WHEELS_MOUNT" -- \
+    env -i PATH="$UNIT_PATH" LANG=C.UTF-8 PNEUMA_GATE_REMOTE_RUN=1 \
+      PNEUMA_GATE_RUN_DIR="$run_dir" PNEUMA_GATE_WORK_DIR="$work_dir" \
+      PNEUMA_GATE_PROFILE_DIR="$PROFILE_DIR" PNEUMA_GATE_IN_MOUNT="$IN_MOUNT" \
+      PNEUMA_GATE_ENVS_MOUNT="$ENVS_MOUNT" PNEUMA_GATE_WHEELS_MOUNT="$WHEELS_MOUNT" \
+      PNEUMA_GATE_CORES="$cores" PNEUMA_GATE_LOOPBACK="$loopback" PNEUMA_GATE_NONCE="$RUN_NONCE" "${fwd_env[@]}" \
+    "$SELF" unit --profile "$profile" --head "$head" --base "$base" --tree "$tree" \
+      --origin-main "$origin_main" --shallow "$shallow" --timeout "$GATE_TIMEOUT_S" \
+      9>&- </dev/null 2>&1 | sed -u 's/^/  gate: /'
+  rc_unit="${PIPESTATUS[0]}"
+  kill "$GUARD_PID" 2>/dev/null; GUARD_PID=""
+  if [ -n "$(dedup_field "$DEDUP_ID" superseded)" ]; then
     log "gate superseded by $(dedup_field "$DEDUP_ID" superseded): verdict discarded"
     result 75 "superseded by $(dedup_field "$DEDUP_ID" superseded)"; return 75
-  fi
-  if [ "$rc" -eq 0 ]; then
+  elif [ -e "$ABORT_FLAG" ]; then
+    log "gate stopped: builder free space fell below ${ABORT_FREE_GIB}GiB"; result 75 "builder disk low"; return 75
+  elif [ "$rc_unit" -eq 0 ]; then
     log "gate GREEN"; result 0; return 0
-  elif [ "$rc" -eq 124 ]; then
-    log "gate TIMED OUT after ${GATE_TIMEOUT_S}s"; result 75 "gate timeout"; return 75
+  elif [ "$rc_unit" -eq 75 ]; then
+    log "gate did not reach a verdict (infrastructure)"; result 75 "no verdict from the gate unit"; return 75
   fi
-  log "gate RED (exit $rc)"; result 1; return 1
+  log "gate RED (exit $rc_unit)"; result 1; return 1
+}
+
+# ── inside the gate's unit ───────────────────────────────────────────────────
+# Everything below runs as the run's DynamicUser, in the sandbox, in the unit's cgroup. It trusts
+# nothing but the profile (root-owned): the bundle, the checkout and every script in it are PR
+# content, and they run only here.
+unit_checkout() {   # <work> <head> <base> <tree> <origin_main> <shallow>: builds $work/ws
+  local work="$1" head="$2" base="$3" tree="$4" om="$5" shallow="$6" store="$IN_MOUNT/store" o ws="$1/ws"
+  mkdir -p "$ws" && git -C "$ws" init -q . || return 1
+  echo "$store/objects" > "$ws/.git/objects/info/alternates"
+  { cat "$store/shallow" 2>/dev/null; tr ',' '\n' <<<"$shallow" | grep -E '^[0-9a-f]{40}$'; } | sort -u > "$ws/.git/shallow"
+  [ -s "$ws/.git/shallow" ] || rm -f "$ws/.git/shallow"
+  if [ -s "$IN_MOUNT/bundle" ]; then
+    git -C "$ws" fetch -q "$IN_MOUNT/bundle" "refs/pneuma-gate/*:refs/gate-keep/*" 2>&1 | sed 's/^/  fetch: /'
+    [ "${PIPESTATUS[0]}" -eq 0 ] || { echo "bundle fetch failed"; return 75; }
+  fi
+  for o in "$head" "$base" ${om:+"$om"}; do
+    git -C "$ws" cat-file -e "${o}^{commit}" 2>/dev/null || { echo "commit $o not in the store (ship a bundle)"; return 75; }
+  done
+  [ "$(git -C "$ws" rev-parse "${head}^{tree}")" = "$tree" ] || { echo "tree mismatch for $head"; return 75; }
+  git -C "$ws" update-ref refs/gate/head "$head" && git -C "$ws" update-ref refs/gate/base "$base" || return 1
+  # tests (e.g. the dead-SHA citation guard) resolve origin/main: give the workspace the same
+  # one the dev box had, never a guess.
+  if [ -n "$om" ]; then git -C "$ws" update-ref refs/remotes/origin/main "$om"; fi
+  git -C "$ws" -c advice.detachedHead=false checkout -q --detach "$head" || return 1
+  [ "$(git -C "$ws" rev-parse 'HEAD^{tree}')" = "$tree" ] || { echo "workspace tree mismatch"; return 75; }
+  [ -z "$(git -C "$ws" status --porcelain)" ] || { echo "workspace not clean after checkout"; return 75; }
+}
+
+# The dependency env: a hit is the immutable cache (read-only mount); a miss is built here, in
+# this unit's cgroup and private disk, and used by this run only (never published from a run).
+unit_env() {   # <ws> <work> <profile> → sets ENV_DIR
+  local ws="$1" work="$2" profile="$3" key
+  key="$(cd "$ws" && profile_env_key)" || { echo "profile_env_key failed"; return 75; }
+  safe_name "$key" || { echo "bad environment key"; return 75; }
+  if [ -e "$ENVS_MOUNT/$key/.ready" ]; then
+    ENV_DIR="$ENVS_MOUNT/$key"; echo "environment $profile/$key ready (read-only shared cache)"; return 0
+  fi
+  ENV_DIR="$work/env/$key"
+  echo "environment $profile/$key not cached — building it in this unit (not published)"
+  ( cd "$ws" && PNEUMA_GATE_WHEELS="$WHEELS_MOUNT" profile_env_build "$ENV_DIR" ) 2>&1 | sed -u 's/^/  env-build: /'
+  local rc="${PIPESTATUS[0]}"
+  [ "$rc" -eq 0 ] || { echo "environment build failed (rc=$rc)"; [ "$rc" -eq 75 ] && return 75; return 1; }
+  touch "$ENV_DIR/.ready"
+}
+
+cmd_unit() {
+  local profile="" head="" base="" tree="" om="" shallow="" timeout_s=5400
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --profile) profile="$2"; shift 2;; --head) head="$2"; shift 2;; --base) base="$2"; shift 2;;
+      --tree) tree="$2"; shift 2;; --origin-main) om="$2"; shift 2;; --shallow) shallow="$2"; shift 2;;
+      --timeout) timeout_s="$2"; shift 2;; *) echo "unknown arg $1"; return 75;;
+    esac
+  done
+  local run_dir="${PNEUMA_GATE_RUN_DIR:?}" work="${PNEUMA_GATE_WORK_DIR:?}"
+  export HOME="$work/home" TMPDIR="$work/tmp"
+  mkdir -p "$HOME" "$TMPDIR" "$run_dir" || return 75
+  # shellcheck disable=SC1090
+  source "$PROFILE_DIR/$profile.sh" || { echo "profile $profile failed to load"; return 75; }
+  unit_checkout "$work" "$head" "$base" "$tree" "$om" "$shallow" || return $?
+  # Optional profile hook: the scoping decision (diff size, selected services) at the top of the log,
+  # so a wrong selection is visible in every verdict. It runs here, in the sandbox, with the PR's code.
+  if declare -F profile_scope_report >/dev/null; then
+    ( cd "$work/ws" && profile_scope_report "$base" "$head" ) 2>&1 | sed -u 's/^/  scope: /' || true
+  fi
+  ENV_DIR=""
+  unit_env "$work/ws" "$work" "$profile" || return $?
+  cd "$work/ws" || return 75
+  profile_gate "$ENV_DIR" "$head" "$base" "$timeout_s"
+}
+
+# The bundle into the object store, inside the store owner's sandbox (no network). The shallow
+# boundary of a shallow dev-box clone is recorded first, so the fetch accepts the cut.
+cmd_promote() {   # inside the sandboxed promote unit (store owner, no network): shallow boundary, then the bundle's keep refs
+  local store="" bundle="" shallow="" repo="" branch=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --store) store="$2"; shift 2;; --bundle) bundle="$2"; shift 2;; --shallow) shallow="$2"; shift 2;;
+      --repo) repo="$2"; shift 2;; --branch) branch="$2"; shift 2;;
+      *) return 2;;
+    esac
+  done
+  RUN_AS=""   # already the store owner inside this unit: the store helpers must not runuser again
+  exec 7>"$store/.promote.lock" && flock 7 || return 1
+  if [ -n "$shallow" ]; then record_shallow "$store" "$shallow" || return 1; fi
+  if [ -s "$bundle" ]; then fetch_keep_refs "$store" "$bundle" "$repo" "$branch" || return 1; fi
+  return 0
+}
+
+# ── warm-env: the only way an env reaches the shared cache ───────────────────
+# A PR's own run never publishes (its tests could tamper with the env after the build). The
+# operator builds the env for a TRUSTED ref (origin/main) in a sandboxed unit with the same
+# limits, then root freezes it into the read-only cache. Proto wheels are staged here as root
+# from a version string this runner validated (no PR code ever runs as root).
+slot_uids() { find "$1" -printf '%U\n' 2>/dev/null | sort -u; }
+slot_owned_by_one_dynamic_uid() {  # <slot>
+  local u; u="$(slot_uids "$1")"
+  [ "$(grep -c . <<<"$u")" = 1 ] && [[ "$u" =~ ^[0-9]+$ ]] && [ "$u" -ge "${PNEUMA_GATE_DYNAMIC_UID_MIN:-61184}" ] && [ "$u" -le "${PNEUMA_GATE_DYNAMIC_UID_MAX:-65519}" ]
+}
+cmd_warm_env() {
+  local profile="" repo="" ref=""
+  while [ $# -gt 0 ]; do
+    case "$1" in --profile) profile="$2"; shift 2;; --repo) repo="$2"; shift 2;; --ref) ref="$2"; shift 2;; *) return 2;; esac
+  done
+  { safe_name "$repo" && safe_name "$profile"; } || { echo "bad repo/profile" >&2; return 2; }
+  [[ "$ref" =~ ^[0-9a-f]{40}$ ]] || { echo "--ref must be a 40-hex commit" >&2; return 2; }
+  check_host || { echo "not the approved builder" >&2; return 75; }
+  # shellcheck disable=SC1090
+  source "$PROFILE_DIR/$profile.sh" || return 75
+  local store; store="$(store_for "$repo")"
+  as_gate git --git-dir="$store" cat-file -e "${ref}^{commit}" 2>/dev/null || { echo "$ref is not in the store" >&2; return 75; }
+  state_init || return 75
+  bind_points
+  local id="warm-$(date +%Y%m%dT%H%M%S)-$$" cores mem
+  cores="$(profile_cores)"; mem="$(profile_mem_mb)"
+  local out key tag
+  out="$(warm_unit "$id-key" "$store" "$profile" "$ref" "$cores" "$mem" key "" 2>&1)" || { printf '%s\n' "$out" >&2; return 75; }
+  key="$(sed -n 's/^WARM_KEY=//p' <<<"$out" | tail -1)"; tag="$(sed -n 's/^WARM_TAG=//p' <<<"$out" | tail -1)"
+  safe_name "$key" || { echo "bad key from the unit" >&2; return 75; }
+  if [ -e "$BASE_DIR/envs/$profile/$key/.ready" ]; then echo "environment $profile/$key is already published"; return 0; fi
+  if [ -n "$tag" ]; then
+    [[ "$tag" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "refusing proto tag '$tag'" >&2; return 75; }
+    if declare -F profile_stage_root >/dev/null; then profile_stage_root "$BASE_DIR" "$tag" || return 75; fi
+  fi
+  local slot="$BASE_DIR/envs/$profile/.slot-$id"
+  # root-owned 0700 until the build unit starts; the unit's own start hands it to the dynamic uid
+  # (ExecStartPre, see warm_unit), so no other local user can write into it before the freeze
+  mkdir -p "$slot" && chmod 0700 "$slot" || return 75
+  if ! warm_unit "$id-build" "$store" "$profile" "$ref" "$cores" "$mem" build "$slot:$ENVS_MOUNT/$key"; then
+    rm -rf --one-file-system "$slot"; echo "environment build failed" >&2; return 75
+  fi
+  # The slot must still belong to the ONE dynamic uid the build unit ran as: a path of another uid means the
+  # uid was recycled, or something else wrote here, and the build is not frozen into the shared cache.
+  slot_owned_by_one_dynamic_uid "$slot" || { rm -rf --one-file-system "$slot"; echo "the build slot is not owned by one dynamic uid: refusing to publish" >&2; return 75; }
+  # Freeze: root-owned, read-only, .ready written last; renamed into place atomically.
+  chown -R root:root "$slot" && touch "$slot/.ready" && chmod -R a-w,a+rX "$slot" && mv "$slot" "$BASE_DIR/envs/$profile/$key" \
+    || { rm -rf --one-file-system "$slot"; return 75; }
+  echo "published environment $profile/$key"
+}
+
+warm_unit() {   # <id> <store> <profile> <ref> <cores> <mem> <key|build> <slot bind or empty>
+  local id="$1" store="$2" profile="$3" ref="$4" cores="$5" mem="$6" mode="$7" slot="$8" binds=() lo
+  lo="$(loopback_claim "$id")" || return 75
+  local nonce; nonce="$(new_nonce)"
+  # Identity audit (VM17 third pass): this warm marker is STATE only. It takes no dedup record, no queue ticket and no
+  # capacity (live_runs skips state=warm), so the worker-pid rule of the gate path does not apply. Its pid is the
+  # warm-env process that holds it: $$ inside warm_unit's $(...) capture still names that process, and state_mark records
+  # its start time beside it. BASHPID would name the short-lived capture subshell, which is the wrong holder.
+  state_mark "$id" "$$" 0 0 warm "$lo" "$nonce" || { loopback_down "$lo"; return 75; }
+  unit_props "$lo" || { loopback_down "$lo"; state_remove "$id"; return 75; }
+  [ -n "$slot" ] && binds=(--property=BindPaths="$slot" --property=ExecStartPre="+$(command -v chown) --reference=$RUN_ROOT/$id ${slot#*:}")
+  "$SYSTEMD_RUN_BIN" --unit="pneuma-warm-$id" --wait --collect --pipe --quiet "${SANDBOX_PROPS[@]}" "${UNIT_PROPS[@]}" \
+    --property=MemoryMax="${mem}M" --property=CPUQuota="$((cores * 100))%" --property=TasksMax=512 \
+    --property=RuntimeMaxSec="$GATE_TIMEOUT_S" \
+    --property=RuntimeDirectory="pneuma-gate/$id" --property=RuntimeDirectoryMode=0700 \
+    --property=BindReadOnlyPaths="$store:$IN_MOUNT/store" \
+    --property=BindReadOnlyPaths="$BASE_DIR/wheels:$WHEELS_MOUNT" "${binds[@]}" -- \
+    env -i PATH="$UNIT_PATH" LANG=C.UTF-8 PNEUMA_GATE_RUN_DIR="$RUN_ROOT/$id" PNEUMA_GATE_WORK_DIR="$UNIT_WORK/$id" \
+      PNEUMA_GATE_PROFILE_DIR="$PROFILE_DIR" PNEUMA_GATE_IN_MOUNT="$IN_MOUNT" PNEUMA_GATE_ENVS_MOUNT="$ENVS_MOUNT" \
+      PNEUMA_GATE_WHEELS_MOUNT="$WHEELS_MOUNT" PNEUMA_GATE_LOOPBACK="$lo" PNEUMA_GATE_NONCE="$nonce" \
+    "$SELF" warm-unit "$mode" --profile "$profile" --ref "$ref" </dev/null
+  local rc=$?
+  # release the address and the reservation only once the unit is positively gone
+  if [ "$(unit_state "pneuma-warm-$id.service")" = inactive ]; then loopback_down "$lo"; state_remove "$id"; fi
+  return "$rc"
+}
+
+cmd_warm_unit() {   # inside a pneuma-warm unit
+  local mode="$1"; shift
+  local profile="" ref=""
+  while [ $# -gt 0 ]; do
+    case "$1" in --profile) profile="$2"; shift 2;; --ref) ref="$2"; shift 2;; *) return 75;; esac
+  done
+  local work="${PNEUMA_GATE_WORK_DIR:?}"
+  export HOME="$work/home" TMPDIR="$work/tmp"; mkdir -p "$HOME" "$TMPDIR" || return 75
+  # shellcheck disable=SC1090
+  source "$PROFILE_DIR/$profile.sh" || return 75
+  local tree; tree="$(git --git-dir="$IN_MOUNT/store" rev-parse "${ref}^{tree}")" || return 75
+  unit_checkout "$work" "$ref" "$ref" "$tree" "" "" || return 75
+  local key; key="$(cd "$work/ws" && profile_env_key)" || return 75
+  safe_name "$key" || return 75
+  if [ "$mode" = key ]; then
+    echo "WARM_KEY=$key"
+    if declare -F profile_wheels_tag >/dev/null; then echo "WARM_TAG=$(cd "$work/ws" && profile_wheels_tag)"; fi
+    return 0
+  fi
+  ( cd "$work/ws" && PNEUMA_GATE_WHEELS="$WHEELS_MOUNT" profile_env_build "$ENVS_MOUNT/$key" )
 }
 
 main() {
@@ -590,8 +1231,15 @@ main() {
   if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != pneuma-submit ]; then
     echo "pneuma-gate-runner: refused: elevation by '$SUDO_USER' (only pneuma-submit may run the gate)" >&2; exit 75
   fi
+  # ...and a submitter that got here through sudo may only run the verbs the sudoers rule names. The internal
+  # verbs (unit, promote, warm-unit) and the operator verbs (janitor, guard, warm-env) are never a submitter's.
+  if [ -n "${SUDO_USER:-}" ]; then
+    case "$sub" in
+      have|run|cancel|status) ;;
+      *) echo "pneuma-gate-runner: refused: verb '$sub' is not available through the submit path" >&2; exit 75;;
+    esac
+  fi
   # `--submitter <id>` is placed by pneuma-gate-entry (sshd's forced command), never by a client.
-  SUBMITTER=""
   if [ "${1:-}" = --submitter ]; then SUBMITTER="${2:-}"; shift 2; fi
   case "$sub" in
     have) cmd_have "$@";;
@@ -600,7 +1248,12 @@ main() {
     cancel) [[ "$SUBMITTER" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] || refuse_noid; cmd_cancel "$@"; exit $?;;
     status) cmd_status;;
     janitor) cmd_janitor;;
-    *) echo "usage: pneuma-gate-runner {have|run|cancel|status|janitor}" >&2; exit 2;;
+    guard) cmd_guard;;
+    unit) cmd_unit "$@"; exit $?;;
+    promote) cmd_promote "$@"; exit $?;;
+    warm-env) cmd_warm_env "$@"; exit $?;;
+    warm-unit) cmd_warm_unit "$@"; exit $?;;
+    *) echo "usage: pneuma-gate-runner {have|run|cancel|status|janitor|guard|warm-env}" >&2; exit 2;;
   esac
 }
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then main "$@"; fi
