@@ -25,6 +25,8 @@ DROPIN=/etc/ssh/sshd_config.d/50-pneuma-submit.conf
 SUDOERS=/etc/sudoers.d/pneuma-submit
 ENTRY=/usr/local/bin/pneuma-gate-entry
 RUNNER=/usr/local/bin/pneuma-gate-runner
+HOME_T=/var/lib/pneuma-submit        # the canonical submitter home (the installer's SUBMIT_HOME)
+INSTALLER=/src/host/pneuma-submit-install.sh   # the installer under test; mutation proofs point it at a copy
 fails=0
 pass() { echo "ok   $1"; }
 bad() { echo "FAIL $1"; fails=$((fails+1)); }
@@ -33,7 +35,7 @@ expect() { if "$@"; then :; else return 1; fi; }
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq >/dev/null 2>&1
 apt-get install -y -qq sudo openssh-server rsync >/dev/null 2>&1 || { echo "FAIL apt install"; exit 1; }
-id pneuma-submit >/dev/null 2>&1 || useradd --system --create-home --shell /bin/bash pneuma-submit
+id pneuma-submit >/dev/null 2>&1 || useradd --system --create-home --home-dir "$HOME_T" --shell /bin/bash pneuma-submit
 useradd -m -s /bin/bash dean-test >/dev/null 2>&1 || true
 ssh-keygen -A >/dev/null 2>&1
 grep -q '^Include /etc/ssh/sshd_config.d/' /etc/ssh/sshd_config || { echo "FAIL sshd_config does not Include sshd_config.d"; exit 1; }
@@ -85,7 +87,7 @@ absent_all() { [ ! -e "$ENTRY" ] && [ ! -e "$KEYS" ] && [ ! -e "$DROPIN" ] && [ 
 # a stage like the real one: root 0700 staging dir with the entry, the installer and the keys file
 new_stage() {
   local s; s="$(mktemp -d /var/lib/pneuma-gate-install-test/stage.XXXXXX)"; chmod 0700 "$s"
-  cp /src/bin/pneuma-gate-entry "$s/"; cp "$INST_SRC" "$s/pneuma-submit-install.sh"
+  cp /src/bin/pneuma-gate-entry "$s/"; cp "$INSTALLER" "$s/pneuma-submit-install.sh"
   printf '%s\n' "$s"
 }
 run_install() { # stage, [PATH prefix]; output to $LOG
@@ -235,6 +237,134 @@ if [ "$rc" = 0 ] && id pneuma-submit >/dev/null 2>&1 && [ "$(getent passwd pneum
   pass "S17 the installer creates the missing pneuma-submit account (rc 0)"
 else bad "S17 rc=$rc account: $(id pneuma-submit 2>&1) log: $(tail -2 "$LOG")"; fi
 rm -rf "$s"
+
+# S18: an existing account with a USABLE password is refused before any live change
+echo 'pneuma-submit:not-a-real-password' | chpasswd
+seed_old; s="$(new_stage)"; printf 'dean-devbox %s submit-test\n' "$KEY1" > "$s/gate-submit-keys"
+run_install "$s"; rc=$?
+if [ "$rc" != 0 ] && old_intact; then pass "S18 an existing account with a usable password is refused, live state unchanged (rc $rc)"
+else bad "S18 rc=$rc old_intact=$(old_intact && echo y || echo n) log: $(tail -1 "$LOG")"; fi
+rm -rf "$s"
+
+# S19: a locked account (password locked) is accepted; the home is then root-owned
+passwd -l pneuma-submit >/dev/null 2>&1
+seed_old; s="$(new_stage)"; printf 'dean-devbox %s submit-test\n' "$KEY1" > "$s/gate-submit-keys"
+run_install "$s"; rc=$?
+submit_home="$(getent passwd pneuma-submit | cut -d: -f6)"
+if [ "$rc" = 0 ] && [ "$(stat -c %U "$submit_home")" = root ]; then pass "S19 a locked account is accepted and its home is root-owned (rc 0)"
+else bad "S19 rc=$rc home=$(stat -c %U "$submit_home" 2>&1) log: $(tail -1 "$LOG")"; fi
+rm -rf "$s"
+
+# S20: an account with an EXTRA group (sudo) is refused before any live change
+usermod -aG sudo pneuma-submit
+seed_old; s="$(new_stage)"; printf 'dean-devbox %s submit-test\n' "$KEY1" > "$s/gate-submit-keys"
+run_install "$s"; rc=$?
+if [ "$rc" != 0 ] && old_intact; then pass "S20 an account with an extra group is refused, live state unchanged (rc $rc)"
+else bad "S20 rc=$rc log: $(tail -1 "$LOG")"; fi
+rm -rf "$s"
+gpasswd -d pneuma-submit sudo >/dev/null 2>&1
+
+# ------------------------------------------------------------------ canonical-home guards (S21-S25)
+# snap: type/owner/mode/size/inode/ctime of every live target and of each extra path, walked trees, content hashes
+# and the submitter passwd entry. Equal before and after = nothing was chowned, chmodded, renamed or written.
+snap() {
+  local p
+  for p in "$ENTRY" "$KEYS" "$DROPIN" "$SUDOERS" "$@"; do
+    if [ -e "$p" ] || [ -L "$p" ]; then
+      stat -c '%n|%F|%U:%G|%a|%s|%i|%z' -- "$p"
+      if [ -d "$p" ] && [ ! -L "$p" ]; then
+        find "$p" -mindepth 1 -printf '%p|%y|%u:%g|%m|%s|%i|%C@|%l\n'
+        find "$p" -mindepth 1 -type f -exec sha256sum {} +
+      elif [ -f "$p" ]; then sha256sum -- "$p"; fi
+    else echo "$p|absent"; fi
+  done
+  getent passwd pneuma-submit
+}
+VICTIM_HOME=/var/lib/pneuma-victim-home
+make_victim() { mkdir -p "$VICTIM_HOME" && printf 'VICTIM\n' > "$VICTIM_HOME/keep" && ln -sf /root/victim.txt "$VICTIM_HOME/link" \
+  && chown -R dean-test:dean-test "$VICTIM_HOME" && chmod 0750 "$VICTIM_HOME"; }
+
+# Each case returns 0 only when the named guard fired (its message in the log), the live state is OLD and every
+# watched path is byte- and metadata-identical before and after. They return status only, so mutation proofs can
+# reuse them without counting results.
+case_wrong_home() { # account exists with an UNRELATED real home: refused by the passwd-home guard
+  local before after rc ok=0
+  make_victim || return 1
+  usermod -d "$VICTIM_HOME" pneuma-submit || return 1
+  seed_old; local s; s="$(new_stage)"; keys_ok "$s"
+  before="$(snap "$VICTIM_HOME" "$HOME_T" /root/victim.txt)"
+  run_install "$s" "" ; rc=$?
+  after="$(snap "$VICTIM_HOME" "$HOME_T" /root/victim.txt)"
+  [ "$rc" != 0 ] && grep -q 'pneuma-submit home is ' "$LOG" && old_intact && [ "$before" = "$after" ] && ok=1
+  usermod -d "$HOME_T" pneuma-submit; rm -rf "$s" "$VICTIM_HOME"
+  [ "$ok" = 1 ]
+}
+case_symlink_home() { # account exists, canonical home is a SYMLINK to an unrelated dir: refused before any chown
+  local before after rc ok=0
+  make_victim || return 1
+  mv "$HOME_T" "$HOME_T.real" && ln -s "$VICTIM_HOME" "$HOME_T" || return 1
+  seed_old; local s; s="$(new_stage)"; keys_ok "$s"
+  before="$(snap "$VICTIM_HOME" "$HOME_T" /root/victim.txt)"
+  run_install "$s"; rc=$?
+  after="$(snap "$VICTIM_HOME" "$HOME_T" /root/victim.txt)"
+  [ "$rc" != 0 ] && grep -q 'existing pneuma-submit home' "$LOG" && old_intact && [ "$before" = "$after" ] && ok=1
+  rm -f "$HOME_T"; mv "$HOME_T.real" "$HOME_T"; rm -rf "$s" "$VICTIM_HOME"
+  [ "$ok" = 1 ]
+}
+case_noacct_bad_home() { # $1 = symlink|file: no account yet, canonical path is a wrong-type entry: refused, no account made
+  local before after rc ok=0
+  make_victim || return 1
+  userdel pneuma-submit >/dev/null 2>&1; rm -rf "$HOME_T"
+  if [ "$1" = symlink ]; then ln -s "$VICTIM_HOME" "$HOME_T"; else printf 'NOT-A-DIR\n' > "$HOME_T"; fi
+  seed_old; local s; s="$(new_stage)"; keys_ok "$s"
+  before="$(snap "$VICTIM_HOME" "$HOME_T" /root/victim.txt)"
+  run_install "$s"; rc=$?
+  after="$(snap "$VICTIM_HOME" "$HOME_T" /root/victim.txt)"
+  ! id pneuma-submit >/dev/null 2>&1 && [ "$rc" != 0 ] && grep -q 'before the account is created' "$LOG" \
+    && old_intact && [ "$before" = "$after" ] && ok=1
+  rm -f "$HOME_T"; rm -rf "$s" "$VICTIM_HOME"
+  [ "$ok" = 1 ]
+}
+case_noacct_real_dir() { # no account, canonical path is a real directory: accepted, account made at the canonical home
+  local rc
+  userdel pneuma-submit >/dev/null 2>&1; rm -rf "$HOME_T"; mkdir "$HOME_T" && chown dean-test:dean-test "$HOME_T" || return 1
+  seed_old; local s; s="$(new_stage)"; printf 'dean-devbox %s submit-test\n' "$KEY1" > "$s/gate-submit-keys"
+  run_install "$s"; rc=$?
+  rm -rf "$s"
+  [ "$rc" = 0 ] && [ "$(getent passwd pneuma-submit | cut -d: -f6)" = "$HOME_T" ] && [ -d "$HOME_T" ] && [ ! -L "$HOME_T" ] \
+    && [ "$(stat -c '%U:%a' "$HOME_T")" = root:755 ]
+}
+
+if case_wrong_home; then pass "S21 account with a wrong passwd home refused, live state and victim home unchanged"
+else bad "S21 wrong passwd home not refused or changed state (log: $(tail -1 "$LOG"))"; fi
+if case_symlink_home; then pass "S22 canonical home that is a symlink (account exists) refused, nothing followed"
+else bad "S22 canonical symlink home not refused or followed (log: $(tail -1 "$LOG"))"; fi
+if case_noacct_bad_home symlink; then pass "S23 canonical symlink with no account refused before account creation"
+else bad "S23 canonical symlink (no account) not refused (log: $(tail -1 "$LOG"))"; fi
+if case_noacct_bad_home file; then pass "S24 canonical regular file with no account refused before account creation"
+else bad "S24 canonical file (no account) not refused (log: $(tail -1 "$LOG"))"; fi
+if case_noacct_real_dir; then pass "S25 canonical real directory accepted; account created at canonical home (root 0755)"
+else bad "S25 canonical real directory positive path failed (log: $(tail -1 "$LOG"))"; fi
+
+# ------------------------------------------------------------------ mutation proofs (S26+)
+# A mutated COPY of the installer (in a temp dir this run creates) must make its case FAIL. The copy replaces one
+# guard's die() with a no-op. The live installer is never edited; the copy is removed afterwards.
+mutate() { # name, guard-die-text-OLD, NEW, case-function, [arg]
+  local name="$1" old="$2" new="$3" fn="$4" arg="${5:-}" m body mutated
+  m="$(mktemp -d /var/lib/pneuma-gate-install-test/mut.XXXXXX)"
+  body="$(cat "$INST_SRC")"; mutated="${body/"$old"/"$new"}"
+  if [ "$mutated" = "$body" ]; then bad "$name mutation text not found in installer"; rm -rf "$m"; return; fi
+  printf '%s\n' "$mutated" > "$m/pneuma-submit-install.sh"
+  INSTALLER="$m/pneuma-submit-install.sh"
+  if $fn $arg; then bad "$name: case still passes with the guard removed (guard not proven)"
+  else pass "$name: removing the guard makes its case fail"; fi
+  INSTALLER="$INST_SRC"
+  rm -rf "$m"
+}
+mutate "S26 mutation (passwd-home guard)" '|| die "pneuma-submit home is ' '|| : "pneuma-submit home is ' case_wrong_home
+mutate "S27 mutation (account real-dir guard)" '|| die "existing pneuma-submit home' '|| : "existing pneuma-submit home' case_symlink_home
+mutate "S28 mutation (pre-account wrong-type guard, symlink)" '|| die "$SUBMIT_HOME exists and is not' '|| : "$SUBMIT_HOME exists and is not' case_noacct_bad_home symlink
+mutate "S29 mutation (pre-account wrong-type guard, file)" '|| die "$SUBMIT_HOME exists and is not' '|| : "$SUBMIT_HOME exists and is not' case_noacct_bad_home file
 
 # ------------------------------------------------------------------ report
 if [ "$fails" = 0 ]; then echo "submit-install: all scenarios passed"; exit 0; fi
