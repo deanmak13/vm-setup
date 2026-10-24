@@ -33,8 +33,12 @@
 
 set -uo pipefail
 
-BIN=/usr/local/bin/dev-box-disk-hygiene
-MARKER=/run/dev-box-disk-low
+# DBDH_ROOT rebases every filesystem path and skips the root check. Only the
+# test suite sets it; production leaves it empty.
+ROOT_PREFIX=${DBDH_ROOT:-}
+BIN=$ROOT_PREFIX/usr/local/bin/dev-box-disk-hygiene
+MARKER=$ROOT_PREFIX/run/dev-box-disk-low
+UNIT_DIR=$ROOT_PREFIX/etc/systemd/system
 TAG=dev-box-disk-hygiene
 GUARD_PRUNE_BELOW=15   # root free % that triggers a WARNING and an immediate prune
 GUARD_LOW_BELOW=10     # root free % that writes the marker and alerts
@@ -42,6 +46,10 @@ SELF=$(readlink -f "$0")
 
 note() { logger -t "$TAG" -- "$*"; [[ -t 1 ]] && echo "$*"; return 0; }
 warn() { logger -t "$TAG" -p daemon.warning -- "$*"; [[ -t 1 ]] && echo "$*"; return 0; }
+
+need_root() {
+    [[ -n "$ROOT_PREFIX" || $EUID -eq 0 ]] || { echo "run as root" >&2; exit 1; }
+}
 
 root_free_pct() {
     df -P / 2>/dev/null | awk 'NR == 2 && $2 > 0 { print int($4 * 100 / $2) }'
@@ -103,21 +111,7 @@ dry_run() {
     docker_up || { echo "docker daemon not reachable; nothing to report"; return 0; }
 
     # LINKS = containers referencing the volume. Zero links = prune candidate.
-    docker system df -v | awk '
-        function bytes(s,   n, u) {
-            n = s + 0; u = s; sub(/^[0-9.]+/, "", u)
-            if (u == "kB") return n * 1e3
-            if (u == "MB") return n * 1e6
-            if (u == "GB") return n * 1e9
-            if (u == "TB") return n * 1e12
-            return n
-        }
-        /^VOLUME NAME/ { f = 1; next }
-        /^$/ { f = 0 }
-        f && NF == 3 { if ($2 == 0) { cand++; sum += bytes($3) } else { kept++ } }
-        END {
-            printf "volumes: %d unused would be pruned (%.1fGB); %d in use kept\n", cand + 0, sum / 1e9, kept + 0
-        }'
+    docker system df -v | awk 'function bytes(s, n, u) { n = s + 0; u = s; sub(/^[0-9.]+/, "", u); return n * (u == "kB" ? 1e3 : u == "MB" ? 1e6 : u == "GB" ? 1e9 : u == "TB" ? 1e12 : 1) } /^VOLUME NAME/ { f = 1; next } /^$/ { f = 0 } f && NF == 3 { if ($2 == 0) { cand++; sum += bytes($3) } else { kept++ } } END { printf "volumes: %d unused would be pruned (%.1fGB); %d in use kept\n", cand + 0, sum / 1e9, kept + 0 }'
 
     local cutoff stale=0 id ts
     cutoff=$(date -d '6 hours ago' +%s)
@@ -133,10 +127,11 @@ dry_run() {
 }
 
 install_units() {
-    [[ $EUID -eq 0 ]] || { echo "run as root: sudo bash $SELF --install" >&2; exit 1; }
+    need_root
+    mkdir -p "$(dirname "$BIN")" "$UNIT_DIR"
     install -m 755 "$SELF" "$BIN"
 
-    cat > /etc/systemd/system/dev-box-disk-hygiene.service <<UNIT
+    cat > "$UNIT_DIR/dev-box-disk-hygiene.service" <<UNIT
 [Unit]
 Description=Prune dev-box Docker leftovers (routine pass)
 
@@ -146,7 +141,7 @@ ExecStart=$BIN --run
 TimeoutStartSec=15min
 UNIT
 
-    cat > /etc/systemd/system/dev-box-disk-hygiene.timer <<'UNIT'
+    cat > "$UNIT_DIR/dev-box-disk-hygiene.timer" <<'UNIT'
 [Unit]
 Description=Run dev-box-disk-hygiene every 15 minutes
 
@@ -158,7 +153,7 @@ OnUnitActiveSec=15min
 WantedBy=timers.target
 UNIT
 
-    cat > /etc/systemd/system/dev-box-disk-hygiene-guard.service <<UNIT
+    cat > "$UNIT_DIR/dev-box-disk-hygiene-guard.service" <<UNIT
 [Unit]
 Description=Dev-box root free-space guard
 
@@ -168,7 +163,7 @@ ExecStart=$BIN --guard
 TimeoutStartSec=10min
 UNIT
 
-    cat > /etc/systemd/system/dev-box-disk-hygiene-guard.timer <<'UNIT'
+    cat > "$UNIT_DIR/dev-box-disk-hygiene-guard.timer" <<'UNIT'
 [Unit]
 Description=Run the dev-box free-space guard every minute
 
@@ -189,7 +184,7 @@ case "${1:-}" in
     --dry-run) dry_run ;;
     --install) install_units ;;
     --run | --guard)
-        [[ $EUID -eq 0 ]] || { echo "run as root" >&2; exit 1; }
+        need_root
         if [[ "$1" == "--run" ]]; then
             routine_pass
             check_low_space
