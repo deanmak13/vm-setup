@@ -2,11 +2,12 @@
 # tests/runner-reaper-reap.test.sh — bin/runner-reaper's reaping decision, run
 # end to end against fixture processes: ps, systemctl, logger and curl are
 # stubbed on PATH, /proc is a fixture PROC_ROOT, and every path comes from a
-# fixture RUNNER_REAPER_CONFIG. A repo's runner units are restarted only when
-# its oldest Runner.Worker is past GRACE, the jobs API shows nothing in
-# progress, AND its CPU time has been flat for two consecutive ticks; any
-# other evidence (young worker, live job, CPU growth, API failure, missing
-# baseline, no units) leaves it alone. --dry-run logs the reap and restarts
+# fixture RUNNER_REAPER_CONFIG. A repo is reaped only when its oldest
+# Runner.Worker is past GRACE AND its CPU time has been flat for two
+# consecutive ticks. Then only the units whose runner has no in-progress
+# job are restarted (a job with no runner name blocks the whole repo). Any
+# other evidence (young worker, CPU growth, API failure, missing baseline,
+# no units) leaves it alone. --dry-run logs the reap and restarts
 # nothing.
 #
 # Run: bash tests/runner-reaper-reap.test.sh
@@ -47,7 +48,11 @@ printf '%s\n' '#!/usr/bin/env bash' "W=$work" \
     'url=""; for a in "$@"; do case "$a" in https://*) url="$a";; esac; done' \
     'if [[ -s "$W/fail_pattern" ]] && [[ "$url" =~ $(cat "$W/fail_pattern") ]]; then exit 22; fi' \
     'case "$url" in' \
-    '  */jobs) cat "$W/jobs.json" ;;' \
+    '  */runs/15/jobs*) cat "$W/busy_jobs.json" ;;' \
+    '  */jobs*) cat "$W/jobs.json" ;;' \
+    '  */pneuma/actions/runners*) cat "$W/runners_pneuma.json" ;;' \
+    '  */actions/runners*) cat "$W/runners.json" ;;' \
+    '  */actions/runs*page=2*) cat "$W/runs_page2.json" ;;' \
     '  */actions/runs*) cat "$W/runs.json" ;;' \
     '  *"/issues?"*) echo "[]" ;;' \
     '  *) echo "{}" ;;' \
@@ -60,12 +65,13 @@ worker() {  # <age-seconds> — one Runner.Worker of the fixture runner, pid 424
 cpu() {  # <utime+stime ticks>
     printf '4242 (Runner.Worker) S 1 1 1 0 -1 0 0 0 0 0 %s 0 0 0\n' "$1" > "$work/proc/4242/stat"
 }
-no_jobs() { printf '{"workflow_runs":[]}\n' > "$work/runs.json"; printf '{"jobs":[]}\n' > "$work/jobs.json"; }
+no_jobs() { printf '{"workflow_runs":[]}\n' > "$work/runs.json"; printf '{"jobs":[]}\n' > "$work/jobs.json"; printf '{"jobs":[]}\n' > "$work/busy_jobs.json"; printf '{"workflow_runs":[]}\n' > "$work/runs_page2.json"; }
 reset() {
     rm -f "$work/rstate/"* "$work/restarts" "$work/fail_pattern"
     : > "$work/reaper.log"
     printf '%s\n' "$UNIT loaded active running GitHub Actions Runner" > "$work/units.out"
     touch "$work/lstate/streak.tsv"
+    printf '%s\n' '{"runners":[{"name":"pneuma-engine-contabo","busy":false},{"name":"pneuma-engine-contabo-2","busy":false},{"name":"pneuma-engine-contabo-build-1","busy":false}]}' > "$work/runners.json"
     worker 900; cpu 1000; no_jobs
 }
 RC=0
@@ -110,7 +116,62 @@ printf '{"workflow_runs":[{"id":7,"status":"in_progress"},{"id":8,"status":"comp
 printf '{"jobs":[{"status":"in_progress"}]}\n' > "$work/jobs.json"
 run; run; run
 expect "a job in progress: never reaped" "" "$(restarts)"
-expect "a job in progress: logged alive with the job evidence" 3 "$(logged 'job in-progress — not reaping (.*runs_checked=1 jobs_in_progress=1')"
+expect "a job in progress: logged alive with the job evidence" 1 "$(logged 'job in-progress on every unit — not reaping (.*runs_checked=1 jobs_in_progress=1')"
+
+# ── 23:56Z shape: three queued runs ahead of the one executing job ───────
+# (the old job check read only the newest runs, saw three idle queued runs,
+# and restarted the busy runner; the fix must see run 15 and skip its unit)
+reset
+printf '{"workflow_runs":[{"id":11,"status":"queued"},{"id":12,"status":"queued"},{"id":13,"status":"queued"},{"id":15,"status":"in_progress"}]}\n' > "$work/runs.json"
+printf '{"jobs":[{"status":"in_progress","runner_name":"pneuma-engine-contabo"}]}\n' > "$work/busy_jobs.json"
+run; run; run
+expect "in-progress run behind 3 queued runs: its runner is never restarted" "" "$(restarts)"
+expect "every non-completed run is checked (no cap of 3)" 3 "$(logged 'runs_checked=4 jobs_in_progress=1 busy_runners=\[pneuma-engine-contabo\]')"
+
+# ── a busy unit is skipped while an idle sibling unit is restarted ───────
+reset
+UNIT2="actions.runner.deanmak13-pneuma-engine.pneuma-engine-contabo-2.service"
+printf '%s\n%s\n' "$UNIT loaded active running x" "$UNIT2 loaded active running x" > "$work/units.out"
+printf '{"workflow_runs":[{"id":15,"status":"in_progress"}]}\n' > "$work/runs.json"
+printf '{"jobs":[{"status":"in_progress","runner_name":"pneuma-engine-contabo"}]}\n' > "$work/busy_jobs.json"
+run; run; run
+expect "busy unit (job in progress) skipped; idle sibling restarted alone" "$UNIT2" "$(restarts)"
+expect "the reap names the skipped busy unit" 1 "$(logged 'busy, skipped: '"$UNIT"'')"
+
+# ── busy run beyond page 1 of the runs listing is still seen ────────────
+reset
+{ printf '{"workflow_runs":['; for i in $(seq 1000 1099); do printf '{"id":%d,"status":"queued"},' "$i"; done; printf '{"id":1100,"status":"queued"}]}\n'; } > "$work/runs.json"
+printf '{"workflow_runs":[{"id":15,"status":"in_progress"}]}\n' > "$work/runs_page2.json"
+printf '{"jobs":[{"status":"in_progress","runner_name":"pneuma-engine-contabo"}]}\n' > "$work/busy_jobs.json"
+run; run; run
+expect "in-progress run on page 2 of the runs list: its runner never restarted" "" "$(restarts)"
+
+# ── a busy runner name matching no unit fails closed (whole repo busy) ───
+reset
+printf '{"workflow_runs":[{"id":15,"status":"in_progress"}]}\n' > "$work/runs.json"
+printf '{"jobs":[{"status":"in_progress","runner_name":"pneuma-engine-renamed"}]}\n' > "$work/busy_jobs.json"
+run; run; run
+expect "busy runner name matching no unit: nothing restarted" "" "$(restarts)"
+
+# ── a jobs listing that never ends is truncated: fail closed, never reaped ──
+reset
+printf '{"workflow_runs":[{"id":15,"status":"in_progress"}]}\n' > "$work/runs.json"
+{ printf '{"jobs":['; for i in $(seq 1 99); do printf '{"status":"completed"},'; done; printf '{"status":"completed"}]}\n'; } > "$work/busy_jobs.json"
+run; run; run
+expect "jobs listing truncated at MAX_PAGES: never reaped" "" "$(restarts)"
+expect "jobs listing truncated: logged as job API failure" 3 "$(logged 'skip pneuma-engine: job API check failed')"
+
+# ── repos pneuma and pneuma-portal: reaping pneuma never selects a portal unit ──
+reset
+PNEUMA_DIR="$work/runners/actions-runner-pneuma-contabo"
+mkdir -p "$PNEUMA_DIR/bin.2.337.0"
+printf '{"agentName":"pneuma-contabo","gitHubUrl":"https://github.com/deanmak13/pneuma"}\n' > "$PNEUMA_DIR/.runner"
+printf '4242 900 %s/bin.2.337.0/Runner.Worker spawnclient 110 113\n' "$PNEUMA_DIR" > "$work/ps.out"
+printf '{"runners":[{"name":"pneuma-contabo","busy":false}]}\n' > "$work/runners_pneuma.json"
+printf '%s\n%s\n' "actions.runner.deanmak13-pneuma.pneuma-contabo.service loaded active running x" \
+    "actions.runner.deanmak13-pneuma-portal.pneuma-portal-contabo.service loaded active running x" > "$work/units.out"
+run; run; run
+expect "reaping pneuma: only its own idle unit restarted; portal unit never selected" "actions.runner.deanmak13-pneuma.pneuma-contabo.service" "$(restarts)"
 
 reset
 printf '{"workflow_runs":[{"id":7,"status":"queued"}]}\n' > "$work/runs.json"
