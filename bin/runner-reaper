@@ -26,8 +26,6 @@ QUIET_STATE_FILE="$STATE_DIR/quiet-streak.tsv"
 CLK_TCK=$(getconf CLK_TCK 2>/dev/null || echo 100)
 CPU_ACTIVE_THRESHOLD_SEC=2
 QUIET_TICKS_REQUIRED=2
-# newest N non-completed runs to check at job level (>=3 per design)
-JOB_CHECK_RUNS=3
 
 DRY_RUN=0
 [[ "${1:-}" == "--dry-run" ]] && DRY_RUN=1
@@ -52,40 +50,69 @@ trap 'rm -f "$AUTH_HEADER_FILE"' EXIT
 
 note() { echo "$(date -Is) $*" >> "$LOG"; logger -t runner-reaper "$*"; }
 
-# ---- job-level liveness: sets JOB_ALIVE_EVIDENCE, returns 0=alive 1=dead 2=API failure
+# ---- job-level liveness: every non-completed run (queued AND in_progress),
+# every page, every job. A job in progress is busy on its runner; a job with
+# no runner name blocks every unit of the repo ("*"). A listing that reaches
+# MAX_PAGES full pages is truncated and fails closed (return 2).
+# Sets JOB_ALIVE_EVIDENCE and BUSY_RUNNERS (space-separated runner names).
+# Returns 0=some job in progress, 1=none, 2=API failure or truncation.
+MAX_PAGES=10
 job_level_alive() {
-    local repo=$1
-    local runs_json ids checked=0 alive_jobs=0 id jobs_json n
-    runs_json=$(curl -sf -m 20 -H @"$AUTH_HEADER_FILE" \
-        -H "Accept: application/vnd.github+json" \
-        "https://api.github.com/repos/$OWNER/$repo/actions/runs?per_page=10") || return 2
-    ids=$(echo "$runs_json" | python3 -c "
+    local repo=$1 status page runs_json raw_n page_ids ids="" id jobs_json jobs_n busy jpage
+    local -a names=()
+    local checked=0 alive_jobs=0
+    BUSY_RUNNERS=""
+    for status in in_progress queued; do
+        for page in $(seq 1 "$MAX_PAGES"); do
+            runs_json=$(curl -sf -m 20 -H @"$AUTH_HEADER_FILE" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/$OWNER/$repo/actions/runs?status=$status&per_page=100&page=$page") || return 2
+            read -r raw_n page_ids <<< "$(echo "$runs_json" | python3 -c "
 import json,sys
-d=json.load(sys.stdin)
-runs=[r for r in (d.get('workflow_runs') or []) if r.get('status') != 'completed']
-for r in runs[:$JOB_CHECK_RUNS]:
-    print(r['id'])
-") || return 2
+runs=json.load(sys.stdin).get('workflow_runs') or []
+print(len(runs), ' '.join(str(r['id']) for r in runs if r.get('status') != 'completed'))
+")" || return 2
+            [[ "$raw_n" =~ ^[0-9]+$ ]] || return 2
+            ids="$ids $page_ids"
+            (( raw_n < 100 )) && break
+            (( page == MAX_PAGES )) && return 2
+        done
+    done
+    ids=$(printf '%s\n' $ids | sort -un)
     if [[ -z "$ids" ]]; then
-        JOB_ALIVE_EVIDENCE="runs_checked=0 jobs_in_progress=0"
+        JOB_ALIVE_EVIDENCE="runs_checked=0 jobs_in_progress=0 busy_runners=[]"
         return 1
     fi
     for id in $ids; do
         checked=$((checked+1))
-        jobs_json=$(curl -sf -m 20 -H @"$AUTH_HEADER_FILE" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/$OWNER/$repo/actions/runs/$id/jobs") || return 2
-        n=$(echo "$jobs_json" | python3 -c "
+        for jpage in $(seq 1 "$MAX_PAGES"); do
+            jobs_json=$(curl -sf -m 20 -H @"$AUTH_HEADER_FILE" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/$OWNER/$repo/actions/runs/$id/jobs?per_page=100&page=$jpage") || return 2
+            read -r jobs_n busy <<< "$(echo "$jobs_json" | python3 -c "
 import json,sys
-d=json.load(sys.stdin)
-jobs=d.get('jobs') or []
-print(sum(1 for j in jobs if j.get('status')=='in_progress'))
-") || return 2
-        alive_jobs=$((alive_jobs+n))
+jobs=json.load(sys.stdin).get('jobs') or []
+print(len(jobs), ' '.join((j.get('runner_name') or '*') for j in jobs if j.get('status') == 'in_progress'))
+")" || return 2
+            [[ "$jobs_n" =~ ^[0-9]+$ ]] || return 2
+            read -ra names <<< "$busy"
+            for name in "${names[@]}"; do
+                alive_jobs=$((alive_jobs+1))
+                BUSY_RUNNERS="$BUSY_RUNNERS $name"
+            done
+            (( jobs_n < 100 )) && break
+            (( jpage == MAX_PAGES )) && return 2
+        done
     done
-    JOB_ALIVE_EVIDENCE="runs_checked=$checked jobs_in_progress=$alive_jobs"
+    JOB_ALIVE_EVIDENCE="runs_checked=$checked jobs_in_progress=$alive_jobs busy_runners=[${BUSY_RUNNERS# }]"
     (( alive_jobs > 0 )) && return 0
     return 1
+}
+
+# ---- a unit is busy when its runner has an in-progress job, or when a job
+# with no runner name is in progress ("*": the whole repo is busy)
+unit_busy() {
+    [[ " $BUSY_RUNNERS " == *" $1 "* || " $BUSY_RUNNERS " == *" * "* ]]
 }
 
 # ---- the runner install directory behind a Runner.Worker command line, or nothing
@@ -183,11 +210,6 @@ for repo in "${!OLDEST[@]}"; do
         continue
     fi
 
-    if (( job_rc == 0 )); then
-        note "alive $repo: job in-progress — not reaping ($evidence)"
-        continue
-    fi
-
     if (( cpu_confirmed_dead == 0 )); then
         note "alive $repo: cpu not yet confirmed dead, need $QUIET_TICKS_REQUIRED consecutive quiet ticks — not reaping ($evidence)"
         continue
@@ -199,11 +221,44 @@ for repo in "${!OLDEST[@]}"; do
         continue
     fi
 
+    # Restart only idle units. A unit whose runner has an in-progress job
+    # is never restarted (the 23:56Z whole-repo restart killed live jobs).
+    # A busy runner name that matches no unit of this repo cannot be
+    # attributed to a unit: fail closed and treat the whole repo as busy.
+    busy_names=()
+    read -ra busy_names <<< "$BUSY_RUNNERS"
+    for busy_name in "${busy_names[@]}"; do
+        matched=0
+        for unit in $units; do
+            runner_name=${unit#actions.runner.$OWNER-$repo.}
+            [[ "${runner_name%.service}" == "$busy_name" ]] && matched=1
+        done
+        (( matched == 1 )) || BUSY_RUNNERS="$BUSY_RUNNERS *"
+    done
+
+    restart_units=""
+    busy_units=""
+    for unit in $units; do
+        runner_name=${unit#actions.runner.$OWNER-$repo.}
+        runner_name=${runner_name%.service}
+        if unit_busy "$runner_name"; then
+            busy_units="$busy_units $unit"
+        else
+            restart_units="$restart_units $unit"
+        fi
+    done
+    if [[ -z "$restart_units" ]]; then
+        note "alive $repo: job in-progress on every unit — not reaping (busy:${busy_units# } $evidence)"
+        continue
+    fi
+
     if (( DRY_RUN == 1 )); then
-        note "DRY-RUN REAP $repo: would restart: $units ($evidence)"
+        note "DRY-RUN REAP $repo: would restart:${restart_units} (busy, skipped:${busy_units:- none} $evidence)"
     else
-        note "REAP $repo: restarting: $units ($evidence)"
-        systemctl restart $units
+        note "REAP $repo: restarting:${restart_units} (busy, skipped:${busy_units:- none} $evidence)"
+        for unit in $restart_units; do
+            systemctl restart "$unit"
+        done
         NEW_QUIET[$repo]=0
     fi
 done
