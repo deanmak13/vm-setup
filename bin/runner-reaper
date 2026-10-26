@@ -50,6 +50,24 @@ trap 'rm -f "$AUTH_HEADER_FILE"' EXIT
 
 note() { echo "$(date -Is) $*" >> "$LOG"; logger -t runner-reaper "$*"; }
 
+# ---- the repo's registered runners, by exact name: REPO_RUNNERS[name]=busy
+# (true|false) from GitHub. A unit is only ever restarted when its runner name
+# is positively listed here, so a unit of another repo is never selected.
+# Returns 2 on API failure (the repo is then skipped).
+declare -A REPO_RUNNERS=()
+repo_runners() {
+    local repo=$1 out name busy
+    out=$(curl -sf -m 20 -H @"$AUTH_HEADER_FILE" \
+        -H "Accept: application/vnd.github+json" \
+        "https://api.github.com/repos/$OWNER/$repo/actions/runners?per_page=100") || return 2
+    out=$(echo "$out" | jq -r '(.runners // [])[] | "\(.name) \(.busy)"') || return 2
+    REPO_RUNNERS=()
+    while read -r name busy; do
+        [[ -n "$name" ]] && REPO_RUNNERS[$name]=$busy
+    done <<< "$out"
+    return 0
+}
+
 # ---- job-level liveness: every non-completed run (queued AND in_progress),
 # every page, every job. A job in progress is busy on its runner; a job with
 # no runner name blocks every unit of the repo ("*"). A listing that reaches
@@ -67,11 +85,7 @@ job_level_alive() {
             runs_json=$(curl -sf -m 20 -H @"$AUTH_HEADER_FILE" \
                 -H "Accept: application/vnd.github+json" \
                 "https://api.github.com/repos/$OWNER/$repo/actions/runs?status=$status&per_page=100&page=$page") || return 2
-            read -r raw_n page_ids <<< "$(echo "$runs_json" | python3 -c "
-import json,sys
-runs=json.load(sys.stdin).get('workflow_runs') or []
-print(len(runs), ' '.join(str(r['id']) for r in runs if r.get('status') != 'completed'))
-")" || return 2
+            read -r raw_n page_ids <<< "$(echo "$runs_json" | jq -r '(.workflow_runs // []) | "\(length) " + ([.[] | select(.status != "completed") | (.id | tostring)] | join(" "))')" || return 2
             [[ "$raw_n" =~ ^[0-9]+$ ]] || return 2
             ids="$ids $page_ids"
             (( raw_n < 100 )) && break
@@ -89,11 +103,7 @@ print(len(runs), ' '.join(str(r['id']) for r in runs if r.get('status') != 'comp
             jobs_json=$(curl -sf -m 20 -H @"$AUTH_HEADER_FILE" \
                 -H "Accept: application/vnd.github+json" \
                 "https://api.github.com/repos/$OWNER/$repo/actions/runs/$id/jobs?per_page=100&page=$jpage") || return 2
-            read -r jobs_n busy <<< "$(echo "$jobs_json" | python3 -c "
-import json,sys
-jobs=json.load(sys.stdin).get('jobs') or []
-print(len(jobs), ' '.join((j.get('runner_name') or '*') for j in jobs if j.get('status') == 'in_progress'))
-")" || return 2
+            read -r jobs_n busy <<< "$(echo "$jobs_json" | jq -r '(.jobs // []) | "\(length) " + ([.[] | select(.status == "in_progress") | (.runner_name // "*")] | join(" "))')" || return 2
             [[ "$jobs_n" =~ ^[0-9]+$ ]] || return 2
             read -ra names <<< "$busy"
             for name in "${names[@]}"; do
@@ -210,6 +220,11 @@ for repo in "${!OLDEST[@]}"; do
         continue
     fi
 
+    if ! repo_runners "$repo"; then
+        note "skip $repo: runners API check failed ($evidence)"
+        continue
+    fi
+
     if (( cpu_confirmed_dead == 0 )); then
         note "alive $repo: cpu not yet confirmed dead, need $QUIET_TICKS_REQUIRED consecutive quiet ticks — not reaping ($evidence)"
         continue
@@ -241,7 +256,10 @@ for repo in "${!OLDEST[@]}"; do
     for unit in $units; do
         runner_name=${unit#actions.runner.$OWNER-$repo.}
         runner_name=${runner_name%.service}
-        if unit_busy "$runner_name"; then
+        if [[ -z "${REPO_RUNNERS[$runner_name]+x}" ]]; then
+            # not a runner of $repo (a glob or another repo's unit): never touch it
+            busy_units="$busy_units $unit(not-$repo)"
+        elif [[ "${REPO_RUNNERS[$runner_name]}" == true ]] || unit_busy "$runner_name"; then
             busy_units="$busy_units $unit"
         else
             restart_units="$restart_units $unit"

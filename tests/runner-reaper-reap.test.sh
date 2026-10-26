@@ -50,6 +50,8 @@ printf '%s\n' '#!/usr/bin/env bash' "W=$work" \
     'case "$url" in' \
     '  */runs/15/jobs*) cat "$W/busy_jobs.json" ;;' \
     '  */jobs*) cat "$W/jobs.json" ;;' \
+    '  */pneuma/actions/runners*) cat "$W/runners_pneuma.json" ;;' \
+    '  */actions/runners*) cat "$W/runners.json" ;;' \
     '  */actions/runs*page=2*) cat "$W/runs_page2.json" ;;' \
     '  */actions/runs*) cat "$W/runs.json" ;;' \
     '  *"/issues?"*) echo "[]" ;;' \
@@ -69,6 +71,7 @@ reset() {
     : > "$work/reaper.log"
     printf '%s\n' "$UNIT loaded active running GitHub Actions Runner" > "$work/units.out"
     touch "$work/lstate/streak.tsv"
+    printf '%s\n' '{"runners":[{"name":"pneuma-engine-contabo","busy":false},{"name":"pneuma-engine-contabo-2","busy":false},{"name":"pneuma-engine-contabo-build-1","busy":false}]}' > "$work/runners.json"
     worker 900; cpu 1000; no_jobs
 }
 RC=0
@@ -149,6 +152,26 @@ printf '{"workflow_runs":[{"id":15,"status":"in_progress"}]}\n' > "$work/runs.js
 printf '{"jobs":[{"status":"in_progress","runner_name":"pneuma-engine-renamed"}]}\n' > "$work/busy_jobs.json"
 run; run; run
 expect "busy runner name matching no unit: nothing restarted" "" "$(restarts)"
+
+# ── a jobs listing that never ends is truncated: fail closed, never reaped ──
+reset
+printf '{"workflow_runs":[{"id":15,"status":"in_progress"}]}\n' > "$work/runs.json"
+{ printf '{"jobs":['; for i in $(seq 1 99); do printf '{"status":"completed"},'; done; printf '{"status":"completed"}]}\n'; } > "$work/busy_jobs.json"
+run; run; run
+expect "jobs listing truncated at MAX_PAGES: never reaped" "" "$(restarts)"
+expect "jobs listing truncated: logged as job API failure" 3 "$(logged 'skip pneuma-engine: job API check failed')"
+
+# ── repos pneuma and pneuma-portal: reaping pneuma never selects a portal unit ──
+reset
+PNEUMA_DIR="$work/runners/actions-runner-pneuma-contabo"
+mkdir -p "$PNEUMA_DIR/bin.2.337.0"
+printf '{"agentName":"pneuma-contabo","gitHubUrl":"https://github.com/deanmak13/pneuma"}\n' > "$PNEUMA_DIR/.runner"
+printf '4242 900 %s/bin.2.337.0/Runner.Worker spawnclient 110 113\n' "$PNEUMA_DIR" > "$work/ps.out"
+printf '{"runners":[{"name":"pneuma-contabo","busy":false}]}\n' > "$work/runners_pneuma.json"
+printf '%s\n%s\n' "actions.runner.deanmak13-pneuma.pneuma-contabo.service loaded active running x" \
+    "actions.runner.deanmak13-pneuma-portal.pneuma-portal-contabo.service loaded active running x" > "$work/units.out"
+run; run; run
+expect "reaping pneuma: only its own idle unit restarted; portal unit never selected" "actions.runner.deanmak13-pneuma.pneuma-contabo.service" "$(restarts)"
 
 reset
 printf '{"workflow_runs":[{"id":7,"status":"queued"}]}\n' > "$work/runs.json"
