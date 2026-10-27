@@ -70,8 +70,8 @@ check "install directory is actions-runner-<runner-name> under the ubuntu home" 
     bash -c 'grep -qxF "runner_dir() { printf '"'"'%s/actions-runner-%s\\n'"'"' \"\$RUNNER_HOME\" \"\$1\"; }" "$1" && grep -qxF "RUNNER_HOME=\"\${RUNNER_HOME:-/home/ubuntu}\"" "$1" && grep -qxF "    dir=\$(runner_dir \"\$runner_name\")" "$1"' _ "$BOOTSTRAP"
 check "no per-repo directory with a special-cased -2 suffix remains" \
     bash -c '! grep -q "actions-runner-\${repo}" "$1" && ! grep -q "== \*-2" "$1"' _ "$BOOTSTRAP"
-check "config.sh gets self-hosted plus the row's own labels" \
-    bash -c 'grep -qx "    runner_labels=\"\$RUNNER_BASE_LABELS,\$labels\"" "$1" && grep -q "^          --labels .\$runner_labels. " "$1" && grep -qx "RUNNER_BASE_LABELS=\"self-hosted\"" "$1"' _ "$BOOTSTRAP"
+check "config.sh gets self-hosted plus the row's own labels (sent as data on stdin)" \
+    bash -c 'grep -qx "    runner_labels=\"\$RUNNER_BASE_LABELS,\$labels\"" "$1" && grep -qF "\"\$runner_labels\" \"\$dir\"" "$1" && grep -qx "RUNNER_BASE_LABELS=\"self-hosted\"" "$1"' _ "$BOOTSTRAP"
 check "the enabled column decides whether the service is started" \
     grep -qxF '    if [[ "$enabled" == "y" ]]; then' "$BOOTSTRAP"
 

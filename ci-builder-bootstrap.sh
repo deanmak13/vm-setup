@@ -36,8 +36,9 @@
 #   only for a repo with exactly one inventory row) registers that runner with
 #   a pre-minted registration token read from FILE instead of minting one from
 #   --gh-token-file, which is then not required. FILE must be a regular file,
-#   not a symlink, with mode 0600 or 0400. The token reaches config.sh through
-#   ACTIONS_RUNNER_INPUT_TOKEN on stdin: it never appears in any argv.
+#   not a symlink, owned by root, with mode 0600 or 0400. The token must match
+#   ^[A-Za-z0-9_-]{20,200}$ (minted tokens too). It reaches config.sh through
+#   ACTIONS_RUNNER_INPUT_TOKEN, sent as data on stdin: never in argv or script text.
 #
 # Safe to re-run: every step checks for existing state before acting.
 set +x  # Registration credentials must never appear in shell tracing.
@@ -95,6 +96,31 @@ RUNNER_VERSION="2.336.0"
 RUNNER_HOME="${RUNNER_HOME:-/home/ubuntu}"
 runner_dir() { printf '%s/actions-runner-%s\n' "$RUNNER_HOME" "$1"; }
 
+# check_reg_token <repo> — a registration token is refused unless it is the
+# expected shape, so no value can ever reach the shell as code. The message
+# never echoes the value.
+check_reg_token() {
+    local re='^[A-Za-z0-9_-]{20,200}$'
+    [[ -n "$REG_TOKEN" && "$REG_TOKEN" != "null" ]] || err "failed to obtain a registration token for $1"
+    [[ "$REG_TOKEN" =~ $re ]] || err "registration token for $1 is malformed; refusing"
+}
+
+# The inner script for config.sh: six data lines on stdin, read in order, then
+# config.sh runs. It is a fixed string: nothing is interpolated into it.
+CONFIG_SCRIPT='IFS= read -r ACTIONS_RUNNER_INPUT_TOKEN
+IFS= read -r RUNNER_OWNER
+IFS= read -r RUNNER_REPO
+IFS= read -r RUNNER_NAME
+IFS= read -r RUNNER_LABELS
+IFS= read -r RUNNER_DIR
+export ACTIONS_RUNNER_INPUT_TOKEN
+cd "$RUNNER_DIR" &&
+./config.sh --unattended \
+  --url "https://github.com/$RUNNER_OWNER/$RUNNER_REPO" \
+  --name "$RUNNER_NAME" \
+  --labels "$RUNNER_LABELS" \
+  --work _work'
+
 register_runners() {
 # ── 9. Register GitHub Actions runners ──────────────────────────────────
 id ubuntu &>/dev/null || useradd -m -s /bin/bash ubuntu
@@ -126,23 +152,15 @@ while read -r repo runner_name labels enabled; do
           https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz &&
         tar xzf actions-runner.tar.gz && rm actions-runner.tar.gz
     "
-    if [[ -n "$REG_TOKEN_FILE" ]]; then
-        REG_TOKEN=$(<"$REG_TOKEN_FILE")
-    else
+    if [[ -z "$REG_TOKEN_FILE" ]]; then
         REG_TOKEN=$(mint_reg_token "$repo")
+        check_reg_token "$repo"
     fi
-    [[ -n "$REG_TOKEN" && "$REG_TOKEN" != "null" ]] || err "failed to obtain a registration token for $repo"
-    # The script goes to su on stdin, so the token is in neither argv nor the
-    # environment of any process except the runner's own config.sh.
-    su - ubuntu -s /bin/bash <<EOF
-export ACTIONS_RUNNER_INPUT_TOKEN='$REG_TOKEN'
-cd '$dir' &&
-./config.sh --unattended \
-          --url https://github.com/$OWNER/$repo \
-          --name '$runner_name' \
-          --labels '$runner_labels' \
-          --work _work
-EOF
+    # The config script is a fixed, quoted string passed to su -c: it holds no
+    # value. The token and the other values arrive as data lines on stdin, read
+    # in order by the inner shell. Neither the token nor any value is in argv.
+    printf '%s\n' "$REG_TOKEN" "$OWNER" "$repo" "$runner_name" "$runner_labels" "$dir" \
+        | su - ubuntu -c "$CONFIG_SCRIPT"
     ( cd "$dir" && ./svc.sh install ubuntu )
     if [[ "$enabled" == "y" ]]; then
         ( cd "$dir" && ./svc.sh start )
@@ -180,8 +198,20 @@ if [[ -n "$REG_TOKEN_FILE" ]]; then
     (( RUNNERS_ONLY )) && [[ -n "$RUNNER_REPO" ]] || err "--reg-token-file requires --runners-only and --runner-repo"
     [[ "$(grep -c . <<< "$RUNNERS")" -eq 1 ]] || err "--reg-token-file requires exactly one inventory row for $RUNNER_REPO"
     [[ -f "$REG_TOKEN_FILE" && ! -L "$REG_TOKEN_FILE" ]] || err "--reg-token-file must be a regular file, not a symlink"
-    reg_mode=$(stat -c '%a' "$REG_TOKEN_FILE")
+    reg_real_before=$(realpath -e -- "$REG_TOKEN_FILE")
+    # Open once; every check and the read go through this descriptor, so the
+    # inode checked is the inode read (no path-swap window).
+    exec {REG_FD}<"$REG_TOKEN_FILE"
+    reg_fd_path="/proc/self/fd/$REG_FD"
+    [[ "$(realpath -e -- "$REG_TOKEN_FILE")" == "$reg_real_before" ]] || err "--reg-token-file changed while it was opened"
+    [[ "$(stat -L -c '%F' "$reg_fd_path")" == "regular file" ]] || err "--reg-token-file must be a regular file"
+    reg_mode=$(stat -L -c '%a' "$reg_fd_path")
     [[ "$reg_mode" == 600 || "$reg_mode" == 400 ]] || err "--reg-token-file must have mode 0600 or 0400 (found $reg_mode)"
+    reg_uid=$(stat -L -c '%u' "$reg_fd_path")
+    [[ "$reg_uid" == 0 ]] || err "--reg-token-file must be owned by root (found uid $reg_uid)"
+    REG_TOKEN=$(cat <&"$REG_FD")
+    exec {REG_FD}<&-
+    check_reg_token "$RUNNER_REPO"
 fi
 
 if (( ! PLAN_RUNNERS )); then
