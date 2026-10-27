@@ -48,6 +48,8 @@ BOOTSTRAP="$BOOTSTRAP" TEST_ROOT="$work" bash -euo pipefail -c '
   curl() { printf "{\"token\":\"private-fixture-registration\"}\n"; }
   su() {
     local command="${*: -1}"
+    # The config step arrives as a script on stdin (token never in argv).
+    if [[ "$command" == /bin/bash ]]; then command=$(cat); fi
     case "$command" in
       *"mkdir -p"*) mkdir -p "$dir" ;;
       *"curl -fsSL"*)

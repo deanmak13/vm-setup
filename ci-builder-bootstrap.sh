@@ -32,6 +32,12 @@
 #
 # --runners-only registers runners without packages, Docker, watchdogs or OpenBao setup.
 # --runner-repo REPO narrows that mode to entries in the canonical inventory.
+# --reg-token-file FILE (only with --runners-only and --runner-repo REPO, and
+#   only for a repo with exactly one inventory row) registers that runner with
+#   a pre-minted registration token read from FILE instead of minting one from
+#   --gh-token-file, which is then not required. FILE must be a regular file,
+#   not a symlink, with mode 0600 or 0400. The token reaches config.sh through
+#   ACTIONS_RUNNER_INPUT_TOKEN on stdin: it never appears in any argv.
 #
 # Safe to re-run: every step checks for existing state before acting.
 set +x  # Registration credentials must never appear in shell tracing.
@@ -44,6 +50,7 @@ STATE_TARBALL=""
 PLAN_RUNNERS=0
 RUNNERS_ONLY=0
 RUNNER_REPO=""
+REG_TOKEN_FILE=""
 
 log() { echo "[ci-builder-bootstrap] $*"; }
 err() { echo "[ci-builder-bootstrap] ERROR: $*" >&2; exit 1; }
@@ -119,17 +126,23 @@ while read -r repo runner_name labels enabled; do
           https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz &&
         tar xzf actions-runner.tar.gz && rm actions-runner.tar.gz
     "
-    REG_TOKEN=$(mint_reg_token "$repo")
-    [[ -n "$REG_TOKEN" && "$REG_TOKEN" != "null" ]] || err "failed to mint registration token for $repo"
-    su - ubuntu -c "
-        cd '$dir' &&
-        ./config.sh --unattended \
+    if [[ -n "$REG_TOKEN_FILE" ]]; then
+        REG_TOKEN=$(<"$REG_TOKEN_FILE")
+    else
+        REG_TOKEN=$(mint_reg_token "$repo")
+    fi
+    [[ -n "$REG_TOKEN" && "$REG_TOKEN" != "null" ]] || err "failed to obtain a registration token for $repo"
+    # The script goes to su on stdin, so the token is in neither argv nor the
+    # environment of any process except the runner's own config.sh.
+    su - ubuntu -s /bin/bash <<EOF
+export ACTIONS_RUNNER_INPUT_TOKEN='$REG_TOKEN'
+cd '$dir' &&
+./config.sh --unattended \
           --url https://github.com/$OWNER/$repo \
-          --token '$REG_TOKEN' \
           --name '$runner_name' \
           --labels '$runner_labels' \
           --work _work
-    "
+EOF
     ( cd "$dir" && ./svc.sh install ubuntu )
     if [[ "$enabled" == "y" ]]; then
         ( cd "$dir" && ./svc.sh start )
@@ -151,6 +164,7 @@ while [[ $# -gt 0 ]]; do
         --state-tarball) STATE_TARBALL="$2"; shift 2 ;;
         --runners-only) RUNNERS_ONLY=1; shift ;;
         --runner-repo) RUNNER_REPO="$2"; shift 2 ;;
+        --reg-token-file) REG_TOKEN_FILE="$2"; shift 2 ;;
         --plan-runners) PLAN_RUNNERS=1; shift ;;
         *) err "Unknown argument: $1" ;;
     esac
@@ -162,10 +176,20 @@ if [[ -n "$RUNNER_REPO" ]]; then
     [[ -n "$RUNNERS" ]] || err "unknown runner repo: $RUNNER_REPO"
 fi
 
+if [[ -n "$REG_TOKEN_FILE" ]]; then
+    (( RUNNERS_ONLY )) && [[ -n "$RUNNER_REPO" ]] || err "--reg-token-file requires --runners-only and --runner-repo"
+    [[ "$(grep -c . <<< "$RUNNERS")" -eq 1 ]] || err "--reg-token-file requires exactly one inventory row for $RUNNER_REPO"
+    [[ -f "$REG_TOKEN_FILE" && ! -L "$REG_TOKEN_FILE" ]] || err "--reg-token-file must be a regular file, not a symlink"
+    reg_mode=$(stat -c '%a' "$REG_TOKEN_FILE")
+    [[ "$reg_mode" == 600 || "$reg_mode" == 400 ]] || err "--reg-token-file must have mode 0600 or 0400 (found $reg_mode)"
+fi
+
 if (( ! PLAN_RUNNERS )); then
     require_root
-    [[ -n "$GH_TOKEN_FILE" && -f "$GH_TOKEN_FILE" ]] || err "--gh-token-file is required and must exist"
-    GH_TOKEN=$(cat "$GH_TOKEN_FILE")
+    if [[ -z "$REG_TOKEN_FILE" ]]; then
+        [[ -n "$GH_TOKEN_FILE" && -f "$GH_TOKEN_FILE" ]] || err "--gh-token-file is required and must exist"
+        GH_TOKEN=$(cat "$GH_TOKEN_FILE")
+    fi
 fi
 
 if (( PLAN_RUNNERS )); then
