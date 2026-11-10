@@ -4,10 +4,17 @@ BOOTSTRAP="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/ci-builder-bootstrap
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 printf 'test-token-not-real' > "$work/token"
+# A real script path keeps BASH_SOURCE defined under kcov with nounset enabled.
+run_fixture() {
+  local fixture
+  fixture=$(mktemp "$work/fixture.XXXXXX.sh")
+  cat > "$fixture"
+  bash -euo pipefail "$fixture"
+}
 # Sourcing exposes the shared entry point without running any host setup.
 # Replace only credential/root/registration boundaries, then exercise the
 # real CLI mode dispatcher. Any whole-host command aborts the test.
-BOOTSTRAP="$BOOTSTRAP" TEST_ROOT="$work" bash -euo pipefail -c '
+BOOTSTRAP="$BOOTSTRAP" TEST_ROOT="$work" run_fixture > "$work/result" <<'FIXTURE'
   source "$BOOTSTRAP"
   require_root() { :; }
   hostname() { printf "vmi3387590\n"; }
@@ -17,7 +24,7 @@ BOOTSTRAP="$BOOTSTRAP" TEST_ROOT="$work" bash -euo pipefail -c '
   docker() { echo "FORBIDDEN docker setup"; exit 93; }
   systemctl() { echo "FORBIDDEN service setup"; exit 94; }
   main --runners-only --runner-repo pneuma-terraformer --gh-token-file "$TEST_ROOT/token"
-' > "$work/result"
+FIXTURE
 grep -qx 'registered:pneuma-terraformer' "$work/result"
 ! grep -q 'test-token-not-real\|FORBIDDEN' "$work/result"
 RUNNER_HOME="$work/home" bash "$BOOTSTRAP" --runners-only --runner-repo pneuma-terraformer --plan-runners > "$work/plan"
@@ -38,7 +45,7 @@ fi
 printf 'PASS runner-only dispatch excludes whole-host provisioning and filters canonical inventory\n'
 # Exercise the SAME registration function with fake external boundaries.
 # Only names/status markers are persisted; fixture tokens never reach output.
-BOOTSTRAP="$BOOTSTRAP" TEST_ROOT="$work" bash -euo pipefail -c '
+BOOTSTRAP="$BOOTSTRAP" TEST_ROOT="$work" run_fixture > "$work/register-output" 2>&1 <<'FIXTURE'
   source "$BOOTSTRAP"
   RUNNER_HOME="$TEST_ROOT/runners"
   GH_TOKEN="private-fixture-pat"
@@ -61,20 +68,21 @@ BOOTSTRAP="$BOOTSTRAP" TEST_ROOT="$work" bash -euo pipefail -c '
   register_runners
   # Existing identity must skip registration entirely on the second call.
   register_runners
-' > "$work/register-output" 2>&1
+FIXTURE
 grep -qx 'configured' "$work/actions"
 grep -qx 'svc-install' "$work/actions"
 grep -qx 'svc-start' "$work/actions"
 test "$(grep -c '^configured$' "$work/actions")" -eq 1
 ! grep -q 'private-fixture' "$work/register-output"
 printf 'PASS shared registration function is idempotent and starts enabled runner without exposing credentials\n'
-if BOOTSTRAP="$BOOTSTRAP" TEST_ROOT="$work" bash -euo pipefail -c '
+if BOOTSTRAP="$BOOTSTRAP" TEST_ROOT="$work" run_fixture > "$work/wrong-host" 2>&1 <<'FIXTURE'
   source "$BOOTSTRAP"
   require_root() { :; }
   hostname() { printf "vmi3131513\n"; }
   register_runners() { echo "FORBIDDEN registration on cluster"; }
   main --runners-only --runner-repo pneuma-terraformer --gh-token-file "$TEST_ROOT/token"
-' > "$work/wrong-host" 2>&1; then
+FIXTURE
+then
   echo 'FAIL runner registration accepted cluster host'; exit 1
 fi
 ! grep -q 'FORBIDDEN registration' "$work/wrong-host"
