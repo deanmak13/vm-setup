@@ -50,8 +50,6 @@ source "$1"
 [[ "$-" == "$before_flags" ]] || exit 1
 [[ "$(set -o | awk '$1 == "pipefail" { print $2 }')" == "$before_pipefail" ]]
 SOURCE_OPTIONS
-check "source: runner preserves default caller options" bash "$work/source-options.sh" "$RUNNER"
-check "source: runner preserves strict caller options" bash -u -o pipefail "$work/source-options.sh" "$RUNNER"
 
 # ── fixtures ─────────────────────────────────────────────────────────────────
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
@@ -234,6 +232,9 @@ export PNEUMA_GATE_IP="$work/bin/ip-stub" IP_RECORD="$work/ip-record.txt" IP_ROU
 
 marker_of() { grep '^PNEUMA_GATE_RESULT ' <<<"$1" | tail -1; }
 field_of() { tr ' ' '\n' <<<"$1" | sed -n "s/^$2=//p" | head -1; }
+
+check "source: runner preserves default caller options" bash "$work/source-options.sh" "$RUNNER"
+check "source: runner preserves strict caller options" bash -u -o pipefail "$work/source-options.sh" "$RUNNER"
 
 # ── scoping base: the client recomputes it from a fresh origin/main ────────
 scope_out=$("$CLIENT" --repo-dir "$src" --head "$head" --base "$head" --scope-only 2>&1) && scope_rc=0 || scope_rc=$?
@@ -587,7 +588,17 @@ export PNEUMA_GATE_MEMINFO="$mem" PNEUMA_GATE_LOADAVG="$load"
 export PNEUMA_GATE_SYSTEMCTL="$work/bin/systemctl-stub"; : > "$UNITS_FILE"; : > "$SYSTEMCTL_ACTIVE"
 for i in 1 2 3; do
   # distinct submitters: three identical scopes would (correctly) attach to ONE job, and this test wants three runs
-  ( "$RUNNER" run --submitter "conc-$i" --profile fake --repo fakerepo --head "$head" --base "$base" --tree "$tree" > "$work/c$i.out" 2>&1; echo $? > "$work/c$i.rc" ) &
+  (
+    # Real systemd units have separate mount namespaces. The symlink-based
+    # stand-in needs separate mount destinations too: one finishing unit
+    # must not unlink another unit's live bind path.
+    PNEUMA_GATE_IN_MOUNT="$work/mnt/conc-$i/in" \
+      PNEUMA_GATE_ENVS_MOUNT="$work/mnt/conc-$i/envs" \
+      "$RUNNER" run --submitter "conc-$i" --profile fake --repo fakerepo --head "$head" --base "$base" --tree "$tree" \
+        > "$work/c$i.out" 2>&1 && child_rc=0 || child_rc=$?
+    echo "$child_rc" > "$work/c$i.rc"
+    if [ "$child_rc" != 0 ]; then cat "$work/c$i.out" >&2; fi
+  ) &
   sleep 1
 done
 sleep 3
