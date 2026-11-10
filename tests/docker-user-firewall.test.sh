@@ -151,7 +151,13 @@ reset; FAKE_RESTORE_FAIL=iptables "$SCRIPT" --apply --pre-docker --rollback-time
     && ok "restore failure keeps the rollback timer armed" || bad "timer disarmed on failure"
 reset; FAKE_SDRUN_FAIL=1 "$SCRIPT" --apply --pre-docker --rollback-timer 300 >/dev/null 2>&1; rc=$?
 [[ $rc -ne 0 ]] && ! grep -q 'restore' "$W/log" && ok "rollback arm failure: refuses to apply (guard pinned)" || bad "applied without a rollback timer"
-env -u DOCKER_FW_TEST_NONROOT bash "$SCRIPT" --apply --rollback-timer 300 >/dev/null 2>&1 && bad "non-root apply succeeded" || ok "non-root apply refused"
+nonroot_command=(env -u DOCKER_FW_TEST_NONROOT bash "$SCRIPT" --apply --rollback-timer 300)
+if [[ $EUID -eq 0 ]]; then
+    nonroot_command=(setpriv --reuid="$(id -u nobody)" --regid="$(id -g nobody)" --clear-groups "${nonroot_command[@]}")
+fi
+nonroot_output=$("${nonroot_command[@]}" 2>&1); nonroot_rc=$?
+[[ $nonroot_rc -ne 0 && "$nonroot_output" == *'--apply needs root'* ]] \
+    && ok "non-root apply refused" || bad "non-root apply did not exercise the root guard"
 
 # ---- jump first, FORWARD jump verified in both families
 reset; printf -- '-A DOCKER-USER -j RETURN\n' > "$W/iptables.du"; cp "$W/iptables.du" "$W/ip6tables.du"

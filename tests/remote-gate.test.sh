@@ -24,7 +24,7 @@ ENGINE_PROFILE="$REPO_DIR/gate-profiles/engine.sh"
 PORTAL_PROFILE="$REPO_DIR/gate-profiles/portal.sh"
 
 work=$(mktemp -d)
-trap 'rm -rf "$work"' EXIT
+trap 'chmod -R u+w "$work" 2>/dev/null; rm -rf "$work"' EXIT
 
 fail=0
 check() {   # check <description> <command...>
@@ -39,6 +39,19 @@ expect_eq() {   # expect_eq <description> <want> <got>
   [[ $2 == "$3" ]] || { verdict=FAIL; fail=1; printf '     want: %q\n     got:  %q\n' "$2" "$3"; }
   printf '%-4s %s\n' "$verdict" "$1"
 }
+
+# The runner is also a sourced helper library. It must not change caller
+# options (including kcov's tracing); a script file also exercises nounset
+# without bash -c's absent BASH_SOURCE at the calling scope.
+cat > "$work/source-options.sh" <<'SOURCE_OPTIONS'
+before_flags=$-
+before_pipefail=$(set -o | awk '$1 == "pipefail" { print $2 }')
+source "$1"
+[[ "$-" == "$before_flags" ]] || exit 1
+[[ "$(set -o | awk '$1 == "pipefail" { print $2 }')" == "$before_pipefail" ]]
+SOURCE_OPTIONS
+check "source: runner preserves default caller options" bash "$work/source-options.sh" "$RUNNER"
+check "source: runner preserves strict caller options" bash -u -o pipefail "$work/source-options.sh" "$RUNNER"
 
 # ── fixtures ─────────────────────────────────────────────────────────────────
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
@@ -115,6 +128,20 @@ chmod +x "$work/bin/gate-as-forced-command" "$work/bin/argv-recorder" "$work/bin
 export SUDO_RECORD="$work/sudo-recorded.txt" PNEUMA_GATE_SUDO="$work/bin/sudo-stub"
 export ARGV_RECORD="$work/argv-recorded.txt"
 export PATH="$work/bin:$PATH" PNEUMA_GATE_RUNNER="$work/bin/gate-as-forced-command" PNEUMA_GATE_RUNNER_BIN="$RUNNER" PNEUMA_GATE_HOST=fakehost
+# Fixture admission must not depend on the developer/Docker host's free disk.
+# Keep real filesystem identity queries; only the available-space probe is
+# controlled. Existing high-floor tests still prove fail-closed admission.
+real_df=$(command -v df)
+export REMOTE_GATE_TEST_REAL_DF="$real_df"
+cat > "$work/bin/df" <<'DF'
+#!/usr/bin/env bash
+if [ "${1:-}" = -BG ] && [ "${2:-}" = --output=avail ]; then
+  printf 'Avail\n100G\n'
+else
+  exec "$REMOTE_GATE_TEST_REAL_DF" "$@"
+fi
+DF
+chmod +x "$work/bin/df"
 export PNEUMA_GATE_DEDUP_DIR="$work/dedup"   # GATE-DEDUP-1 state: never under /var/lib in tests
 export PNEUMA_GATE_RESULTS_DIR="$work/results"
 export PNEUMA_GATE_RESULTS_UID="$(id -u)"   # the expected owner of result files in tests (root on the builder)   # the root-owned verdict files: never under /var/lib in tests
@@ -447,8 +474,8 @@ hit_out=$("$CLIENT" --repo-dir "$src" --profile fake --head "$head" --base "$bas
 expect_eq "cache hit: the gate is green" 0 "$hit_rc"
 check "cache hit: the run uses the read-only shared cache at the unit's mount" grep -q "env=$PNEUMA_GATE_ENVS_MOUNT/fakekey1" <<<"$hit_out"
 check "cache hit: the cache is bound read-only into the unit" grep -q -- "--property=BindReadOnlyPaths=$PNEUMA_GATE_BASE/envs/fake:$PNEUMA_GATE_ENVS_MOUNT" "$SCOPE_RECORD"
-rm -rf "$PNEUMA_GATE_BASE/envs/fake/fakekey1"
 chmod -R u+w "$PNEUMA_GATE_BASE/envs" 2>/dev/null || true
+rm -rf "$PNEUMA_GATE_BASE/envs/fake/fakekey1"
 
 out=$("$CLIENT" --repo-dir "$src" --profile redfake --head "$head" --base "$base" --log-dir "$work/logs" 2>&1) && rc=0 || rc=$?
 expect_eq "client: red gate exits 1" 1 "$rc"

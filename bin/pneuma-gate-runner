@@ -30,7 +30,12 @@
 # wheels are read-only to units, so one run cannot poison another's inputs or forge its verdict.
 # systemd owns every per-run directory (RuntimeDirectory= and PrivateTmp=): nothing here deletes
 # one. The runner NEVER touches k3s, containerd, docker volumes or the GitHub runner services.
-set -uo pipefail
+# Sourced helpers must preserve the caller's shell options. In particular,
+# enabling nounset inside a bash -c caller breaks kcov's BASH_SOURCE trace
+# prefix after this file returns. Executable runs retain strict options.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  set -uo pipefail
+fi
 
 BASE_DIR="${PNEUMA_GATE_BASE:-/var/lib/pneuma-gate}"
 RUN_ROOT="${PNEUMA_GATE_RUN_ROOT:-/run/pneuma-gate}"   # systemd creates each run's directory here (RuntimeDirectory=)

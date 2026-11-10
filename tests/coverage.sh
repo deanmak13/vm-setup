@@ -27,7 +27,7 @@ OUT="$REPO_DIR/cov"
 
 [[ -d "$OUT" ]] && docker run --rm -v "$REPO_DIR:/src" "$IMAGE" rm -rf /src/cov
 docker run --rm -v "$REPO_DIR:/src" -w /src -e "HOST_ID=$(id -u):$(id -g)" "$IMAGE" bash -c '
-    apt-get -qq update >/dev/null && apt-get -qq install -y jq git iproute2 >/dev/null
+    apt-get -qq update >/dev/null && apt-get -qq install -y jq git iproute2 util-linux >/dev/null
     # tests/** is test-harness code, not product code: it is run by kcov (its tests execute the
     # product), but it is not in the coverage denominator. Product scripts (bin/*, gate-profiles/*)
     # stay fully measured. Same rule as COV-OMIT-1: every exclusion is justified here.
