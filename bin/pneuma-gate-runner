@@ -560,7 +560,7 @@ refuse_noid() { echo "pneuma-gate-runner: refused: no submitter identity (only p
 # sshd's own auth record (ExposeAuthInfo). It is never a field the client supplies. When it is
 # unknown, the run neither supersedes nor is superseded: the fail-safe is to cancel nothing.
 DEDUP_DIR="${PNEUMA_GATE_DEDUP_DIR:-/var/lib/pneuma-gate-dedup}"
-PER_SUBMITTER_CAP="${PNEUMA_GATE_PER_SUBMITTER_CAP:-8}"   # live gates one submitter may hold at once (queued + running)
+PER_SUBMITTER_CAP="${PNEUMA_GATE_PER_SUBMITTER_CAP:-5}"   # live gates one submitter may hold at once (queued + running)
 dedup_register() {  # <id> <key> <head> <submitter> <unit> <worker pid> <nonce> <jobkey>
   # The identity is the WORKER's pid, never $$ (inside a subshell $$ is the top-level runner), plus its start time.
   mkdir -p "$DEDUP_DIR" && chmod 0700 "$DEDUP_DIR" || return 1
