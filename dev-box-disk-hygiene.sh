@@ -20,7 +20,7 @@
 #               VOLUME_GRACE. Named volumes and volumes in use are never selected.
 #   pytest      /tmp/pytest-of-<user>/pytest-N older than PYTEST_MIN_AGE, unreferenced
 #   basetemps   pytest basetemp layout (numbered dirs plus a *current symlink) under
-#               BASETEMP_ROOT_GLOBS, depth <= BASETEMP_MAX_DEPTH, older than BASETEMP_MIN_AGE
+#               BASETEMP_ROOTS, depth <= BASETEMP_MAX_DEPTH, older than BASETEMP_MIN_AGE
 #   releases    ~/.local/share/coding-gateway/releases/<40-hex>: keeps the release named
 #               by the gateway unit, any a symlink points to, any a process references,
 #               and the RELEASE_KEEP_NEWEST newest of the rest
@@ -61,7 +61,9 @@ VOLUME_GRACE=$((24 * 3600))
 PYTEST_MIN_AGE=$((3 * 3600))
 BASETEMP_MIN_AGE=$((24 * 3600))
 BASETEMP_MAX_DEPTH=4
-BASETEMP_ROOT_GLOBS=("$ROOT_PREFIX/tmp/claude-*" "$HOME/.cache/wt-669/claude-local")
+# Exact paths only. A glob is accepted only under $HOME (see root_entry_ok): /tmp is
+# world-writable, so nothing may be expanded there.
+BASETEMP_ROOTS=("$ROOT_PREFIX/tmp/claude-$(id -u)" "$HOME/.cache/wt-669/claude-local")
 RELEASE_KEEP_NEWEST=2
 # Stopped containers whose names match one of these globs are never removed.
 KEEP_CONTAINER_NAMES=('kodus*' 'db_kodus_*' 'rabbitmq-prod' 'coding-gateway-*')
@@ -167,18 +169,60 @@ under() {
     [[ "$(realpath -e -- "${1%/*}" 2>/dev/null)" == "$(realpath -e -- "$2" 2>/dev/null)" ]]
 }
 
-# remove_tree <dir>: delete a tree we own without following symlinks or leaving
-# the filesystem. Refuses the whole tree if any directory is group/other-writable
-# or any entry is owned by another uid. Read-only directories are made writable
-# from inside each parent (-execdir), so the chmod never resolves a path.
+# root_entry_ok <entry>: an absolute exact path, or a glob that lies under $HOME.
+root_entry_ok() {
+    case $1 in
+        *[*?[]*) [[ "$1" == "$HOME"/* ]] ;;
+        *) [[ "$1" == /* ]] ;;
+    esac
+}
+
+# chain_private <root> <dir>: every directory from <dir>'s parent up to <root>
+# (inclusive) is owned by us and not group/other-writable. Root itself is checked
+# by the caller with private_base.
+chain_private() {
+    local p=$2
+    while :; do
+        p=${p%/*}; [[ -n "$p" ]] || p=/
+        private_base "$p" || return 1
+        [[ "$p" == "$1" ]] && return 0
+        [[ "$p" == / ]] && return 1
+    done
+}
+
+# remove_tree <dir>: delete a tree we own. The parent must be reached without any
+# symlink (realpath equals the path), we cd into it and check pwd -P, then every
+# check and every removal is relative to that directory (./name), so a parent
+# swapped after validation cannot redirect the deletion. Refuses the whole tree
+# if any directory is group/other-writable or any entry is owned by another uid.
 remove_tree() {
-    if [[ -n "$(find "$1" -xdev -type d -perm /022 -print -quit)" ]]; then
-        warn "refusing to remove $1: a directory in it is group/other-writable"; return 1
+    local dir=$1 parent name uid
+    parent=${dir%/*}
+    name=${dir##*/}
+    uid=$(id -u)
+    if [[ -z "$name" || "$name" == . || "$name" == .. || "$parent" != /* ]]; then
+        warn "refusing to remove $dir: malformed path"; return 1
     fi
-    if [[ -n "$(find "$1" -xdev ! -uid "$(id -u)" -print -quit)" ]]; then
-        warn "refusing to remove $1: an entry in it is owned by another uid"; return 1
+    if [[ "$(realpath -e -- "$parent" 2>/dev/null)" != "$parent" ]]; then
+        warn "refusing to remove $dir: its parent is reached through a symlink"; return 1
     fi
-    find "$1" -xdev -type d ! -perm -u=w -execdir chmod u+w {} + && find "$1" -xdev -depth -delete
+    (
+        cd -- "$parent" || exit 1
+        if [[ "$(pwd -P)" != "$parent" ]]; then
+            warn "refusing to remove $dir: parent moved after validation"; exit 1
+        fi
+        if [[ ! -d "./$name" || -L "./$name" || "$(stat -c %u -- "./$name" 2>/dev/null)" != "$uid" ]]; then
+            warn "refusing to remove $dir: not a directory of ours"; exit 1
+        fi
+        if [[ -n "$(find "./$name" -xdev -type d -perm /022 -print -quit)" ]]; then
+            warn "refusing to remove $dir: a directory in it is group/other-writable"; exit 1
+        fi
+        if [[ -n "$(find "./$name" -xdev ! -uid "$uid" -print -quit)" ]]; then
+            warn "refusing to remove $dir: an entry in it is owned by another uid"; exit 1
+        fi
+        find "./$name" -xdev -type d ! -perm -u=w -execdir chmod u+w {} + \
+            && find "./$name" -xdev -depth -delete
+    )
 }
 
 # ---- grace window for anonymous volumes of removed containers -----------------
@@ -327,15 +371,21 @@ basetemp_layout_ok() {
 }
 
 select_basetemps() {
-    local glob root d newest
-    for glob in "${BASETEMP_ROOT_GLOBS[@]}"; do
-        for root in $glob; do                      # the glob expands on purpose
+    local entry root d newest
+    for entry in "${BASETEMP_ROOTS[@]}"; do
+        if ! root_entry_ok "$entry"; then
+            printf 'KEEP\tunsafe-root\t%s\n' "$entry"; continue
+        fi
+        for root in $entry; do                     # expands only for entries under $HOME
             [[ -d "$root" && ! -L "$root" ]] || continue
+            if ! private_base "$root"; then
+                printf 'KEEP\tunsafe-root\t%s\n' "$root"; continue
+            fi
             while IFS= read -r d; do
                 [[ -n "$d" ]] || continue
                 basetemp_layout_ok "$d" || continue
-                if ! owned_dir "$d"; then
-                    printf 'KEEP\tnot-owned-or-symlink\t%s\n' "$d"; continue
+                if ! owned_dir "$d" || ! chain_private "$root" "$d"; then
+                    printf 'KEEP\tunsafe-ancestor\t%s\n' "$d"; continue
                 fi
                 newest=$(find "$d" -maxdepth 2 -printf '%T@\n' 2>/dev/null | sort -rn | head -n1 | cut -d. -f1)
                 if [[ -z "$newest" ]] || (( newest >= $(date +%s) - BASETEMP_MIN_AGE )); then
@@ -432,8 +482,8 @@ remove_pytest_dirs() {
 remove_basetemps() {
     local d
     for d in "$@"; do
-        if [[ "$(realpath -e -- "$d" 2>/dev/null)" != "$d" ]] || ! owned_dir "$d" || ! basetemp_layout_ok "$d"; then
-            warn "refusing to remove $d (not a basetemp, not ours, or reached through a symlink)"; continue
+        if ! owned_dir "$d" || ! basetemp_layout_ok "$d"; then
+            warn "refusing to remove $d (not a basetemp or not ours)"; continue
         fi
         if remove_tree "$d"; then
             REMOVED_THIS=$((REMOVED_THIS + 1)); note "removed basetemp dir $d"
@@ -468,7 +518,10 @@ run_pass() {
     while IFS=$'\t' read -r verdict a b c; do
         case $verdict in
             SEL) keys+=("$a"); total=$((total + b)); shown+=("$c") ;;
-            KEEP) kept_by[$a]=$(( ${kept_by[$a]:-0} + 1 )) ;;
+            KEEP)
+                kept_by[$a]=$(( ${kept_by[$a]:-0} + 1 ))
+                [[ $mode == run && $a == unsafe-* ]] && warn "$label kept $b ($a)"
+                ;;
             NA) return 0 ;;
             ERR)
                 if [[ $mode == dry ]]; then echo "$label: skipped ($a)"; else warn "$label pass skipped: $a"; fi
@@ -512,9 +565,20 @@ routine_pass() {
     else
         note "skip: docker daemon not reachable"
     fi
-    run_pass pytest select_pytest remove_pytest_dirs "$mode"
-    run_pass basetemps select_basetemps remove_basetemps "$mode"
-    run_pass releases select_releases remove_releases "$mode"
+    if (( $(id -u) == 0 )); then
+        # Never walk another user's /tmp or home as root: the user-level install does these.
+        for label in pytest basetemps releases; do
+            if [[ $mode == dry ]]; then
+                echo "$label: skipped (running as root; use --install-user)"
+            else
+                note "$label pass skipped: running as root (use --install-user)"
+            fi
+        done
+    else
+        run_pass pytest select_pytest remove_pytest_dirs "$mode"
+        run_pass basetemps select_basetemps remove_basetemps "$mode"
+        run_pass releases select_releases remove_releases "$mode"
+    fi
     if docker_up; then
         if [[ $mode == run ]]; then
             prune_images

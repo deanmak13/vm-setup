@@ -76,7 +76,7 @@ check_not "grace_active on a missing file is false" grace_active "$(hex 32)"
 
 # --- basetemp layout ------------------------------------------------------------
 fresh
-BL=$T/root/tmp/claude-1000/layout
+BL=$T/root/tmp/claude-$(id -u)/layout
 mkdir -p "$BL/test_a0" "$BL/test_a1"; ln -s test_a1 "$BL/test_acurrent"
 check "a pytest basetemp layout is recognised" basetemp_layout_ok "$BL"
 echo x > "$BL/notes.txt"
@@ -139,7 +139,7 @@ check "select_pytest refuses a group-writable base" grep -q "^ERR" <<<"$(select_
 chmod 755 "$PYTEST_BASE"
 
 fresh
-BTR=$T/root/tmp/claude-1000
+BTR=$T/root/tmp/claude-$(id -u)
 mkdir -p "$BTR/proj/test_s0" "$BTR/proj/test_s1"
 echo x > "$BTR/proj/test_s0/f"; ln -s test_s1 "$BTR/proj/test_scurrent"
 touch -d '3 days ago' "$BTR/proj/test_s0/f" "$BTR/proj/test_s0" "$BTR/proj/test_s1" "$BTR/proj"
@@ -165,6 +165,34 @@ check "select_releases selects the oldest other" grep -q "^SEL	$RELDIR/$(rhex 4)
 check "select_releases keeps the active release" grep -q "^KEEP	active	$RELDIR/$(rhex 1)" <<<"$out"
 check "select_releases keeps the newest others" grep -q "^KEEP	newest-2	$RELDIR/$(rhex 3)" <<<"$out"
 
+# --- anchored removal, glob roots, root gate (review of the basetemp pass) --------
+fresh
+check_not "a glob outside HOME is not an acceptable root" root_entry_ok "/tmp/claude-*"
+check_not "an absolute glob under /tmp is refused" root_entry_ok "/tmp/claude-*/x"
+check "an exact absolute path is acceptable" root_entry_ok "$BASETEMP_UID_ROOT"
+check "a glob under HOME is acceptable" root_entry_ok "$HOME/.cache/wt-669/*"
+ORIG_ROOTS=("${BASETEMP_ROOTS[@]}")
+BASETEMP_ROOTS=("/tmp/claude-*")
+out=$(select_basetemps)
+check "a glob root outside HOME is rejected and journaled as unsafe" grep -q "^KEEP	unsafe-root	/tmp/claude-" <<<"$out"
+check_not "no basetemp is selected from a rejected glob" grep -q "^SEL" <<<"$out"
+BASETEMP_ROOTS=("${ORIG_ROOTS[@]}")
+
+fresh
+SW=$BASETEMP_UID_ROOT/swap
+mkdir -p "$SW/cand_x"; echo x > "$SW/cand_x/f"; chmod 755 "$SW" "$SW/cand_x"
+mkdir -p "$T/outside-sw/cand_x"; echo keep > "$T/outside-sw/cand_x/keep"; chmod 755 "$T/outside-sw" "$T/outside-sw/cand_x"
+mv "$SW" "$T/swap-away"; ln -s "$T/outside-sw" "$SW"
+remove_tree "$SW/cand_x" 2>/dev/null
+check "the swapped parent is still the symlink (refusal left it alone)" [ -L "$SW" ]
+check "nothing outside the swapped parent is removed" [ -f "$T/outside-sw/cand_x/keep" ]
+rm -f -- "$SW"; mv "$T/swap-away" "$SW"
+
+fresh
+RT=$BASETEMP_UID_ROOT/rt; mkdir -p "$RT/test_z0"; chmod 755 "$RT" "$RT/test_z0"; echo x > "$RT/test_z0/f"
+remove_tree "$RT/test_z0" 2>/dev/null
+check "a plain owned tree is removed by the anchored path" [ ! -e "$RT/test_z0" ]
+
 # --- removers -----------------------------------------------------------------
 fresh
 D1=$T/root/tmp/pytest-of-$(id -un)/pytest-9
@@ -186,9 +214,9 @@ remove_pytest_dirs "$T/elsewhere/pytest-8"
 check "remove_pytest_dirs refuses a path outside the base" [ -d "$T/elsewhere/pytest-8" ]
 
 fresh
-BTX=$T/root/tmp/claude-1000/rm/test_r0
+BTX=$T/root/tmp/claude-$(id -u)/rm/test_r0
 mkdir -p "$BTX"; echo x > "$BTX/f"; ln -s test_r0 "$(dirname "$BTX")/test_rcurrent"
-remove_basetemps "$BTX" "$T/root/tmp/claude-1000/rm"
+remove_basetemps "$BTX" "$T/root/tmp/claude-$(id -u)/rm"
 check "remove_basetemps refuses a dir without the layout" [ -d "$BTX" ]
 
 fresh

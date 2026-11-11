@@ -128,7 +128,7 @@ expect "five candidates cause one process scan" '^ps ' 1
 
 # --- basetemps: pytest layout under a claude scratch root --------------------
 reset_fakes
-BT=$T/root/tmp/claude-1000/proj
+BT=$T/root/tmp/claude-$(id -u)/proj
 mkdir -p "$BT/test_flow0" "$BT/test_flow1"
 chmod 755 "$BT" "$BT/test_flow0" "$BT/test_flow1"     # pytest makes basetemps 700; pin the test's mode
 echo x > "$BT/test_flow0/a.txt"; echo x > "$BT/test_flow1/b.txt"
@@ -136,8 +136,8 @@ ln -s test_flow1 "$BT/test_flowcurrent"
 touch -d '3 days ago' "$BT/test_flow0/a.txt" "$BT/test_flow0" "$BT/test_flow1/b.txt" "$BT/test_flow1" "$BT"
 touch -h -d '3 days ago' "$BT/test_flowcurrent"
 # A young basetemp and one with a foreign entry must survive.
-YB=$T/root/tmp/claude-1000/young; mkdir -p "$YB/test_y0"; echo x > "$YB/test_y0/y"; ln -s test_y0 "$YB/test_ycurrent"
-FB=$T/root/tmp/claude-1000/foreign; mkdir -p "$FB/test_f0" "$FB/test_f1"; echo x > "$FB/notes.txt"
+YB=$T/root/tmp/claude-$(id -u)/young; mkdir -p "$YB/test_y0"; echo x > "$YB/test_y0/y"; ln -s test_y0 "$YB/test_ycurrent"
+FB=$T/root/tmp/claude-$(id -u)/foreign; mkdir -p "$FB/test_f0" "$FB/test_f1"; echo x > "$FB/notes.txt"
 ln -s test_f1 "$FB/test_fcurrent"; touch -d '3 days ago' "$FB" "$FB/test_f0" "$FB/test_f1" "$FB/notes.txt"
 call --dry-run
 expect_out "dry run counts one basetemp" '^basetemps: 1 would be removed' 1
@@ -145,6 +145,46 @@ call --run
 check "real-looking basetemp removed" [ ! -e "$BT" ]
 check "young basetemp kept" [ -d "$YB" ]
 check "basetemp with a foreign entry kept" [ -d "$FB" ]
+
+# --- basetemp roots and ancestors must be private; root never walks user trees ----
+reset_fakes
+BTA=$BASETEMP_UID_ROOT/proj; mkdir -p "$BTA/test_a0" "$BTA/test_a1"; chmod 755 "$BTA" "$BTA/test_a0" "$BTA/test_a1"
+echo x > "$BTA/test_a0/f"; ln -s test_a1 "$BTA/test_acurrent"
+touch -d '3 days ago' "$BTA/test_a0/f" "$BTA/test_a0" "$BTA/test_a1" "$BTA"; touch -h -d '3 days ago' "$BTA/test_acurrent"
+FAKE_STAT_UID=0 export FAKE_STAT_UID
+call --dry-run
+expect_out "a basetemp root owned by another uid is refused" 'unsafe-root' 1
+expect_out "no basetemp is selected under a foreign-owned root" '^basetemps: 0 would be removed' 1
+call --run
+check "basetemp under a foreign-owned root kept" [ -d "$BTA" ]
+unset FAKE_STAT_UID
+
+reset_fakes
+BTM=$BASETEMP_UID_ROOT/mid; BTC=$BTM/proj; mkdir -p "$BTC/test_c0" "$BTC/test_c1"
+chmod 775 "$BTM"; chmod 755 "$BTC" "$BTC/test_c0" "$BTC/test_c1"
+echo x > "$BTC/test_c0/f"; ln -s test_c1 "$BTC/test_ccurrent"
+touch -d '3 days ago' "$BTC/test_c0/f" "$BTC/test_c0" "$BTC/test_c1" "$BTC"; touch -h -d '3 days ago' "$BTC/test_ccurrent"
+call --dry-run
+expect_out "a group-writable ancestor makes the candidate unsafe" 'unsafe-ancestor' 1
+call --run
+check "candidate under a group-writable ancestor kept" [ -d "$BTC" ]
+expect "the unsafe keep is journaled" 'basetemps kept .*unsafe-ancestor' 1
+
+reset_fakes
+add_pytest_dir pytest-0 5hours
+BTR0=$BASETEMP_UID_ROOT/proj; mkdir -p "$BTR0/test_r0" "$BTR0/test_r1"; chmod 755 "$BTR0" "$BTR0/test_r0" "$BTR0/test_r1"
+echo x > "$BTR0/test_r0/f"; ln -s test_r1 "$BTR0/test_rcurrent"
+touch -d '3 days ago' "$BTR0/test_r0/f" "$BTR0/test_r0" "$BTR0/test_r1" "$BTR0"; touch -h -d '3 days ago' "$BTR0/test_rcurrent"
+FAKE_UID=0 export FAKE_UID
+call --dry-run
+expect_out "root skips the pytest pass" 'pytest: skipped \(running as root' 1
+expect_out "root skips the basetemp pass" 'basetemps: skipped \(running as root' 1
+expect_out "root skips the release pass" 'releases: skipped \(running as root' 1
+call --run
+check "root leaves a user's pytest dir alone" [ -d "$PYTEST_BASE/pytest-0" ]
+check "root leaves a user's basetemp alone" [ -d "$BTR0" ]
+expect "root journals the skipped passes" 'pass skipped: running as root' 3
+unset FAKE_UID
 
 # --- ownership and symlink discipline on removal -----------------------------
 reset_fakes
@@ -182,7 +222,7 @@ check "candidate with inner symlink removed" [ ! -e "$PYTEST_BASE/pytest-0" ]
 check "symlink target outside the candidate untouched" [ -f "$T/outside/keep.txt" ]
 
 reset_fakes
-BT2=$T/root/tmp/claude-1000/gp; mkdir -p "$BT2/test_g0"; echo x > "$BT2/test_g0/f"
+BT2=$T/root/tmp/claude-$(id -u)/gp; mkdir -p "$BT2/test_g0"; echo x > "$BT2/test_g0/f"
 chmod 775 "$BT2/test_g0"; ln -s test_g0 "$BT2/test_gcurrent"; touch -d '3 days ago' "$BT2"/test_g0/f "$BT2/test_g0" "$BT2"
 call --run
 check "basetemp with a group-writable dir refused whole" [ -f "$BT2/test_g0/f" ]

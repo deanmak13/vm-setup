@@ -31,6 +31,7 @@ LOCK="$T/root/run/dev-box-disk-hygiene.lock"
 GRACE_FILE="$T/state/dev-box-disk-hygiene/volume-grace"
 PRUNE_STAMP="$T/state/dev-box-disk-hygiene/last-prune"
 PYTEST_BASE="$T/root/tmp/pytest-of-$(id -un)"
+BASETEMP_UID_ROOT="$T/root/tmp/claude-$(id -u)"
 RELDIR="$HOME/.local/share/coding-gateway/releases"
 UNIT="$HOME/.config/systemd/user/coding-gateway.service"
 
@@ -127,6 +128,10 @@ case "$name" in
     # FAKE_FOREIGN makes the foreign-owner probe report an entry owned by another uid.
     if [[ -n "${FAKE_FOREIGN:-}" && "$*" == *"! -uid"* ]]; then echo "$1/foreign-owned"; exit 0; fi
     exec /usr/bin/find "$@" ;;
+  id)
+    # FAKE_UID makes `id -u` report that uid (the root-skip tests); other forms pass through.
+    if [[ -n "${FAKE_UID:-}" && "$*" == "-u" ]]; then echo "$FAKE_UID"; exit 0; fi
+    exec /usr/bin/id "$@" ;;
   stat)
     # FAKE_STAT_UID makes every stat report that owner, so ownership checks fail.
     if [[ -n "${FAKE_STAT_UID:-}" ]]; then
@@ -139,7 +144,7 @@ esac
 exit 0
 SHIM
 chmod +x "$T/bin/fake-cmd"
-for n in docker df systemctl logger pgrep loginctl stat find ps; do ln -s "$T/bin/fake-cmd" "$T/bin/$n"; done
+for n in docker df systemctl logger pgrep loginctl stat find ps id; do ln -s "$T/bin/fake-cmd" "$T/bin/$n"; done
 
 # Fixture helpers.
 hex()  { printf '%064x' "$1"; }                  # 64-hex, like an anonymous volume id
@@ -165,13 +170,14 @@ set_free() { export FAKE_TOTAL_GB=1000 FAKE_FREE_GB=$(( $1 * 10 )); }
 
 reset_fakes() {
   unset FAKE_DOCKER_DOWN FAKE_DOCKER_HANG FAKE_PRUNE_FAIL FAKE_RM_FAIL FAKE_DF_BAD FAKE_PGREP_HIT \
-        FAKE_LINGER FAKE_STAT_UID FAKE_FOREIGN FAKE_PS_FAIL
+        FAKE_LINGER FAKE_STAT_UID FAKE_FOREIGN FAKE_PS_FAIL FAKE_UID
   set_free 50
   : > "$FAKE_LOG"; : > "$FAKE_PS"; : > "$FAKE_INSPECT"; : > "$FAKE_VOLS"
   chmod -R u+w "$HOME" "$T/root" "$T/state" 2>/dev/null
   rm -rf "$HOME/.local" "$HOME/.config" "$T/root/usr" "$T/root/etc" "$PYTEST_BASE" "$MARKER" \
-         "$T/state" "$T/root/tmp/claude-1000"
-  mkdir -p "$PYTEST_BASE" "$T/root/run" "$T/root/tmp"
+         "$T/state" "$BASETEMP_UID_ROOT"
+  mkdir -p "$PYTEST_BASE" "$T/root/run" "$T/root/tmp" "$BASETEMP_UID_ROOT"
+  chmod 755 "$BASETEMP_UID_ROOT"
   chmod 755 "$PYTEST_BASE"
 }
 
