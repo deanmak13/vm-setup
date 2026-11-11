@@ -30,7 +30,7 @@ add_container "$(hex 6)" rabbitmq-prod exited "$(docker_stamp 3 days)"
 add_container "$(hex 7)" pg-young exited "$(docker_stamp 1 hours)"
 add_container "$(hex 8)" pg-dead dead "$(docker_stamp 3 days)"
 call --dry-run
-expect_out "dry run counts two containers" '^containers: 2 would be removed' 1
+expect_out "dry run counts two containers" '^containers: would remove=2' 1
 expect_out "dry run names the selected containers" '^  tst-pg-run1$' 1
 expect_out "dry run names the dead container" '^  pg-dead$' 1
 expect "dry run removes no container" '^docker rm ' 0
@@ -91,7 +91,7 @@ add_volume "$(hex 11)" 0 "$(rfc_stamp 1 hours)" 1GB                 # younger th
 add_volume pgdata 0 "$(rfc_stamp 3 days)" 3GB                       # named
 add_volume "$(hex 12)" 1 "$(rfc_stamp 3 days)" 4GB                  # in use
 call --dry-run
-expect_out "dry run counts one volume at 2.0GB" '^volumes: 1 would be removed \(2.0GB\)' 1
+expect_out "dry run counts one volume at 2.0GB" '^volumes: would remove=1 \(2.0GB\)' 1
 expect "dry run removes no volume" '^docker volume rm ' 0
 call --run
 expect "old anonymous dangling volume is removed" "^docker volume rm -- $(hex 10)\$" 1
@@ -109,7 +109,7 @@ add_pytest_dir pytest-2 10minutes      # young: kept
 ln -s pytest-2 "$PYTEST_BASE/pytest-current"
 export FAKE_PGREP_HIT="$PYTEST_BASE/pytest-1"
 call --dry-run
-expect_out "dry run counts one pytest dir" '^pytest: 1 would be removed' 1
+expect_out "dry run counts one pytest dir" '^pytest: would remove=1' 1
 expect "dry run removes no pytest dir" '^docker (rm|volume rm|image prune) |^rm ' 0
 check "dry run kept pytest-0" [ -d "$PYTEST_BASE/pytest-0" ]
 call --run
@@ -140,7 +140,7 @@ YB=$T/root/tmp/claude-$FAKE_UID/young; mkdir -p "$YB/test_y0"; echo x > "$YB/tes
 FB=$T/root/tmp/claude-$FAKE_UID/foreign; mkdir -p "$FB/test_f0" "$FB/test_f1"; echo x > "$FB/notes.txt"
 ln -s test_f1 "$FB/test_fcurrent"; touch -d '3 days ago' "$FB" "$FB/test_f0" "$FB/test_f1" "$FB/notes.txt"
 call --dry-run
-expect_out "dry run counts one basetemp" '^basetemps: 1 would be removed' 1
+expect_out "dry run counts one basetemp" '^basetemps: would remove=1' 1
 call --run
 check "real-looking basetemp removed" [ ! -e "$BT" ]
 check "young basetemp kept" [ -d "$YB" ]
@@ -154,7 +154,7 @@ touch -d '3 days ago' "$BTA/test_a0/f" "$BTA/test_a0" "$BTA/test_a1" "$BTA"; tou
 FAKE_STAT_UID=0 export FAKE_STAT_UID
 call --dry-run
 expect_out "a basetemp root owned by another uid is refused" 'unsafe-root' 1
-expect_out "no basetemp is selected under a foreign-owned root" '^basetemps: 0 would be removed' 1
+expect_out "no basetemp is selected under a foreign-owned root" '^basetemps: would remove=0' 1
 call --run
 check "basetemp under a foreign-owned root kept" [ -d "$BTA" ]
 unset FAKE_STAT_UID
@@ -238,7 +238,7 @@ mkdir -p "$(dirname "$UNIT")"
 printf 'ExecStart=%s/%s/bin/gateway\n' "$RELDIR" "$(rhex 1)" > "$UNIT"
 export FAKE_PGREP_HIT="$RELDIR/$(rhex 2)"
 call --dry-run
-expect_out "dry run counts one superseded release" '^releases: 1 would be removed' 1
+expect_out "dry run counts one superseded release" '^releases: would remove=1' 1
 expect_out "dry run keeps the active release" 'active=1' 1
 check "dry run removed no release" [ -d "$RELDIR/$(rhex 5)" ]
 call --run
@@ -257,7 +257,7 @@ printf 'ExecStart=%s/%s/bin/gateway\n' "$RELDIR" "$(rhex 1)" > "$UNIT"
 add_release 5 7hours
 ln -s "$RELDIR/$(rhex 2)" "$(dirname "$RELDIR")/current"
 call --dry-run
-expect_out "release pointed at by a current link is protected; the oldest unprotected is selected" 'releases: 1 would be removed' 1
+expect_out "release pointed at by a current link is protected; the oldest unprotected is selected" 'releases: would remove=1' 1
 call --run
 check "release pointed at by a current link survives" [ -d "$RELDIR/$(rhex 2)" ]
 check "a release that would otherwise be a newest-two keeper is kept" [ -d "$RELDIR/$(rhex 4)" ]
@@ -282,7 +282,7 @@ add_release 4 6hours
 chmod 775 "$RELDIR/$(rhex 4)/bin"
 call --run
 check "group-writable release tree refused whole" [ -f "$RELDIR/$(rhex 4)/bin/gateway" ]
-expect "group-writable tree refusal is journaled" 'refusing to remove .*group/other-writable' 1
+expect "group-writable tree refusal is journaled" 'refusing to remove .*: group-writable' 1
 
 reset_fakes
 add_release 1 4hours
@@ -291,10 +291,10 @@ printf 'ExecStart=%s/%s/bin/gateway\n' "$RELDIR" "$(rhex 1)" > "$UNIT"
 add_release 2 5hours
 add_release 3 3hours
 add_release 4 6hours
-FAKE_FOREIGN=1 export FAKE_FOREIGN
+FAKE_FOREIGN=$(rhex 4) export FAKE_FOREIGN
 call --run
 check "tree with a foreign-owned entry refused whole" [ -f "$RELDIR/$(rhex 4)/bin/gateway" ]
-expect "foreign-owned entry refusal is journaled" 'owned by another uid' 1
+expect "foreign-owned entry refusal is journaled" 'refusing to remove .*: foreign-owner' 1
 unset FAKE_FOREIGN
 
 reset_fakes
@@ -338,10 +338,10 @@ expect "dry run journals nothing" 'logger' 0
 expect "dry run calls no rm" '^rm ' 0
 expect "dry run writes no grace state" 'docker rm' 0
 check "dry run wrote no grace file" [ ! -e "$GRACE_FILE" ]
-expect_out "dry run reports containers" '^containers: 1 would be removed' 1
-expect_out "dry run reports volumes" '^volumes: 1 would be removed \(2.0GB\)' 1
-expect_out "dry run reports pytest" '^pytest: 1 would be removed' 1
-expect_out "dry run reports releases" '^releases: 0 would be removed' 1
+expect_out "dry run reports containers" '^containers: would remove=1' 1
+expect_out "dry run reports volumes" '^volumes: would remove=1 \(2.0GB\)' 1
+expect_out "dry run reports pytest" '^pytest: would remove=1' 1
+expect_out "dry run reports releases" '^releases: would remove=0' 1
 expect_out "dry run reports images" '^images: 3 dangling would be pruned' 1
 expect_out "dry run says nothing changed" 'dry run: nothing was changed' 1
 check "dry run kept the pytest dir" [ -d "$PYTEST_BASE/pytest-0" ]
@@ -514,6 +514,25 @@ check "--uninstall-user exits 0" [ "$rc" -eq 0 ]
 check "user binary removed" [ ! -e "$UBIN" ]
 check "user units removed" [ ! -e "$UUNITS/dev-box-disk-hygiene-guard.timer" ]
 expect "user uninstall disables the user timers" '^systemctl --user disable --now' 1
+
+# --- dry run and real run agree on the selected and refused sets ------------------
+reset_fakes
+chmod 700 "$PYTEST_BASE"
+add_pytest_dir pytest-41 5hours
+add_pytest_dir pytest-42 5hours
+FAKE_FOREIGN=pytest-42 export FAKE_FOREIGN
+call --dry-run
+expect_out "dry run lists the foreign-owned tree as refused with its reason" "refused foreign-owner: $PYTEST_BASE/pytest-42" 1
+expect_out "dry run counts the clean tree as would remove" '^pytest: would remove=1' 1
+expect_out "dry run counts the refusal by reason" 'refused foreign-owner=1' 1
+check "dry run mutates nothing (refused tree)" [ -e "$PYTEST_BASE/pytest-42" ]
+check "dry run mutates nothing (clean tree)" [ -e "$PYTEST_BASE/pytest-41" ]
+call --run
+check "real run removes the clean tree" [ ! -e "$PYTEST_BASE/pytest-41" ]
+check "real run keeps the refused tree" [ -e "$PYTEST_BASE/pytest-42" ]
+expect "real run journals the same refusal" 'refusing to remove .*pytest-42: foreign-owner' 1
+expect "real run summary counts the same refusal" 'refused foreign-owner=1' 1
+unset FAKE_FOREIGN
 
 # --- usage -------------------------------------------------------------------
 call bogus

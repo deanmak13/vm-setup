@@ -136,8 +136,13 @@ case "$name" in
     exit 0 ;;
   pgrep) exit 1 ;;
   find)
-    # FAKE_FOREIGN makes the foreign-owner probe report an entry owned by another uid.
-    if [[ -n "${FAKE_FOREIGN:-}" && "$*" == *"! -uid"* ]]; then echo "$1/foreign-owned"; exit 0; fi
+    # FAKE_FOREIGN=<tree name> makes the foreign-owner probe of that tree report an entry
+    # owned by another uid; other trees are unaffected.
+    if [[ -n "${FAKE_FOREIGN:-}" && "$*" == *"! -uid"* ]]; then
+      for a in "$@"; do
+        if [[ "$a" == "./$FAKE_FOREIGN" || "$a" == "$FAKE_FOREIGN" ]]; then echo "$a/foreign-owned"; exit 0; fi
+      done
+    fi
     # FAKE_UID: the "not ours" probe compares against the real uid that owns the files.
     if [[ -n "${FAKE_UID:-}" && "$*" == *"! -uid"* ]]; then
       args=(); prev=
@@ -153,6 +158,8 @@ case "$name" in
     if [[ -n "${FAKE_UID:-}" && "$*" == "-u" ]]; then echo "$FAKE_UID"; exit 0; fi
     exec /usr/bin/id "$@" ;;
   stat)
+    # FAKE_DOT_UID makes only the stat of "." report that owner.
+    if [[ -n "${FAKE_DOT_UID:-}" && "${@: -1}" == . && "$*" != *%a* ]]; then echo "$FAKE_DOT_UID"; exit 0; fi
     # FAKE_STAT_UID makes every stat report that owner, so ownership checks fail.
     if [[ -n "${FAKE_STAT_UID:-}" ]]; then
       if [[ "$*" == *%a* ]]; then echo "$FAKE_STAT_UID 755"; else echo "$FAKE_STAT_UID"; fi
@@ -195,7 +202,7 @@ set_free() { export FAKE_TOTAL_GB=1000 FAKE_FREE_GB=$(( $1 * 10 )); }
 
 reset_fakes() {
   unset FAKE_DOCKER_DOWN FAKE_DOCKER_HANG FAKE_PRUNE_FAIL FAKE_RM_FAIL FAKE_DF_BAD FAKE_PGREP_HIT \
-        FAKE_LINGER FAKE_STAT_UID FAKE_FOREIGN FAKE_PS_FAIL
+        FAKE_LINGER FAKE_STAT_UID FAKE_DOT_UID FAKE_FOREIGN FAKE_PS_FAIL
   export FAKE_UID=1000
   set_free 50
   : > "$FAKE_LOG"; : > "$FAKE_PS"; : > "$FAKE_INSPECT"; : > "$FAKE_VOLS"

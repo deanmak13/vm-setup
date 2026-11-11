@@ -217,7 +217,7 @@ check_not "remove_tree refuses a path with no name" remove_tree "/"
 mkdir -p "$T/rt-parent"; chmod 755 "$T/rt-parent"
 check_not "remove_tree refuses a missing directory" remove_tree "$T/rt-parent/absent"
 mkdir -p "$T/rt-parent2/d"; chmod 755 "$T/rt-parent2" "$T/rt-parent2/d"; echo x > "$T/rt-parent2/d/f"
-FAKE_FOREIGN=1 export FAKE_FOREIGN
+FAKE_FOREIGN=d export FAKE_FOREIGN
 check_not "remove_tree refuses a tree with a foreign-owned entry" remove_tree "$T/rt-parent2/d"
 check "the refused tree is intact" [ -f "$T/rt-parent2/d/f" ]
 unset FAKE_FOREIGN
@@ -266,6 +266,7 @@ add_release 5 3hours
 chmod 775 "$RELDIR/$(rhex 5)/bin"
 remove_releases "$RELDIR/$(rhex 5)"
 check "remove_releases keeps a release with a group-writable dir" [ -d "$RELDIR/$(rhex 5)" ]
+check "the release checker reports a group-writable release as refused, as the deleter does" [ "$(release_verdict "$RELDIR/$(rhex 5)")" = group-writable ]
 
 fresh
 add_container "$(hex 60)" gone exited "$(docker_stamp 3 days)"
@@ -359,7 +360,7 @@ sel_mixed() { printf 'SEL\tk1\t10\tlabel1\nKEEP\twhy\tk2\nSEL\tk3\t5\tlabel3\n';
 rem_count() { REMOVED_THIS=0; REMOVED_LIST+=("$@"); REMOVED_THIS=${#REMOVED_LIST[@]}; }
 REMOVED_LIST=()
 run_pass mixed sel_mixed rem_count dry > "$OUT"
-check "dry run_pass reports the selection" grep -q "mixed: 2 would be removed" "$OUT"
+check "dry run_pass reports the selection" grep -q "mixed: would remove=2" "$OUT"
 check "dry run_pass lists small selections" grep -q "label1" "$OUT"
 REMOVED_LIST=()
 run_pass mixed sel_mixed rem_count run
@@ -478,6 +479,72 @@ check "main with an unknown argument exits 2" [ "$rc" -eq 2 ]
 check "main --install-user installs" [ -x "$HOME/.local/bin/$TAG" ]
 ( main --uninstall-user ) >/dev/null 2>&1
 check "main --uninstall-user uninstalls" [ ! -e "$HOME/.local/bin/$TAG" ]
+
+# --- loose modes inside a tree: relaxed only under a private 0700 base --------
+fresh
+chmod 700 "$PYTEST_BASE"
+add_pytest_dir pytest-30 5hours
+mkdir -p "$PYTEST_BASE/pytest-30/loose"; chmod 777 "$PYTEST_BASE/pytest-30/loose"; echo x > "$PYTEST_BASE/pytest-30/loose/f"
+touch -d "5 hours ago" "$PYTEST_BASE/pytest-30/loose/f" "$PYTEST_BASE/pytest-30/loose" "$PYTEST_BASE/pytest-30"
+remove_pytest_dirs "$PYTEST_BASE/pytest-30"
+check "a tree with a 0777 directory under a 0700 base is removed" [ ! -e "$PYTEST_BASE/pytest-30" ]
+
+fresh
+chmod 755 "$PYTEST_BASE"
+add_pytest_dir pytest-31 5hours
+mkdir -p "$PYTEST_BASE/pytest-31/loose"; chmod 777 "$PYTEST_BASE/pytest-31/loose"; echo x > "$PYTEST_BASE/pytest-31/loose/f"
+touch -d "5 hours ago" "$PYTEST_BASE/pytest-31/loose/f" "$PYTEST_BASE/pytest-31/loose" "$PYTEST_BASE/pytest-31"
+remove_pytest_dirs "$PYTEST_BASE/pytest-31"
+check "the same tree under a 0755 base is refused" [ -f "$PYTEST_BASE/pytest-31/loose/f" ]
+
+for mode in 700 755; do
+  fresh
+  chmod "$mode" "$PYTEST_BASE"
+  add_pytest_dir pytest-32 5hours
+  FAKE_FOREIGN=pytest-32 export FAKE_FOREIGN
+  remove_pytest_dirs "$PYTEST_BASE/pytest-32"
+  unset FAKE_FOREIGN
+  check "a tree holding a foreign-owned entry is refused under base $mode" [ -e "$PYTEST_BASE/pytest-32" ]
+done
+
+fresh
+chmod 700 "$PYTEST_BASE"
+add_pytest_dir pytest-33 5hours
+mkdir -p "$T/outside-33"; echo keep > "$T/outside-33/keep"
+ln -s "$T/outside-33" "$PYTEST_BASE/pytest-33/link"
+remove_pytest_dirs "$PYTEST_BASE/pytest-33"
+check "a symlink inside a relaxed tree is not followed" [ -f "$T/outside-33/keep" ]
+
+fresh
+mkdir -p "$T/dotchk/x"; chmod 755 "$T/dotchk" "$T/dotchk/x"
+dotv=$( cd "$T/dotchk" && export FAKE_DOT_UID=0 && verdict_here x 0 )
+check "a directory whose own owner is not ours is refused before anything runs" [ "$dotv" = not-ours ]
+
+fresh
+chmod 755 "$PYTEST_BASE"
+add_pytest_dir pytest-34 5hours
+mkdir -p "$PYTEST_BASE/pytest-34/loose"; chmod 777 "$PYTEST_BASE/pytest-34/loose"; echo x > "$PYTEST_BASE/pytest-34/loose/f"
+touch -d "5 hours ago" "$PYTEST_BASE/pytest-34/loose/f" "$PYTEST_BASE/pytest-34/loose" "$PYTEST_BASE/pytest-34"
+run_pass pytest select_pytest remove_pytest_dirs run
+check "the pass summary counts the refused tree and its reason" grep -q "refused group-writable=1" "$FAKE_LOG"
+
+# --- relaxed basetemp trees: the root and every ancestor must be private --------
+fresh
+chmod 700 "$BASETEMP_UID_ROOT"
+mkdir -p "$BASETEMP_UID_ROOT/deep"; chmod 700 "$BASETEMP_UID_ROOT/deep"
+mk_basetemp "$BASETEMP_UID_ROOT/deep/proj" 3days
+chmod 777 "$BASETEMP_UID_ROOT/deep/proj/"*0
+remove_basetemps "$BASETEMP_UID_ROOT/deep/proj"
+check "a basetemp under a 0700 root and private ancestors with a 0777 dir is removed" [ ! -e "$BASETEMP_UID_ROOT/deep/proj" ]
+
+fresh
+chmod 700 "$BASETEMP_UID_ROOT"
+mkdir -p "$BASETEMP_UID_ROOT/grp"; chmod 750 "$BASETEMP_UID_ROOT/grp"
+mk_basetemp "$BASETEMP_UID_ROOT/grp/proj" 3days
+chmod 777 "$BASETEMP_UID_ROOT/grp/proj/"*0
+remove_basetemps "$BASETEMP_UID_ROOT/grp/proj"
+check "a group-accessible ancestor keeps the tree" [ -d "$BASETEMP_UID_ROOT/grp/proj" ]
+
 
 if [[ $fail -eq 0 ]]; then
   echo "dev-box-disk-hygiene unit tests: all passed"
