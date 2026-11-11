@@ -143,9 +143,18 @@ under() {
 }
 
 # remove_tree <dir>: delete a tree we own without following symlinks or leaving
-# the filesystem. Read-only directories are made writable first (find, not -R).
+# the filesystem. Refuses the whole tree if any directory is group/other-writable
+# or any entry is owned by another uid: then no other user can swap entries
+# under us. Read-only directories are made writable from inside each parent
+# (-execdir), so the chmod never resolves a path through a swapped symlink.
 remove_tree() {
-    find "$1" -xdev -type d -exec chmod u+w {} + && find "$1" -xdev -depth -delete
+    if [[ -n "$(find "$1" -xdev -type d -perm /022 -print -quit)" ]]; then
+        warn "refusing to remove $1: a directory in it is group/other-writable"; return 1
+    fi
+    if [[ -n "$(find "$1" -xdev ! -uid "$(id -u)" -print -quit)" ]]; then
+        warn "refusing to remove $1: an entry in it is owned by another uid"; return 1
+    fi
+    find "$1" -xdev -type d ! -perm -u=w -execdir chmod u+w {} + && find "$1" -xdev -depth -delete
 }
 
 # ---- selectors: print "SEL<TAB>key<TAB>bytes<TAB>label", "KEEP<TAB>reason<TAB>item", "NA" (not applicable) or "ERR<TAB>message"

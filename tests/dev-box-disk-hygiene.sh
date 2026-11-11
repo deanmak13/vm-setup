@@ -104,6 +104,10 @@ case "$name" in
     [[ -n "${FAKE_PGREP_HIT:-}" && "$*" == *"$FAKE_PGREP_HIT"* ]] && { echo 4242; exit 0; }
     exit 1 ;;
   loginctl) echo "${FAKE_LINGER:-yes}"; exit 0 ;;
+  find)
+    # FAKE_FOREIGN makes the foreign-owner probe report an entry owned by another uid.
+    if [[ -n "${FAKE_FOREIGN:-}" && "$*" == *"! -uid"* ]]; then echo "$1/foreign-owned"; exit 0; fi
+    exec /usr/bin/find "$@" ;;
   stat)
     # FAKE_STAT_UID makes every stat report that owner, so ownership checks fail.
     if [[ -n "${FAKE_STAT_UID:-}" ]]; then
@@ -115,7 +119,7 @@ esac
 exit 0
 SHIM
 chmod +x "$T/bin/fake-cmd"
-for n in docker df systemctl logger pgrep loginctl stat; do ln -s "$T/bin/fake-cmd" "$T/bin/$n"; done
+for n in docker df systemctl logger pgrep loginctl stat find; do ln -s "$T/bin/fake-cmd" "$T/bin/$n"; done
 
 # Fixture helpers.
 hex()  { printf '%064x' "$1"; }                  # 64-hex, like an anonymous volume id
@@ -131,7 +135,7 @@ add_volume() { printf '%s %s %s %s\n' "$1" "$2" "$3" "$4" >> "$FAKE_VOLS"; }
 set_free() { export FAKE_TOTAL_GB=1000 FAKE_FREE_GB=$(( $1 * 10 )); }
 
 reset_fakes() {
-  unset FAKE_DOCKER_DOWN FAKE_PRUNE_FAIL FAKE_RM_FAIL FAKE_DF_BAD FAKE_PGREP_HIT FAKE_LINGER FAKE_STAT_UID
+  unset FAKE_DOCKER_DOWN FAKE_PRUNE_FAIL FAKE_RM_FAIL FAKE_DF_BAD FAKE_PGREP_HIT FAKE_LINGER FAKE_STAT_UID FAKE_FOREIGN
   set_free 50
   : > "$FAKE_LOG"; : > "$FAKE_PS"; : > "$FAKE_VOLS"
   chmod -R u+w "$HOME" "$T/root" 2>/dev/null
@@ -143,6 +147,7 @@ reset_fakes() {
 # add_pytest_dir <name> <age>: directory whose entries are all <age> old.
 add_pytest_dir() {
   mkdir -p "$PYTEST_BASE/$1"
+  chmod 755 "$PYTEST_BASE/$1"   # explicit: umask may leave dirs group-writable
   echo x > "$PYTEST_BASE/$1/f.txt"
   touch -d "$2 ago" "$PYTEST_BASE/$1/f.txt" "$PYTEST_BASE/$1"
 }
@@ -310,6 +315,35 @@ chmod 775 "$PYTEST_BASE"
 call --run
 [[ -d "$PYTEST_BASE/pytest-0" ]] || { echo "FAIL: pytest dir removed under a group-writable base" >&2; fail=1; }
 expect "group-writable pytest base is journaled as skipped" 'pytest pass skipped' 1
+
+# A tree holding a group-writable directory is refused whole: nothing changes.
+reset_fakes
+add_release 1 4hours
+mkdir -p "$(dirname "$UNIT")"
+printf 'ExecStart=%s/%s/bin/gateway\n' "$RELDIR" "$(rhex 1)" > "$UNIT"
+add_release 2 5hours
+add_release 3 3hours
+add_release 4 6hours
+chmod 775 "$RELDIR/$(rhex 4)/bin"
+call --run
+[[ -d "$RELDIR/$(rhex 4)/bin/" ]] || { echo "FAIL: group-writable release tree removed" >&2; fail=1; }
+[[ -f "$RELDIR/$(rhex 4)/bin/gateway" ]] || { echo "FAIL: files in refused tree removed" >&2; fail=1; }
+expect "group-writable tree refusal is journaled" 'refusing to remove .*group/other-writable' 1
+expect "group-writable tree refusal is journaled as a failed removal" 'could not remove gateway release|refusing to remove' 2
+
+# A tree holding an entry owned by another uid is refused whole.
+reset_fakes
+add_release 1 4hours
+mkdir -p "$(dirname "$UNIT")"
+printf 'ExecStart=%s/%s/bin/gateway\n' "$RELDIR" "$(rhex 1)" > "$UNIT"
+add_release 2 5hours
+add_release 3 3hours
+add_release 4 6hours
+FAKE_FOREIGN=1 export FAKE_FOREIGN
+call --run
+[[ -f "$RELDIR/$(rhex 4)/bin/gateway" ]] || { echo "FAIL: tree with foreign-owned entry removed" >&2; fail=1; }
+expect "foreign-owned entry refusal is journaled" 'owned by another uid' 1
+unset FAKE_FOREIGN
 
 # A candidate that is a symlink: the link and its target are both untouched.
 reset_fakes
