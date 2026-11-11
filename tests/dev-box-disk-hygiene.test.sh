@@ -479,6 +479,68 @@ check "main --install-user installs" [ -x "$HOME/.local/bin/$TAG" ]
 ( main --uninstall-user ) >/dev/null 2>&1
 check "main --uninstall-user uninstalls" [ ! -e "$HOME/.local/bin/$TAG" ]
 
+# --- loose modes inside a tree: relaxed only under a private 0700 base --------
+fresh
+chmod 700 "$PYTEST_BASE"
+add_pytest_dir pytest-30 5hours
+mkdir -p "$PYTEST_BASE/pytest-30/loose"; chmod 777 "$PYTEST_BASE/pytest-30/loose"; echo x > "$PYTEST_BASE/pytest-30/loose/f"
+touch -d "5 hours ago" "$PYTEST_BASE/pytest-30/loose/f" "$PYTEST_BASE/pytest-30/loose" "$PYTEST_BASE/pytest-30"
+remove_pytest_dirs "$PYTEST_BASE/pytest-30"
+check "a tree with a 0777 directory under a 0700 base is removed" [ ! -e "$PYTEST_BASE/pytest-30" ]
+
+fresh
+chmod 755 "$PYTEST_BASE"
+add_pytest_dir pytest-31 5hours
+mkdir -p "$PYTEST_BASE/pytest-31/loose"; chmod 777 "$PYTEST_BASE/pytest-31/loose"; echo x > "$PYTEST_BASE/pytest-31/loose/f"
+touch -d "5 hours ago" "$PYTEST_BASE/pytest-31/loose/f" "$PYTEST_BASE/pytest-31/loose" "$PYTEST_BASE/pytest-31"
+remove_pytest_dirs "$PYTEST_BASE/pytest-31"
+check "the same tree under a 0755 base is refused" [ -f "$PYTEST_BASE/pytest-31/loose/f" ]
+
+for mode in 700 755; do
+  fresh
+  chmod "$mode" "$PYTEST_BASE"
+  add_pytest_dir pytest-32 5hours
+  FAKE_FOREIGN=1 export FAKE_FOREIGN
+  remove_pytest_dirs "$PYTEST_BASE/pytest-32"
+  unset FAKE_FOREIGN
+  check "a tree holding a foreign-owned entry is refused under base $mode" [ -e "$PYTEST_BASE/pytest-32" ]
+done
+
+fresh
+chmod 700 "$PYTEST_BASE"
+add_pytest_dir pytest-33 5hours
+mkdir -p "$T/outside-33"; echo keep > "$T/outside-33/keep"
+ln -s "$T/outside-33" "$PYTEST_BASE/pytest-33/link"
+remove_pytest_dirs "$PYTEST_BASE/pytest-33"
+check "a symlink inside a relaxed tree is not followed" [ -f "$T/outside-33/keep" ]
+
+fresh
+chmod 755 "$PYTEST_BASE"
+add_pytest_dir pytest-34 5hours
+mkdir -p "$PYTEST_BASE/pytest-34/loose"; chmod 777 "$PYTEST_BASE/pytest-34/loose"; echo x > "$PYTEST_BASE/pytest-34/loose/f"
+touch -d "5 hours ago" "$PYTEST_BASE/pytest-34/loose/f" "$PYTEST_BASE/pytest-34/loose" "$PYTEST_BASE/pytest-34"
+run_pass pytest select_pytest remove_pytest_dirs run
+check "the pass summary counts the refused tree and its reason" grep -q "refused group-writable=1" "$FAKE_LOG"
+
+# --- relaxed basetemp trees: the root and every ancestor must be private --------
+fresh
+chmod 700 "$BASETEMP_UID_ROOT"
+mkdir -p "$BASETEMP_UID_ROOT/deep"; chmod 700 "$BASETEMP_UID_ROOT/deep"
+mk_basetemp "$BASETEMP_UID_ROOT/deep/proj" 3days
+chmod 777 "$BASETEMP_UID_ROOT/deep/proj/"*0
+remove_basetemps "$BASETEMP_UID_ROOT/deep/proj"
+check "a basetemp under a 0700 root and private ancestors with a 0777 dir is removed" [ ! -e "$BASETEMP_UID_ROOT/deep/proj" ]
+
+fresh
+chmod 700 "$BASETEMP_UID_ROOT"
+mkdir -p "$BASETEMP_UID_ROOT/grp"; chmod 750 "$BASETEMP_UID_ROOT/grp"
+mk_basetemp "$BASETEMP_UID_ROOT/grp/proj" 3days
+chmod 777 "$BASETEMP_UID_ROOT/grp/proj/"*0
+remove_basetemps "$BASETEMP_UID_ROOT/grp/proj"
+check "a group-accessible ancestor keeps the tree" [ -d "$BASETEMP_UID_ROOT/grp/proj" ]
+
+check "an unknown owner is journaled as not-ours" [ "$(refusal_reason 4)" = not-ours ]
+
 if [[ $fail -eq 0 ]]; then
   echo "dev-box-disk-hygiene unit tests: all passed"
 fi

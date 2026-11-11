@@ -282,7 +282,7 @@ add_release 4 6hours
 chmod 775 "$RELDIR/$(rhex 4)/bin"
 call --run
 check "group-writable release tree refused whole" [ -f "$RELDIR/$(rhex 4)/bin/gateway" ]
-expect "group-writable tree refusal is journaled" 'refusing to remove .*group/other-writable' 1
+expect "group-writable tree refusal is journaled" 'refusing to remove .*: group-writable' 1
 
 reset_fakes
 add_release 1 4hours
@@ -294,7 +294,7 @@ add_release 4 6hours
 FAKE_FOREIGN=1 export FAKE_FOREIGN
 call --run
 check "tree with a foreign-owned entry refused whole" [ -f "$RELDIR/$(rhex 4)/bin/gateway" ]
-expect "foreign-owned entry refusal is journaled" 'owned by another uid' 1
+expect "foreign-owned entry refusal is journaled" 'refusing to remove .*: foreign-owner' 1
 unset FAKE_FOREIGN
 
 reset_fakes

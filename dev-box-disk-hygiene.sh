@@ -82,6 +82,7 @@ fi
 MARKER=$RUN_DIR/dev-box-disk-low
 LOCK=$RUN_DIR/dev-box-disk-hygiene.lock
 REMOVED_THIS=0
+declare -A REFUSED_BY=()
 PROC_SNAP=""
 PROC_SNAP_OK=0
 PROC_SNAP_TAKEN=0
@@ -190,39 +191,64 @@ chain_private() {
     done
 }
 
-# remove_tree <dir>: delete a tree we own. The parent must be reached without any
-# symlink (realpath equals the path), we cd into it and check pwd -P, then every
-# check and every removal is relative to that directory (./name), so a parent
-# swapped after validation cannot redirect the deletion. Refuses the whole tree
-# if any directory is group/other-writable or any entry is owned by another uid.
+# relax_ok <base> <dir>: the base is owned by us with mode exactly 0700, and every
+# directory from <dir>'s parent down to the base is owned by us with no group/other
+# access. Then no other user can reach the tree, so loose modes inside it are harmless.
+relax_ok() {
+    local p=${2%/*} uid ub mb u m
+    uid=$(id -u)
+    read -r ub mb < <(stat -c '%u %a' -- "$1" 2>/dev/null) || return 1
+    [[ "$ub" == "$uid" && "$mb" == 700 ]] || return 1
+    while [[ "$p" != "$1" ]]; do
+        [[ "$p" == "$1"/* ]] || return 1
+        read -r u m < <(stat -c '%u %a' -- "$p" 2>/dev/null) || return 1
+        [[ "$u" == "$uid" && "$m" =~ ^[0-7]+$ ]] || return 1
+        (( 8#$m & 077 )) && return 1
+        p=${p%/*}
+    done
+    return 0
+}
+
+# remove_tree <dir> [relax]: delete a tree we own. The parent must be reached without
+# a symlink; we cd into it and check pwd -P, then run every check and removal relative
+# to it (./name), so a parent swapped after validation cannot redirect the deletion.
+# Always refused: any entry owned by another uid. Refused unless relax=1: any directory
+# that is group/other-writable. Returns 0 when removed; 1 unsafe path, 2 group/other-
+# writable directory, 3 foreign-owned entry, 4 not ours or moved, 5 removal failed.
 remove_tree() {
-    local dir=$1 parent name uid
+    local dir=$1 relax=${2:-0} parent name uid
     parent=${dir%/*}
     name=${dir##*/}
     uid=$(id -u)
-    if [[ -z "$name" || "$name" == . || "$name" == .. || "$parent" != /* ]]; then
-        warn "refusing to remove $dir: malformed path"; return 1
-    fi
-    if [[ "$(realpath -e -- "$parent" 2>/dev/null)" != "$parent" ]]; then
-        warn "refusing to remove $dir: its parent is reached through a symlink"; return 1
-    fi
+    [[ -n "$name" && "$name" != . && "$name" != .. && "$parent" == /* ]] || return 1
+    [[ "$(realpath -e -- "$parent" 2>/dev/null)" == "$parent" ]] || return 1
     (
-        cd -- "$parent" || exit 1
-        if [[ "$(pwd -P)" != "$parent" ]]; then
-            warn "refusing to remove $dir: parent moved after validation"; exit 1
+        cd -- "$parent" || exit 4
+        [[ "$(pwd -P)" == "$parent" ]] || exit 4
+        [[ -d "./$name" && ! -L "./$name" && "$(stat -c %u -- "./$name" 2>/dev/null)" == "$uid" ]] || exit 4
+        if (( ! relax )) && [[ -n "$(find -P "./$name" -xdev -type d -perm /022 -print -quit)" ]]; then
+            exit 2
         fi
-        if [[ ! -d "./$name" || -L "./$name" || "$(stat -c %u -- "./$name" 2>/dev/null)" != "$uid" ]]; then
-            warn "refusing to remove $dir: not a directory of ours"; exit 1
-        fi
-        if [[ -n "$(find "./$name" -xdev -type d -perm /022 -print -quit)" ]]; then
-            warn "refusing to remove $dir: a directory in it is group/other-writable"; exit 1
-        fi
-        if [[ -n "$(find "./$name" -xdev ! -uid "$uid" -print -quit)" ]]; then
-            warn "refusing to remove $dir: an entry in it is owned by another uid"; exit 1
-        fi
-        find "./$name" -xdev -type d ! -perm -u=w -execdir chmod u+w {} + \
-            && find "./$name" -xdev -depth -delete
+        [[ -z "$(find -P "./$name" -xdev ! -uid "$uid" -print -quit)" ]] || exit 3
+        find -P "./$name" -xdev -type d ! -perm -u=w -execdir chmod u+w {} + \
+            && find -P "./$name" -xdev -depth -delete || exit 5
     )
+}
+
+# refusal_reason <code>: the journal word for a remove_tree refusal.
+refusal_reason() {
+    case $1 in
+        1) echo unsafe-path ;; 2) echo group-writable ;; 3) echo foreign-owner ;;
+        4) echo not-ours ;; *) echo failed ;;
+    esac
+}
+
+# record_refusal <code> <dir>: count one refused tree by reason and journal it.
+record_refusal() {
+    local why
+    why=$(refusal_reason "$1")
+    REFUSED_BY[$why]=$(( ${REFUSED_BY[$why]:-0} + 1 ))
+    warn "refusing to remove $2: $why"
 }
 
 # ---- grace window for anonymous volumes of removed containers -----------------
@@ -466,29 +492,44 @@ remove_volumes() {
 }
 
 remove_pytest_dirs() {
-    local d
+    local d relax
     for d in "$@"; do
         if ! under "$d" "$PYTEST_BASE" || [[ ! "${d##*/}" =~ ^pytest-[0-9]+$ ]] || ! owned_dir "$d"; then
             warn "refusing to remove $d (outside $PYTEST_BASE, not ours, or a symlink)"; continue
         fi
-        if remove_tree "$d"; then
+        relax=0; relax_ok "$PYTEST_BASE" "$d" && relax=1
+        if remove_tree "$d" "$relax"; then
             REMOVED_THIS=$((REMOVED_THIS + 1)); note "removed pytest temp dir $d"
         else
-            warn "could not remove pytest temp dir $d"
+            record_refusal "$?" "$d"
         fi
     done
 }
 
+# basetemp_root_of <dir>: the configured basetemp root that contains <dir>, if any.
+basetemp_root_of() {
+    local entry root
+    for entry in "${BASETEMP_ROOTS[@]}"; do
+        root_entry_ok "$entry" || continue
+        for root in $entry; do
+            [[ -d "$root" && "$1" == "$root"/* ]] && { printf '%s\n' "$root"; return 0; }
+        done
+    done
+    return 1
+}
+
 remove_basetemps() {
-    local d
+    local d root relax
     for d in "$@"; do
         if ! owned_dir "$d" || ! basetemp_layout_ok "$d"; then
             warn "refusing to remove $d (not a basetemp or not ours)"; continue
         fi
-        if remove_tree "$d"; then
+        root=$(basetemp_root_of "$d") || root=
+        relax=0; [[ -n "$root" ]] && relax_ok "$root" "$d" && relax=1
+        if remove_tree "$d" "$relax"; then
             REMOVED_THIS=$((REMOVED_THIS + 1)); note "removed basetemp dir $d"
         else
-            warn "could not remove basetemp dir $d"
+            record_refusal "$?" "$d"
         fi
     done
 }
@@ -499,10 +540,10 @@ remove_releases() {
         if ! under "$d" "$GATEWAY_RELEASES" || [[ ! "${d##*/}" =~ ^[0-9a-f]{40}$ ]] || ! owned_dir "$d"; then
             warn "refusing to remove $d (not a release under $GATEWAY_RELEASES, not ours, or a symlink)"; continue
         fi
-        if remove_tree "$d"; then
+        if remove_tree "$d" 0; then
             REMOVED_THIS=$((REMOVED_THIS + 1)); note "removed gateway release ${d##*/}"
         else
-            warn "could not remove gateway release ${d##*/}"
+            record_refusal "$?" "$d"
         fi
     done
 }
@@ -537,10 +578,13 @@ run_pass() {
     fi
     (( n > 0 )) || return 0
     REMOVED_THIS=0
+    REFUSED_BY=()
     for (( i = 0; i < n; i += 100 )); do
         "$remover" "${keys[@]:i:100}"
     done
-    note "$label: removed $REMOVED_THIS of $n selected ($(gb "$total") planned)"
+    local refused=""
+    for reason in "${!REFUSED_BY[@]}"; do refused+=" $reason=${REFUSED_BY[$reason]}"; done
+    note "$label: removed $REMOVED_THIS of $n selected ($(gb "$total") planned); refused${refused:- none}"
     (( REMOVED_THIS == n )) || warn "$label: $((n - REMOVED_THIS)) selected item(s) not removed (in use or error)"
 }
 
