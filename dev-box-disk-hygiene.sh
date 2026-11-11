@@ -215,40 +215,85 @@ relax_ok() {
 # Always refused: any entry owned by another uid. Refused unless relax=1: any directory
 # that is group/other-writable. Returns 0 when removed; 1 unsafe path, 2 group/other-
 # writable directory, 3 foreign-owned entry, 4 not ours or moved, 5 removal failed.
-remove_tree() {
-    local dir=$1 relax=${2:-0} parent name uid
+# verdict_here <name> [relax]: read-only checks on ./<name>, relative to the current
+# directory, and on "." itself. Prints "ok" or the refusal reason. Changes nothing.
+verdict_here() {
+    local name=$1 relax=${2:-0} uid
+    uid=$(id -u)
+    if [[ "$(stat -c %u -- . 2>/dev/null)" != "$uid" ]]; then echo not-ours; return 0; fi
+    if [[ ! -d "./$name" || -L "./$name" || "$(stat -c %u -- "./$name" 2>/dev/null)" != "$uid" ]]; then
+        echo not-ours; return 0
+    fi
+    if (( ! relax )) && [[ -n "$(find -P "./$name" -xdev -type d -perm /022 -print -quit)" ]]; then
+        echo group-writable; return 0
+    fi
+    if [[ -n "$(find -P "./$name" -xdev ! -uid "$uid" -print -quit)" ]]; then echo foreign-owner; return 0; fi
+    echo ok
+}
+
+# tree_verdict <dir> [relax]: the verdict for a tree, read-only. The parent must be
+# reached without a symlink; the check runs inside a subshell that cd's into it.
+tree_verdict() {
+    local dir=$1 relax=${2:-0} parent name
     parent=${dir%/*}
     name=${dir##*/}
-    uid=$(id -u)
-    [[ -n "$name" && "$name" != . && "$name" != .. && "$parent" == /* ]] || return 1
-    [[ "$(realpath -e -- "$parent" 2>/dev/null)" == "$parent" ]] || return 1
+    if [[ -z "$name" || "$name" == . || "$name" == .. || "$parent" != /* ]]; then echo unsafe-path; return 0; fi
+    if [[ "$(realpath -e -- "$parent" 2>/dev/null)" != "$parent" ]]; then echo unsafe-path; return 0; fi
+    ( cd -- "$parent" 2>/dev/null && [[ "$(pwd -P)" == "$parent" ]] && verdict_here "$name" "$relax" ) \
+        || echo not-ours
+}
+
+# remove_tree <dir> [relax]: delete a tree we own. Plans with tree_verdict first; the
+# deletion then cd's into the parent, re-checks pwd -P and the verdict, and removes by
+# relative name, so a parent swapped after validation cannot redirect it. Prints the
+# refusal reason on stdout and returns 1 when refused or failed.
+remove_tree() {
+    local dir=$1 relax=${2:-0} parent name v
+    v=$(tree_verdict "$dir" "$relax")
+    if [[ $v != ok ]]; then echo "$v"; return 1; fi
+    parent=${dir%/*}
+    name=${dir##*/}
     (
-        cd -- "$parent" || exit 4
-        [[ "$(pwd -P)" == "$parent" ]] || exit 4
-        [[ -d "./$name" && ! -L "./$name" && "$(stat -c %u -- "./$name" 2>/dev/null)" == "$uid" ]] || exit 4
-        if (( ! relax )) && [[ -n "$(find -P "./$name" -xdev -type d -perm /022 -print -quit)" ]]; then
-            exit 2
-        fi
-        [[ -z "$(find -P "./$name" -xdev ! -uid "$uid" -print -quit)" ]] || exit 3
+        cd -- "$parent" || { echo not-ours; exit 1; }
+        [[ "$(pwd -P)" == "$parent" ]] || { echo not-ours; exit 1; }
+        v=$(verdict_here "$name" "$relax")
+        [[ $v == ok ]] || { echo "$v"; exit 1; }
         find -P "./$name" -xdev -type d ! -perm -u=w -execdir chmod u+w {} + \
-            && find -P "./$name" -xdev -depth -delete || exit 5
+            && find -P "./$name" -xdev -depth -delete
     )
 }
 
-# refusal_reason <code>: the journal word for a remove_tree refusal.
-refusal_reason() {
-    case $1 in
-        1) echo unsafe-path ;; 2) echo group-writable ;; 3) echo foreign-owner ;;
-        4) echo not-ours ;; *) echo failed ;;
-    esac
+# Checkers: one per pass. Each prints "ok" or the reason, read-only. The dry run and the
+# real run both call them, so they agree on the selected and refused sets.
+pytest_verdict() {
+    local d=$1 relax=0
+    if ! under "$d" "$PYTEST_BASE" || [[ ! "${d##*/}" =~ ^pytest-[0-9]+$ ]]; then echo unsafe-path; return 0; fi
+    if ! owned_dir "$d"; then echo not-ours; return 0; fi
+    relax_ok "$PYTEST_BASE" "$d" && relax=1
+    tree_verdict "$d" "$relax"
 }
 
-# record_refusal <code> <dir>: count one refused tree by reason and journal it.
+basetemp_verdict() {
+    local d=$1 root relax=0
+    if ! owned_dir "$d"; then echo not-ours; return 0; fi
+    if ! basetemp_layout_ok "$d"; then echo not-basetemp; return 0; fi
+    root=$(basetemp_root_of "$d") || root=
+    [[ -n "$root" ]] && relax_ok "$root" "$d" && relax=1
+    tree_verdict "$d" "$relax"
+}
+
+release_verdict() {
+    local d=$1
+    if ! under "$d" "$GATEWAY_RELEASES" || [[ ! "${d##*/}" =~ ^[0-9a-f]{40}$ ]]; then echo unsafe-path; return 0; fi
+    if ! owned_dir "$d"; then echo not-ours; return 0; fi
+    tree_verdict "$d" 0
+}
+
+# record_refusal <reason> <dir>: count one refused tree by reason and journal it.
 record_refusal() {
-    local why
-    why=$(refusal_reason "$1")
+    local why=$1 dir=$2
     REFUSED_BY[$why]=$(( ${REFUSED_BY[$why]:-0} + 1 ))
-    warn "refusing to remove $2: $why"
+    warn "refusing to remove $dir: $why"
 }
 
 # ---- grace window for anonymous volumes of removed containers -----------------
@@ -492,16 +537,15 @@ remove_volumes() {
 }
 
 remove_pytest_dirs() {
-    local d relax
+    local d v relax out
     for d in "$@"; do
-        if ! under "$d" "$PYTEST_BASE" || [[ ! "${d##*/}" =~ ^pytest-[0-9]+$ ]] || ! owned_dir "$d"; then
-            warn "refusing to remove $d (outside $PYTEST_BASE, not ours, or a symlink)"; continue
-        fi
+        v=$(pytest_verdict "$d")
+        if [[ $v != ok ]]; then record_refusal "$v" "$d"; continue; fi
         relax=0; relax_ok "$PYTEST_BASE" "$d" && relax=1
-        if remove_tree "$d" "$relax"; then
+        if out=$(remove_tree "$d" "$relax"); then
             REMOVED_THIS=$((REMOVED_THIS + 1)); note "removed pytest temp dir $d"
         else
-            record_refusal "$?" "$d"
+            record_refusal "${out:-failed}" "$d"
         fi
     done
 }
@@ -519,46 +563,44 @@ basetemp_root_of() {
 }
 
 remove_basetemps() {
-    local d root relax
+    local d v root relax out
     for d in "$@"; do
-        if ! owned_dir "$d" || ! basetemp_layout_ok "$d"; then
-            warn "refusing to remove $d (not a basetemp or not ours)"; continue
-        fi
+        v=$(basetemp_verdict "$d")
+        if [[ $v != ok ]]; then record_refusal "$v" "$d"; continue; fi
         root=$(basetemp_root_of "$d") || root=
         relax=0; [[ -n "$root" ]] && relax_ok "$root" "$d" && relax=1
-        if remove_tree "$d" "$relax"; then
+        if out=$(remove_tree "$d" "$relax"); then
             REMOVED_THIS=$((REMOVED_THIS + 1)); note "removed basetemp dir $d"
         else
-            record_refusal "$?" "$d"
+            record_refusal "${out:-failed}" "$d"
         fi
     done
 }
 
 remove_releases() {
-    local d
+    local d v out
     for d in "$@"; do
-        if ! under "$d" "$GATEWAY_RELEASES" || [[ ! "${d##*/}" =~ ^[0-9a-f]{40}$ ]] || ! owned_dir "$d"; then
-            warn "refusing to remove $d (not a release under $GATEWAY_RELEASES, not ours, or a symlink)"; continue
-        fi
-        if remove_tree "$d" 0; then
+        v=$(release_verdict "$d")
+        if [[ $v != ok ]]; then record_refusal "$v" "$d"; continue; fi
+        if out=$(remove_tree "$d" 0); then
             REMOVED_THIS=$((REMOVED_THIS + 1)); note "removed gateway release ${d##*/}"
         else
-            record_refusal "$?" "$d"
+            record_refusal "${out:-failed}" "$d"
         fi
     done
 }
 
 # run_pass <label> <selector> <remover> <dry|run>: select, then report or remove in batches of 100.
 run_pass() {
-    local label=$1 selector=$2 remover=$3 mode=$4
+    local label=$1 selector=$2 remover=$3 mode=$4 checker=${5:-}
     local verdict a b c total=0 n i reason kept=""
-    local -a keys=() shown=()
+    local -a keys=() bytes=() shown=()
     local -A kept_by=()
     local selection
     selection=$("$selector")
     while IFS=$'\t' read -r verdict a b c; do
         case $verdict in
-            SEL) keys+=("$a"); total=$((total + b)); shown+=("$c") ;;
+            SEL) keys+=("$a"); bytes+=("$b"); total=$((total + b)); shown+=("$c") ;;
             KEEP)
                 kept_by[$a]=$(( ${kept_by[$a]:-0} + 1 ))
                 [[ $mode == run && $a == unsafe-* ]] && warn "$label kept $b ($a)"
@@ -572,8 +614,23 @@ run_pass() {
     n=${#keys[@]}
     for reason in "${!kept_by[@]}"; do kept+=" $reason=${kept_by[$reason]}"; done
     if [[ $mode == dry ]]; then
-        printf '%s: %d would be removed (%s);%s\n' "$label" "$n" "$(gb "$total")" "${kept:- kept none}"
-        if (( n > 0 && n <= 25 )); then printf '  %s\n' "${shown[@]}"; fi
+        # Same checker as the real run: list what would go and what would be refused.
+        local -a would=() refused_lines=()
+        local -A dry_refused=()
+        local wtotal=0 k v j r dref=""
+        for (( j = 0; j < n; j++ )); do
+            k=${keys[j]}; v=ok
+            [[ -n $checker ]] && v=$("$checker" "$k")
+            if [[ $v == ok ]]; then
+                would+=("${shown[j]}"); wtotal=$((wtotal + bytes[j]))
+            else
+                dry_refused[$v]=$(( ${dry_refused[$v]:-0} + 1 )); refused_lines+=("  refused $v: $k")
+            fi
+        done
+        for r in "${!dry_refused[@]}"; do dref+=" $r=${dry_refused[$r]}"; done
+        printf '%s: would remove=%d (%s); refused%s;%s\n' "$label" "${#would[@]}" "$(gb "$wtotal")" "${dref:- none}" "${kept:- kept none}"
+        if (( ${#would[@]} > 0 && ${#would[@]} <= 25 )); then printf '  %s\n' "${would[@]}"; fi
+        if (( ${#refused_lines[@]} > 0 && ${#refused_lines[@]} <= 25 )); then printf '%s\n' "${refused_lines[@]}"; fi
         return 0
     fi
     (( n > 0 )) || return 0
@@ -619,9 +676,9 @@ routine_pass() {
             fi
         done
     else
-        run_pass pytest select_pytest remove_pytest_dirs "$mode"
-        run_pass basetemps select_basetemps remove_basetemps "$mode"
-        run_pass releases select_releases remove_releases "$mode"
+        run_pass pytest select_pytest remove_pytest_dirs "$mode" pytest_verdict
+        run_pass basetemps select_basetemps remove_basetemps "$mode" basetemp_verdict
+        run_pass releases select_releases remove_releases "$mode" release_verdict
     fi
     if docker_up; then
         if [[ $mode == run ]]; then
