@@ -51,7 +51,7 @@ RESERVE_CORES="${PNEUMA_GATE_RESERVE_CORES:-3}"       # left for runners + k3s
 RESERVE_MEM_MB="${PNEUMA_GATE_RESERVE_MEM_MB:-6144}"
 MAX_CONCURRENT="${PNEUMA_GATE_MAX_CONCURRENT:-4}"
 BUNDLE_MAX_MB="${PNEUMA_GATE_BUNDLE_MAX_MB:-4096}"      # a bundle past this is refused (disk DoS)
-GATE_TIMEOUT_S="${PNEUMA_GATE_TIMEOUT_S:-5400}"
+GATE_TIMEOUT_S="${PNEUMA_GATE_TIMEOUT_S:-7200}"   # per-gate wall clock (RuntimeMaxSec); also bounds warm-env builds
 LOAD_CEILING_PCT="${PNEUMA_GATE_LOAD_CEILING_PCT:-150}" # % of nproc; only blocks stacking a 2nd gate
 POLL_S="${PNEUMA_GATE_POLL_S:-5}"
 NPROC="${PNEUMA_GATE_NPROC:-$(nproc)}"
@@ -565,7 +565,7 @@ refuse_noid() { echo "pneuma-gate-runner: refused: no submitter identity (only p
 # sshd's own auth record (ExposeAuthInfo). It is never a field the client supplies. When it is
 # unknown, the run neither supersedes nor is superseded: the fail-safe is to cancel nothing.
 DEDUP_DIR="${PNEUMA_GATE_DEDUP_DIR:-/var/lib/pneuma-gate-dedup}"
-PER_SUBMITTER_CAP="${PNEUMA_GATE_PER_SUBMITTER_CAP:-3}"   # live gates one submitter may hold at once (queued + running)
+PER_SUBMITTER_CAP="${PNEUMA_GATE_PER_SUBMITTER_CAP:-5}"   # live gates one submitter may hold at once (queued + running)
 dedup_register() {  # <id> <key> <head> <submitter> <unit> <worker pid> <nonce> <jobkey>
   # The identity is the WORKER's pid, never $$ (inside a subshell $$ is the top-level runner), plus its start time.
   mkdir -p "$DEDUP_DIR" && chmod 0700 "$DEDUP_DIR" || return 1
@@ -1085,7 +1085,7 @@ unit_env() {   # <ws> <work> <profile> → sets ENV_DIR
 }
 
 cmd_unit() {
-  local profile="" head="" base="" tree="" om="" shallow="" timeout_s=5400
+  local profile="" head="" base="" tree="" om="" shallow="" timeout_s=7200
   while [ $# -gt 0 ]; do
     case "$1" in
       --profile) profile="$2"; shift 2;; --head) head="$2"; shift 2;; --base) base="$2"; shift 2;;

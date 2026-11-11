@@ -64,6 +64,21 @@ NVIDIA device plugin DaemonSet so pods can request `nvidia.com/gpu` resources.
 
 Prerequisites: NVIDIA drivers + `nvidia-container-toolkit` must be installed first.
 
+## Dev-Box Disk Hygiene
+
+The dev box is also the TST k3s node. A full root disk taints the node and evicts TST,
+so Docker leftovers (dangling test-Postgres volumes, exited containers) are pruned on a timer.
+Standalone install, no setup.sh involvement:
+
+```bash
+bash ~/vm-setup/dev-box-disk-hygiene.sh --dry-run            # Show what a pass would reclaim
+sudo bash ~/vm-setup/dev-box-disk-hygiene.sh --install       # Install binary + both timers (root)
+```
+
+- Routine pass every 15 min: exited containers (>6h), unused volumes, dangling images. Never `-a`.
+- Guard every 1 min: root free <15% prunes immediately and logs a WARNING; <10% writes `/run/dev-box-disk-low` and sends a `daemon.warning` syslog alert.
+- Check: `journalctl -t dev-box-disk-hygiene`, `systemctl list-timers 'dev-box-disk-hygiene*'`
+
 ## Cloudflare Origin Firewall
 
 To restrict HTTP/HTTPS traffic to Cloudflare IPs only (for proxied subdomains):
