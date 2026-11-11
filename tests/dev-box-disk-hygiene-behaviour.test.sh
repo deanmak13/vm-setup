@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tests/dev-box-disk-hygiene.sh - behaviour tests for dev-box-disk-hygiene.sh, run as
+# tests/dev-box-disk-hygiene-behaviour.test.sh - behaviour tests for dev-box-disk-hygiene.sh, run as
 # child processes. The shared sandbox lives in dev-box-disk-hygiene.lib.sh. The
 # in-process unit layer is dev-box-disk-hygiene.test.sh (measured by kcov).
 # Assertions are branch-free: a failed check sets fail=1 and the run exits 1.
@@ -128,7 +128,7 @@ expect "five candidates cause one process scan" '^ps ' 1
 
 # --- basetemps: pytest layout under a claude scratch root --------------------
 reset_fakes
-BT=$T/root/tmp/claude-$(id -u)/proj
+BT=$T/root/tmp/claude-$FAKE_UID/proj
 mkdir -p "$BT/test_flow0" "$BT/test_flow1"
 chmod 755 "$BT" "$BT/test_flow0" "$BT/test_flow1"     # pytest makes basetemps 700; pin the test's mode
 echo x > "$BT/test_flow0/a.txt"; echo x > "$BT/test_flow1/b.txt"
@@ -136,8 +136,8 @@ ln -s test_flow1 "$BT/test_flowcurrent"
 touch -d '3 days ago' "$BT/test_flow0/a.txt" "$BT/test_flow0" "$BT/test_flow1/b.txt" "$BT/test_flow1" "$BT"
 touch -h -d '3 days ago' "$BT/test_flowcurrent"
 # A young basetemp and one with a foreign entry must survive.
-YB=$T/root/tmp/claude-$(id -u)/young; mkdir -p "$YB/test_y0"; echo x > "$YB/test_y0/y"; ln -s test_y0 "$YB/test_ycurrent"
-FB=$T/root/tmp/claude-$(id -u)/foreign; mkdir -p "$FB/test_f0" "$FB/test_f1"; echo x > "$FB/notes.txt"
+YB=$T/root/tmp/claude-$FAKE_UID/young; mkdir -p "$YB/test_y0"; echo x > "$YB/test_y0/y"; ln -s test_y0 "$YB/test_ycurrent"
+FB=$T/root/tmp/claude-$FAKE_UID/foreign; mkdir -p "$FB/test_f0" "$FB/test_f1"; echo x > "$FB/notes.txt"
 ln -s test_f1 "$FB/test_fcurrent"; touch -d '3 days ago' "$FB" "$FB/test_f0" "$FB/test_f1" "$FB/notes.txt"
 call --dry-run
 expect_out "dry run counts one basetemp" '^basetemps: 1 would be removed' 1
@@ -184,7 +184,7 @@ call --run
 check "root leaves a user's pytest dir alone" [ -d "$PYTEST_BASE/pytest-0" ]
 check "root leaves a user's basetemp alone" [ -d "$BTR0" ]
 expect "root journals the skipped passes" 'pass skipped: running as root' 3
-unset FAKE_UID
+FAKE_UID=1000 export FAKE_UID
 
 # --- ownership and symlink discipline on removal -----------------------------
 reset_fakes
@@ -222,7 +222,7 @@ check "candidate with inner symlink removed" [ ! -e "$PYTEST_BASE/pytest-0" ]
 check "symlink target outside the candidate untouched" [ -f "$T/outside/keep.txt" ]
 
 reset_fakes
-BT2=$T/root/tmp/claude-$(id -u)/gp; mkdir -p "$BT2/test_g0"; echo x > "$BT2/test_g0/f"
+BT2=$T/root/tmp/claude-$FAKE_UID/gp; mkdir -p "$BT2/test_g0"; echo x > "$BT2/test_g0/f"
 chmod 775 "$BT2/test_g0"; ln -s test_g0 "$BT2/test_gcurrent"; touch -d '3 days ago' "$BT2"/test_g0/f "$BT2/test_g0" "$BT2"
 call --run
 check "basetemp with a group-writable dir refused whole" [ -f "$BT2/test_g0/f" ]

@@ -26,12 +26,15 @@ export DBDH_ROOT="$T/root"
 export HOME="$T/home"
 export XDG_STATE_HOME="$T/state"
 export DBDH_DOCKER_TIMEOUT=2
+# Every suite runs as one fixed uid: id, stat and the "not ours" probe report it, so the
+# tests behave the same as root in the kcov container and as a normal user natively.
+export FAKE_UID=1000
 MARKER="$T/root/run/dev-box-disk-low"
 LOCK="$T/root/run/dev-box-disk-hygiene.lock"
 GRACE_FILE="$T/state/dev-box-disk-hygiene/volume-grace"
 PRUNE_STAMP="$T/state/dev-box-disk-hygiene/last-prune"
 PYTEST_BASE="$T/root/tmp/pytest-of-$(id -un)"
-BASETEMP_UID_ROOT="$T/root/tmp/claude-$(id -u)"
+BASETEMP_UID_ROOT="$T/root/tmp/claude-$FAKE_UID"
 RELDIR="$HOME/.local/share/coding-gateway/releases"
 UNIT="$HOME/.config/systemd/user/coding-gateway.service"
 
@@ -121,12 +124,29 @@ case "$name" in
     exit 0 ;;
   ps)
     [[ -z "${FAKE_PS_FAIL:-}" ]] || exit 1
-    if [[ -n "${FAKE_PGREP_HIT:-}" ]]; then /usr/bin/ps "$@"; echo "4242 bash $FAKE_PGREP_HIT"; exit 0; fi
-    exec /usr/bin/ps "$@" ;;
+    if [[ -x /usr/bin/ps ]]; then
+      if [[ -n "${FAKE_PGREP_HIT:-}" ]]; then /usr/bin/ps "$@"; echo "4242 bash $FAKE_PGREP_HIT"; exit 0; fi
+      exec /usr/bin/ps "$@"
+    fi
+    # Minimal images (the kcov image) ship no ps: list command lines from /proc instead.
+    for p in /proc/[0-9]*; do
+      printf '%s %s\n' "${p#/proc/}" "$(tr '\0' ' ' < "$p/cmdline" 2>/dev/null)"
+    done
+    [[ -z "${FAKE_PGREP_HIT:-}" ]] || echo "4242 bash $FAKE_PGREP_HIT"
+    exit 0 ;;
   pgrep) exit 1 ;;
   find)
     # FAKE_FOREIGN makes the foreign-owner probe report an entry owned by another uid.
     if [[ -n "${FAKE_FOREIGN:-}" && "$*" == *"! -uid"* ]]; then echo "$1/foreign-owned"; exit 0; fi
+    # FAKE_UID: the "not ours" probe compares against the real uid that owns the files.
+    if [[ -n "${FAKE_UID:-}" && "$*" == *"! -uid"* ]]; then
+      args=(); prev=
+      for a in "$@"; do
+        if [[ $prev == -uid ]]; then args+=("$(/usr/bin/id -u)"); else args+=("$a"); fi
+        prev=$a
+      done
+      exec /usr/bin/find "${args[@]}"
+    fi
     exec /usr/bin/find "$@" ;;
   id)
     # FAKE_UID makes `id -u` report that uid (the root-skip tests); other forms pass through.
@@ -136,6 +156,11 @@ case "$name" in
     # FAKE_STAT_UID makes every stat report that owner, so ownership checks fail.
     if [[ -n "${FAKE_STAT_UID:-}" ]]; then
       if [[ "$*" == *%a* ]]; then echo "$FAKE_STAT_UID 755"; else echo "$FAKE_STAT_UID"; fi
+      exit 0
+    fi
+    # FAKE_UID: report the faked uid as the owner, keeping the real mode bits.
+    if [[ -n "${FAKE_UID:-}" && "$*" == *%u* ]]; then
+      if [[ "$*" == *%a* ]]; then echo "$FAKE_UID $(/usr/bin/stat -c %a -- "${@: -1}")"; else echo "$FAKE_UID"; fi
       exit 0
     fi
     exec /usr/bin/stat "$@" ;;
@@ -170,7 +195,8 @@ set_free() { export FAKE_TOTAL_GB=1000 FAKE_FREE_GB=$(( $1 * 10 )); }
 
 reset_fakes() {
   unset FAKE_DOCKER_DOWN FAKE_DOCKER_HANG FAKE_PRUNE_FAIL FAKE_RM_FAIL FAKE_DF_BAD FAKE_PGREP_HIT \
-        FAKE_LINGER FAKE_STAT_UID FAKE_FOREIGN FAKE_PS_FAIL FAKE_UID
+        FAKE_LINGER FAKE_STAT_UID FAKE_FOREIGN FAKE_PS_FAIL
+  export FAKE_UID=1000
   set_free 50
   : > "$FAKE_LOG"; : > "$FAKE_PS"; : > "$FAKE_INSPECT"; : > "$FAKE_VOLS"
   chmod -R u+w "$HOME" "$T/root" "$T/state" 2>/dev/null

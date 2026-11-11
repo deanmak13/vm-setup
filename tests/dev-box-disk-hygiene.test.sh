@@ -5,16 +5,32 @@
 # executes in this shell and kcov measures it. The subprocess behaviour suite is
 # tests/dev-box-disk-hygiene.sh. Shares the sandbox and shims in the lib.
 
+# functrace: functions and command substitutions inherit the DEBUG trap, so kcov measures them
+set -T
 REPO_TESTS=$(cd "$(dirname "$0")" && pwd)
 # shellcheck source=dev-box-disk-hygiene.lib.sh
 source "$REPO_TESTS/dev-box-disk-hygiene.lib.sh"
 # shellcheck source=../dev-box-disk-hygiene.sh
 source "$SCRIPT"
 
+# The unit layer runs as a fixed uid (id, stat and the "not ours" probe agree), so the
+# same cases pass as root in the kcov container and as a normal user natively.
 fresh() {
   { exec 8>&-; } 2>/dev/null     # release any lock this shell took in an earlier case
   reset_fakes
+  export FAKE_UID=1000
   REMOVED_THIS=0; PROC_SNAP=""; PROC_SNAP_OK=0; PROC_SNAP_TAKEN=0
+}
+
+# mk_basetemp <dir> <age>: a pytest-layout basetemp (numbered dirs plus a *current link).
+mk_basetemp() {
+  local name=${1##*/}
+  mkdir -p "$1/${name}0" "$1/${name}1"
+  chmod 755 "$1" "$1/${name}0" "$1/${name}1"
+  echo x > "$1/${name}0/f"
+  ln -s "${name}1" "$1/${name}current"
+  touch -d "$2 ago" "$1/${name}0/f" "$1/${name}0" "$1/${name}1" "$1"
+  touch -h -d "$2 ago" "$1/${name}current"
 }
 
 # --- pure helpers ------------------------------------------------------------
@@ -76,7 +92,7 @@ check_not "grace_active on a missing file is false" grace_active "$(hex 32)"
 
 # --- basetemp layout ------------------------------------------------------------
 fresh
-BL=$T/root/tmp/claude-$(id -u)/layout
+BL=$BASETEMP_UID_ROOT/layout
 mkdir -p "$BL/test_a0" "$BL/test_a1"; ln -s test_a1 "$BL/test_acurrent"
 check "a pytest basetemp layout is recognised" basetemp_layout_ok "$BL"
 echo x > "$BL/notes.txt"
@@ -139,7 +155,7 @@ check "select_pytest refuses a group-writable base" grep -q "^ERR" <<<"$(select_
 chmod 755 "$PYTEST_BASE"
 
 fresh
-BTR=$T/root/tmp/claude-$(id -u)
+BTR=$BASETEMP_UID_ROOT
 mkdir -p "$BTR/proj/test_s0" "$BTR/proj/test_s1"
 echo x > "$BTR/proj/test_s0/f"; ln -s test_s1 "$BTR/proj/test_scurrent"
 touch -d '3 days ago' "$BTR/proj/test_s0/f" "$BTR/proj/test_s0" "$BTR/proj/test_s1" "$BTR/proj"
@@ -193,6 +209,101 @@ RT=$BASETEMP_UID_ROOT/rt; mkdir -p "$RT/test_z0"; chmod 755 "$RT" "$RT/test_z0";
 remove_tree "$RT/test_z0" 2>/dev/null
 check "a plain owned tree is removed by the anchored path" [ ! -e "$RT/test_z0" ]
 
+# --- coverage: refusal and failure branches of the removers and selectors -----
+fresh
+check_not "chain_private stops at / when the root is not an ancestor" chain_private "$T/nowhere" "$T/a/b"
+check_not "remove_tree refuses a relative path" remove_tree "relative/x"
+check_not "remove_tree refuses a path with no name" remove_tree "/"
+mkdir -p "$T/rt-parent"; chmod 755 "$T/rt-parent"
+check_not "remove_tree refuses a missing directory" remove_tree "$T/rt-parent/absent"
+mkdir -p "$T/rt-parent2/d"; chmod 755 "$T/rt-parent2" "$T/rt-parent2/d"; echo x > "$T/rt-parent2/d/f"
+FAKE_FOREIGN=1 export FAKE_FOREIGN
+check_not "remove_tree refuses a tree with a foreign-owned entry" remove_tree "$T/rt-parent2/d"
+check "the refused tree is intact" [ -f "$T/rt-parent2/d/f" ]
+unset FAKE_FOREIGN
+
+fresh
+mk_basetemp "$BASETEMP_UID_ROOT/young" 10minutes
+out=$(select_basetemps)
+check "a young basetemp is kept" grep -q "^KEEP	young-or-unreadable	" <<<"$out"
+fresh
+mk_basetemp "$BASETEMP_UID_ROOT/busy" 3days
+FAKE_PGREP_HIT="$BASETEMP_UID_ROOT/busy" export FAKE_PGREP_HIT
+out=$(select_basetemps)
+check "a basetemp a process references is kept in use" grep -q "^KEEP	in-use	" <<<"$out"
+unset FAKE_PGREP_HIT
+fresh
+mkdir -p "$BASETEMP_UID_ROOT/mid"; chmod 775 "$BASETEMP_UID_ROOT/mid"
+mk_basetemp "$BASETEMP_UID_ROOT/mid/proj" 3days
+out=$(select_basetemps)
+check "a group-writable ancestor is journaled as unsafe" grep -q "^KEEP	unsafe-ancestor	" <<<"$out"
+fresh
+mk_basetemp "$BASETEMP_UID_ROOT/rootcase" 3days
+FAKE_STAT_UID=0 export FAKE_STAT_UID
+out=$(select_basetemps)
+check "a basetemp root owned by another uid is journaled as unsafe" grep -q "^KEEP	unsafe-root	" <<<"$out"
+unset FAKE_STAT_UID
+
+fresh
+mk_basetemp "$BASETEMP_UID_ROOT/ok/proj" 3days
+remove_basetemps "$BASETEMP_UID_ROOT/ok/proj"
+check "remove_basetemps removes an owned basetemp" [ ! -e "$BASETEMP_UID_ROOT/ok/proj" ]
+check "remove_basetemps counts the removal" [ "$REMOVED_THIS" -eq 1 ]
+fresh
+mk_basetemp "$BASETEMP_UID_ROOT/bad/proj" 3days
+chmod 775 "$BASETEMP_UID_ROOT/bad/proj/"*0
+remove_basetemps "$BASETEMP_UID_ROOT/bad/proj"
+check "remove_basetemps keeps a basetemp with a group-writable dir" [ -d "$BASETEMP_UID_ROOT/bad/proj" ]
+
+fresh
+mkdir -p "$PYTEST_BASE/pytest-88/sub"; chmod 755 "$PYTEST_BASE/pytest-88" "$PYTEST_BASE/pytest-88/sub"
+chmod 775 "$PYTEST_BASE/pytest-88/sub"
+remove_pytest_dirs "$PYTEST_BASE/pytest-88"
+check "remove_pytest_dirs keeps a tree with a group-writable dir" [ -d "$PYTEST_BASE/pytest-88" ]
+
+fresh
+add_release 5 3hours
+chmod 775 "$RELDIR/$(rhex 5)/bin"
+remove_releases "$RELDIR/$(rhex 5)"
+check "remove_releases keeps a release with a group-writable dir" [ -d "$RELDIR/$(rhex 5)" ]
+
+fresh
+add_container "$(hex 60)" gone exited "$(docker_stamp 3 days)"
+add_volume "$(hex 61)" 1 "$(rfc_stamp 3 days)" 1GB
+remove_volumes "$(hex 61)"
+check "remove_volumes counts nothing for an in-use volume" [ "$REMOVED_THIS" -eq 0 ]
+
+fresh
+add_release 1 4hours
+mkdir -p "$(dirname "$UNIT")"
+printf 'ExecStart=%s/%s/bin/gateway\n' "$RELDIR" "$(rhex 1)" > "$UNIT"
+add_release 2 5hours
+add_release 3 3hours
+add_release 4 6hours
+add_release 6 8hours
+mkdir -p "$RELDIR/notahexdir"
+ln -s "$RELDIR/$(rhex 2)" "$(dirname "$RELDIR")/current"
+FAKE_PGREP_HIT="$RELDIR/$(rhex 3)" export FAKE_PGREP_HIT
+out=$(select_releases)
+check "a release a current link points at is protected" grep -q "^KEEP	active	$RELDIR/$(rhex 2)" <<<"$out"
+check "a non-release directory is journaled" grep -q "^KEEP	not-a-release	$RELDIR/notahexdir" <<<"$out"
+check "a process-referenced release is kept in use" grep -q "^KEEP	in-use	$RELDIR/$(rhex 3)" <<<"$out"
+unset FAKE_PGREP_HIT
+rm -f -- "$(dirname "$RELDIR")/current"
+
+fresh
+FAKE_UID=0 export FAKE_UID
+out=$(routine_pass dry)
+check "as root the routine dry pass skips the pytest pass" grep -q "pytest: skipped (running as root" <<<"$out"
+check "as root the routine dry pass skips the basetemp pass" grep -q "basetemps: skipped (running as root" <<<"$out"
+FAKE_UID=1000 export FAKE_UID
+
+fresh
+main --install > "$OUT" 2>&1
+check "main --install installs the system units" [ -f "$ROOT_PREFIX/etc/systemd/system/dev-box-disk-hygiene.timer" ]
+main --uninstall > "$OUT" 2>&1
+check "main --uninstall removes the system units" [ ! -e "$ROOT_PREFIX/etc/systemd/system/dev-box-disk-hygiene.timer" ]
+
 # --- removers -----------------------------------------------------------------
 fresh
 D1=$T/root/tmp/pytest-of-$(id -un)/pytest-9
@@ -214,9 +325,9 @@ remove_pytest_dirs "$T/elsewhere/pytest-8"
 check "remove_pytest_dirs refuses a path outside the base" [ -d "$T/elsewhere/pytest-8" ]
 
 fresh
-BTX=$T/root/tmp/claude-$(id -u)/rm/test_r0
+BTX=$BASETEMP_UID_ROOT/rm/test_r0
 mkdir -p "$BTX"; echo x > "$BTX/f"; ln -s test_r0 "$(dirname "$BTX")/test_rcurrent"
-remove_basetemps "$BTX" "$T/root/tmp/claude-$(id -u)/rm"
+remove_basetemps "$BTX"
 check "remove_basetemps refuses a dir without the layout" [ -d "$BTX" ]
 
 fresh
