@@ -491,6 +491,10 @@ check "service: MemoryMax = the admitted mem" grep -q -- "--property=MemoryMax=5
 check "service: CPUQuota = cores x 100%" grep -q -- "--property=CPUQuota=200%" "$SCOPE_RECORD"
 check "service: TasksMax is capped" grep -q -- "--property=TasksMax=512" "$SCOPE_RECORD"
 check "service: a hard RuntimeMaxSec cap" grep -q -- "--property=RuntimeMaxSec=" "$SCOPE_RECORD"
+check "timeout: a gate with no override gets RuntimeMaxSec=7200 (120 min)" grep -q -- "--property=RuntimeMaxSec=7200 " "$SCOPE_RECORD"
+check "timeout: the in-unit fallback is 7200 too" grep -q -- "^  local profile=\"\" head=\"\" base=\"\" tree=\"\" om=\"\" shallow=\"\" timeout_s=7200$" "$RUNNER"
+check "timeout: the default is 7200 s in the runner" env -u PNEUMA_GATE_TIMEOUT_S PNEUMA_GATE_SYSTEMCTL=/bin/true bash -c 'source "$1"; [ "$GATE_TIMEOUT_S" = 7200 ]' _ "$RUNNER"
+check "timeout: PNEUMA_GATE_TIMEOUT_S still overrides the default" env PNEUMA_GATE_TIMEOUT_S=321 PNEUMA_GATE_SYSTEMCTL=/bin/true bash -c 'source "$1"; [ "$GATE_TIMEOUT_S" = 321 ]' _ "$RUNNER"
 for prop in DynamicUser=yes PrivateTmp=yes ProtectSystem=strict ProtectHome=yes NoNewPrivileges=yes ProtectProc=invisible \
             MemorySwapMax=0 "RuntimeDirectory=pneuma-gate/" RuntimeDirectoryMode=0700; do
   check "service: sandbox property $prop" grep -q -- "--property=$prop" "$SCOPE_RECORD"
@@ -546,6 +550,13 @@ admit() {   # admit <nproc> <avail_mb> <load1> <live gates> <cores> <mem_mb>  ->
 check "capacity: 8 cores, 18G free, idle -> first gate admitted" admit 8 18000 1.0 0 2 3072
 check "capacity: second gate fits beside the first (reserve 3 of 8)" admit 8 18000 1.0 1 2 3072
 check "capacity: third gate refused (2+2+2 > 8-3)" not admit 8 18000 1.0 2 2 3072
+check "capacity: the submitter cap (8) did not change the core/memory/concurrency defaults" \
+  env -u PNEUMA_GATE_RESERVE_CORES -u PNEUMA_GATE_MAX_CONCURRENT -u PNEUMA_GATE_RESERVE_MEM_MB PNEUMA_GATE_SYSTEMCTL=/bin/true \
+  bash -c 'source "$1"; [ "$RESERVE_CORES" = 3 ] && [ "$RESERVE_MEM_MB" = 6144 ] && [ "$MAX_CONCURRENT" = 4 ]' _ "$RUNNER"
+check "submitter cap: the default is 8 (PNEUMA_GATE_PER_SUBMITTER_CAP unset)" \
+  env -u PNEUMA_GATE_PER_SUBMITTER_CAP PNEUMA_GATE_SYSTEMCTL=/bin/true bash -c 'source "$1"; [ "$PER_SUBMITTER_CAP" = 8 ]' _ "$RUNNER"
+check "submitter cap: PNEUMA_GATE_PER_SUBMITTER_CAP still overrides the default" \
+  env PNEUMA_GATE_PER_SUBMITTER_CAP=2 PNEUMA_GATE_SYSTEMCTL=/bin/true bash -c 'source "$1"; [ "$PER_SUBMITTER_CAP" = 2 ]' _ "$RUNNER"
 check "capacity: refused when free memory minus reserve < need" not admit 8 8000 1.0 0 2 3072
 check "capacity: tiny host still runs ONE gate" admit 2 18000 1.0 0 2 3072
 check "capacity: saturated host (load > 1.5x cores) refuses to stack a 2nd gate" not admit 8 18000 14.0 1 2 3072
@@ -877,9 +888,13 @@ flock -u 7; exec 7>&-; wait "$lock_pid" 2>/dev/null || true
 
 # fairness: submitter A at its cap is refused; submitter B is still admitted; neither cancels the other
 fresh
-rec2 a-1 repoA/q1 "$C1" "$SUB_A"; rec2 a-2 repoA/q2 "$C1" "$SUB_A"; rec2 a-3 repoA/q3 "$C1" "$SUB_A"
+for i in 1 2 3 4 5 6 7; do rec2 "a-$i" "repoA/q$i" "$C1" "$SUB_A"; done
+rc_eighth=0; ddo dedup_admit a-8 "$dstore" repoA main "$C2" "$SUB_A" || rc_eighth=$?
+check "fairness: a submitter may hold 8: with 7 held, the 8th gate is admitted" test "$rc_eighth" = 0
+fresh
+for i in 1 2 3 4 5 6 7 8; do rec2 "a-$i" "repoA/q$i" "$C1" "$SUB_A"; done
 rc_capped=0; ddo dedup_admit flood-a "$dstore" repoA main "$C2" "$SUB_A" || rc_capped=$?
-check "fairness: a submitter at its cap is refused (exit 2), not queued" test "$rc_capped" = 2
+check "fairness: a submitter at its cap (8) is refused (exit 2), not queued" test "$rc_capped" = 2
 rc_b=0; ddo dedup_admit b-1 "$dstore" repoA main "$C2" "$SUB_B" || rc_b=$?
 check "fairness: another submitter is still admitted while A is at its cap" test "$rc_b" = 0
 check "fairness: A's flood cancels none of B's gates, and B's gate is recorded" \
@@ -949,13 +964,13 @@ check "A1: through sudo, status is still served" bash -c 'SUDO_USER=pneuma-submi
 # address or touches the store: an over-cap submitter costs the host nothing
 mkdir -p "$PNEUMA_GATE_DEDUP_DIR"; rm -f "$PNEUMA_GATE_DEDUP_DIR"/*
 sleep 300 & cap_pid=$!
-for n in 1 2 3; do
+for n in 1 2 3 4 5 6 7 8; do
   bash -c 'source "$1"; mkdir -p "$PNEUMA_GATE_DEDUP_DIR"; printf "key=\nhead=%s\npid=%s\npstart=%s\nsubmitter=capped\nunit=pneuma-gate-cap-%s.service\nsuperseded=\n" "$3" "$2" "$(proc_start "$2")" "$4" > "$PNEUMA_GATE_DEDUP_DIR/cap-$4"' _ "$RUNNER" "$cap_pid" "$head" "$n"
 done
 : > "$SCOPE_RECORD"; : > "$IP_RECORD"; ls "$PNEUMA_GATE_STATE_DIR/in" > "$work/in-before.txt"
 git init -q --bare "$work/cap-bundle-src.git" 2>/dev/null
 a2_out="$("$RUNNER" run --submitter capped --profile fake --repo capfresh --head "$head" --base "$base" --tree "$tree" --bundle < /dev/null 2>&1)" && a2_rc=0 || a2_rc=$?
-check "A2: a submitter at its cap is refused (75, named)" bash -c '[ "$1" = 75 ] && grep -q "already holds" <<<"$2"' _ "$a2_rc" "$a2_out"
+check "A2: a ninth gate from a submitter at its cap of 8 is refused (75, naming the cap)" bash -c '[ "$1" = 75 ] && grep -q "already holds 8" <<<"$2"' _ "$a2_rc" "$a2_out"
 check "A2: ...before any promote unit ran" bash -c '! grep -q -- "--unit=pneuma-promote-" "$1"' _ "$SCOPE_RECORD"
 check "A2: ...before a loopback address was claimed" bash -c '! grep -q "route add local" "$1"' _ "$IP_RECORD"
 check "A2: ...before a bundle was staged" bash -c 'ls "$1/in" | cmp -s - "$2"' _ "$PNEUMA_GATE_STATE_DIR" "$work/in-before.txt"
@@ -1127,9 +1142,9 @@ fresh_state; : > "$SYSTEMCTL_RECORD"
 
 # F5. the per-submitter cap counts records whose liveness is unknown, and never deletes or supersedes them
 fresh
-for n in 1 2 3; do printf 'key=\nhead=%s\npid=nonsense\npstart=1\nsubmitter=unk\nunit=pneuma-gate-unk-%s.service\nsuperseded=\n' "$C1" "$n" > "$PNEUMA_GATE_DEDUP_DIR/unk-$n"; done
+for n in 1 2 3 4 5 6 7 8; do printf 'key=\nhead=%s\npid=nonsense\npstart=1\nsubmitter=unk\nunit=pneuma-gate-unk-%s.service\nsuperseded=\n' "$C1" "$n" > "$PNEUMA_GATE_DEDUP_DIR/unk-$n"; done
 f5_rc=0; ddo dedup_hold f5-new repoA main "$C2" unk "$$" nonce-f5 job-f5 || f5_rc=$?
-check "F5: three records of unknown liveness hold the submitter at its cap (a fourth gate is refused, exit 2)" test "$f5_rc" = 2
+check "F5: eight records of unknown liveness hold the submitter at its cap (a ninth gate is refused, exit 2)" test "$f5_rc" = 2
 fresh
 printf 'key=repoA/main\nhead=%s\npid=nonsense\npstart=1\nsubmitter=%s\nunit=pneuma-gate-f5-unk.service\nsuperseded=\n' "$C1" "$SUB_A" > "$PNEUMA_GATE_DEDUP_DIR/f5-unk"
 ddo dedup_admit f5-newer "$dstore" repoA main "$C2" "$SUB_A" >/dev/null 2>&1
