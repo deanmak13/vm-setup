@@ -123,6 +123,31 @@ in_use() {
 
 dir_bytes() { du -sk -- "$1" 2>/dev/null | awk '{ printf "%d\n", $1 * 1024 }'; }
 
+# owned_dir <path>: a real directory (not a symlink) owned by the current uid.
+owned_dir() {
+    [[ -d "$1" && ! -L "$1" ]] || return 1
+    [[ "$(stat -c %u -- "$1" 2>/dev/null)" == "$(id -u)" ]]
+}
+
+# private_base <path>: owned by the current uid and not group/other-writable,
+# the same check pytest applies to its own basetemp root.
+private_base() {
+    local uid mode
+    read -r uid mode < <(stat -c '%u %a' -- "$1" 2>/dev/null) || return 1
+    [[ "$uid" == "$(id -u)" ]] && (( (8#$mode & 022) == 0 ))
+}
+
+# under <path> <parent>: the path's resolved parent is exactly the resolved parent dir.
+under() {
+    [[ "$(realpath -e -- "${1%/*}" 2>/dev/null)" == "$(realpath -e -- "$2" 2>/dev/null)" ]]
+}
+
+# remove_tree <dir>: delete a tree we own without following symlinks or leaving
+# the filesystem. Read-only directories are made writable first (find, not -R).
+remove_tree() {
+    find "$1" -xdev -type d -exec chmod u+w {} + && find "$1" -xdev -depth -delete
+}
+
 # ---- selectors: print "SEL<TAB>key<TAB>bytes<TAB>label", "KEEP<TAB>reason<TAB>item", "NA" (not applicable) or "ERR<TAB>message"
 
 select_containers() {
@@ -179,10 +204,13 @@ select_volumes() {
 
 select_pytest() {
     [[ -d "$PYTEST_BASE" && ! -L "$PYTEST_BASE" ]] || { printf 'NA\n'; return 0; }
+    if ! private_base "$PYTEST_BASE"; then
+        printf 'ERR\t%s is not owned by %s or is group/other-writable\n' "$PYTEST_BASE" "$(id -un)"; return 0
+    fi
     local d newest cutoff
     cutoff=$(( $(date +%s) - PYTEST_MIN_AGE ))
     for d in "$PYTEST_BASE"/pytest-[0-9]*; do
-        [[ -d "$d" && ! -L "$d" ]] || continue
+        owned_dir "$d" || { printf 'KEEP\tnot-owned-or-symlink\t%s\n' "$d"; continue; }
         newest=$(find "$d" -maxdepth 2 -printf '%T@\n' 2>/dev/null | sort -rn | head -n1 | cut -d. -f1)
         if [[ -z "$newest" ]] || (( newest >= cutoff )); then
             printf 'KEEP\tyoung-or-unreadable\t%s\n' "$d"
@@ -196,6 +224,7 @@ select_pytest() {
 
 select_releases() {
     [[ -d "$GATEWAY_RELEASES" && ! -L "$GATEWAY_RELEASES" ]] || { printf 'NA\n'; return 0; }
+    owned_dir "$GATEWAY_RELEASES" || { printf 'ERR\t%s is not a directory owned by %s\n' "$GATEWAY_RELEASES" "$(id -un)"; return 0; }
     if [[ ! -f "$GATEWAY_UNIT" ]]; then
         printf 'ERR\t%s not found; active release unknown\n' "$GATEWAY_UNIT"; return 0
     fi
@@ -209,6 +238,8 @@ select_releases() {
         id=${d##*/}
         if [[ ! "$id" =~ ^[0-9a-f]{40}$ || "${d%/*}" != "$GATEWAY_RELEASES" ]]; then
             printf 'KEEP\tnot-a-release\t%s\n' "$d"
+        elif ! owned_dir "$d"; then
+            printf 'KEEP\tnot-owned-or-symlink\t%s\n' "$d"
         elif grep -qx -- "$id" <<<"$active"; then
             printf 'KEEP\tactive\t%s\n' "$d"
         elif in_use "$d"; then
@@ -249,10 +280,10 @@ remove_volumes() {
 remove_pytest_dirs() {
     local d
     for d in "$@"; do
-        if [[ "${d%/*}" != "$PYTEST_BASE" || ! "${d##*/}" =~ ^pytest-[0-9]+$ || -L "$d" || ! -d "$d" ]]; then
-            warn "refusing to remove $d (outside $PYTEST_BASE)"; continue
+        if ! under "$d" "$PYTEST_BASE" || [[ ! "${d##*/}" =~ ^pytest-[0-9]+$ ]] || ! owned_dir "$d"; then
+            warn "refusing to remove $d (outside $PYTEST_BASE, not ours, or a symlink)"; continue
         fi
-        if rm -rf -- "$d"; then
+        if remove_tree "$d"; then
             REMOVED_THIS=$((REMOVED_THIS + 1)); note "removed pytest temp dir $d"
         else
             warn "could not remove pytest temp dir $d"
@@ -263,11 +294,11 @@ remove_pytest_dirs() {
 remove_releases() {
     local d
     for d in "$@"; do
-        if [[ "${d%/*}" != "$GATEWAY_RELEASES" || ! "${d##*/}" =~ ^[0-9a-f]{40}$ || -L "$d" || ! -d "$d" ]]; then
-            warn "refusing to remove $d (not a release under $GATEWAY_RELEASES)"; continue
+        if ! under "$d" "$GATEWAY_RELEASES" || [[ ! "${d##*/}" =~ ^[0-9a-f]{40}$ ]] || ! owned_dir "$d"; then
+            warn "refusing to remove $d (not a release under $GATEWAY_RELEASES, not ours, or a symlink)"; continue
         fi
-        # Release trees are stored read-only: restore owner write before removing.
-        if chmod -R u+w -- "$d" && rm -rf -- "$d"; then
+        # Release trees are stored read-only; remove_tree restores owner write first.
+        if remove_tree "$d"; then
             REMOVED_THIS=$((REMOVED_THIS + 1)); note "removed gateway release ${d##*/}"
         else
             warn "could not remove gateway release ${d##*/}"

@@ -104,11 +104,18 @@ case "$name" in
     [[ -n "${FAKE_PGREP_HIT:-}" && "$*" == *"$FAKE_PGREP_HIT"* ]] && { echo 4242; exit 0; }
     exit 1 ;;
   loginctl) echo "${FAKE_LINGER:-yes}"; exit 0 ;;
+  stat)
+    # FAKE_STAT_UID makes every stat report that owner, so ownership checks fail.
+    if [[ -n "${FAKE_STAT_UID:-}" ]]; then
+      if [[ "$*" == *%a* ]]; then echo "$FAKE_STAT_UID 755"; else echo "$FAKE_STAT_UID"; fi
+      exit 0
+    fi
+    exec /usr/bin/stat "$@" ;;
 esac
 exit 0
 SHIM
 chmod +x "$T/bin/fake-cmd"
-for n in docker df systemctl logger pgrep loginctl; do ln -s "$T/bin/fake-cmd" "$T/bin/$n"; done
+for n in docker df systemctl logger pgrep loginctl stat; do ln -s "$T/bin/fake-cmd" "$T/bin/$n"; done
 
 # Fixture helpers.
 hex()  { printf '%064x' "$1"; }                  # 64-hex, like an anonymous volume id
@@ -124,12 +131,13 @@ add_volume() { printf '%s %s %s %s\n' "$1" "$2" "$3" "$4" >> "$FAKE_VOLS"; }
 set_free() { export FAKE_TOTAL_GB=1000 FAKE_FREE_GB=$(( $1 * 10 )); }
 
 reset_fakes() {
-  unset FAKE_DOCKER_DOWN FAKE_PRUNE_FAIL FAKE_RM_FAIL FAKE_DF_BAD FAKE_PGREP_HIT FAKE_LINGER
+  unset FAKE_DOCKER_DOWN FAKE_PRUNE_FAIL FAKE_RM_FAIL FAKE_DF_BAD FAKE_PGREP_HIT FAKE_LINGER FAKE_STAT_UID
   set_free 50
   : > "$FAKE_LOG"; : > "$FAKE_PS"; : > "$FAKE_VOLS"
   chmod -R u+w "$HOME" "$T/root" 2>/dev/null
   rm -rf "$HOME/.local" "$HOME/.config" "$T/root/usr" "$T/root/etc" "$PYTEST_BASE" "$MARKER"
   mkdir -p "$PYTEST_BASE" "$T/root/run"
+  chmod 755 "$PYTEST_BASE"
 }
 
 # add_pytest_dir <name> <age>: directory whose entries are all <age> old.
@@ -282,6 +290,72 @@ add_release 1 1hours
 call --dry-run
 expect_out "missing unit skips the release pass" '^releases: skipped \(.*not found' 1
 [[ -d "$RELDIR/$(rhex 1)" ]] || { echo "FAIL: release removed without a unit" >&2; fail=1; }
+
+# --- ownership and symlink discipline on removal -----------------------------
+# Base owned by another uid: the whole pytest pass is skipped, nothing removed.
+reset_fakes
+add_pytest_dir pytest-0 5hours
+FAKE_STAT_UID=0 export FAKE_STAT_UID
+call --dry-run
+expect_out "foreign-owned pytest base skips the pass" 'pytest: skipped .*not owned' 1
+call --run
+[[ -d "$PYTEST_BASE/pytest-0" ]] || { echo "FAIL: pytest dir removed under a foreign-owned base" >&2; fail=1; }
+expect "foreign-owned pytest base is journaled as skipped" 'pytest pass skipped' 1
+unset FAKE_STAT_UID
+
+# Group/other-writable base: skipped as pytest itself would refuse it.
+reset_fakes
+add_pytest_dir pytest-0 5hours
+chmod 775 "$PYTEST_BASE"
+call --run
+[[ -d "$PYTEST_BASE/pytest-0" ]] || { echo "FAIL: pytest dir removed under a group-writable base" >&2; fail=1; }
+expect "group-writable pytest base is journaled as skipped" 'pytest pass skipped' 1
+
+# A candidate that is a symlink: the link and its target are both untouched.
+reset_fakes
+mkdir -p "$T/outside"; echo keep > "$T/outside/keep.txt"; touch -d '5 hours ago' "$T/outside/keep.txt" "$T/outside"
+ln -s "$T/outside" "$PYTEST_BASE/pytest-9"
+call --run
+[[ -L "$PYTEST_BASE/pytest-9" ]] || { echo "FAIL: symlink candidate removed" >&2; fail=1; }
+[[ -f "$T/outside/keep.txt" ]] || { echo "FAIL: symlink candidate target removed" >&2; fail=1; }
+
+# A symlink inside an otherwise selected candidate: only the link goes, target stays.
+reset_fakes
+mkdir -p "$T/outside"; echo keep > "$T/outside/keep.txt"; touch -d '5 hours ago' "$T/outside/keep.txt" "$T/outside"
+add_pytest_dir pytest-0 5hours
+ln -s "$T/outside/keep.txt" "$PYTEST_BASE/pytest-0/link.txt"
+touch -h -d '5 hours ago' "$PYTEST_BASE/pytest-0/link.txt"
+touch -d '5 hours ago' "$PYTEST_BASE/pytest-0"
+call --run
+[[ ! -e "$PYTEST_BASE/pytest-0" ]] || { echo "FAIL: candidate with inner symlink kept" >&2; fail=1; }
+[[ -f "$T/outside/keep.txt" ]] || { echo "FAIL: symlink target outside the candidate removed" >&2; fail=1; }
+
+# Release base owned by another uid: release pass skipped, nothing removed.
+reset_fakes
+add_release 1 4hours
+mkdir -p "$(dirname "$UNIT")"
+printf 'ExecStart=%s/%s/bin/gateway\n' "$RELDIR" "$(rhex 1)" > "$UNIT"
+add_release 2 5hours
+add_release 3 6hours
+FAKE_STAT_UID=0 export FAKE_STAT_UID
+call --dry-run
+expect_out "foreign-owned releases base skips the pass" 'releases: skipped .*owned by' 1
+call --run
+[[ -d "$RELDIR/$(rhex 3)" ]] || { echo "FAIL: release removed under a foreign-owned base" >&2; fail=1; }
+unset FAKE_STAT_UID
+
+# A release that is a symlink to a tree outside: link and target untouched.
+reset_fakes
+mkdir -p "$T/outside-rel/bin"; echo x > "$T/outside-rel/bin/gateway"; touch -d '9 hours ago' "$T/outside-rel/bin/gateway" "$T/outside-rel"
+add_release 1 4hours
+mkdir -p "$(dirname "$UNIT")"
+printf 'ExecStart=%s/%s/bin/gateway\n' "$RELDIR" "$(rhex 1)" > "$UNIT"
+add_release 2 3hours
+add_release 3 2hours
+ln -s "$T/outside-rel" "$RELDIR/$(rhex 9)"
+call --run
+[[ -L "$RELDIR/$(rhex 9)" ]] || { echo "FAIL: symlinked release removed" >&2; fail=1; }
+[[ -f "$T/outside-rel/bin/gateway" ]] || { echo "FAIL: symlinked release target removed" >&2; fail=1; }
 
 # --- empty selections never run a removal ----------------------------------
 reset_fakes
