@@ -99,7 +99,7 @@ fetch_keep_refs() {  # <store> <bundle> <repo> <branch-or-empty>
   safe_name "$repo" || return 1
   specs+=("+refs/pneuma-gate/repo/$repo:refs/gate-keep/repo/$repo")
   if [ -n "$branch" ]; then specs+=("+refs/pneuma-gate/branch/$branch:refs/gate-keep/branch/$branch"); fi
-  specs+=("+refs/pneuma-gate/head-*:refs/gate-keep/head-*" "+refs/pneuma-gate/base-*:refs/gate-keep/base-*" "+refs/pneuma-gate/om-*:refs/gate-keep/om-*")
+  specs+=("+refs/pneuma-gate/head-*:refs/gate-keep/head-*" "+refs/pneuma-gate/base-*:refs/gate-keep/base-*" "+refs/pneuma-gate/om-*:refs/gate-keep/om-*" "+refs/pneuma-gate/sibling/*:refs/gate-keep/sibling/*")
   as_gate git --git-dir="$store" fetch "$bundle" "${specs[@]}" 2>&1 | sed 's/^/  fetch: /'
   return "${PIPESTATUS[0]}"
 }
@@ -183,9 +183,15 @@ R_REPO=""; R_HEAD=""; R_TREE=""; R_PROFILE=""; R_BASE=""; R_ORIGIN=""; R_ENV="";
 RESULTS_DIR="${PNEUMA_GATE_RESULTS_DIR:-/var/lib/pneuma-gate-results}"
 # job_key: the ONE identity of a verdict's scope. Everything that can change what the gate decides is in it:
 # repo, head, tree, submitter, profile, base, origin-main and the scope env flags (sorted, comma-joined).
-job_key() {  # <repo> <head> <tree> <submitter> <profile> <base> <origin_main> <env>
-  printf 'pneuma-gate-job-v1|repo=%s|head=%s|tree=%s|submitter=%s|profile=%s|base=%s|origin_main=%s|env=%s' \
-    "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" | sha256sum | cut -d' ' -f1
+job_key() {  # <repo> <head> <tree> <submitter> <profile> <base> <origin_main> <env> [siblings: sorted NAME=SHA, comma-joined]
+  # The siblings segment exists ONLY when there are siblings, so a submission without any keeps the exact 6ffda16 key and
+  # old/new clients and hosts still bind each other's verdicts.
+  local m
+  m="pneuma-gate-job-v1|repo=$1|head=$2|tree=$3|submitter=$4|profile=$5|base=$6|origin_main=$7|env=$8"
+  if [ -n "${9:-}" ]; then
+    m="$m|siblings=$9"
+  fi
+  printf '%s' "$m" | sha256sum | cut -d' ' -f1
 }
 result() {   # result <exit> [reason]: the verdict is written to the result file, and the stream shows that file's line
   local line tmp
@@ -426,8 +432,17 @@ cmd_cancel() {  # --repo R --head SHA: cancel THIS submitter's live jobs for tha
   )
 }
 
+cmd_siblings() {   # --profile P: the sibling repo names profile P's gate needs, one per line (data in the profile)
+  local profile=""
+  while [ $# -gt 0 ]; do case "$1" in --profile) profile="$2"; shift 2;; *) echo "unknown arg $1" >&2; return 2;; esac; done
+  safe_name "$profile" && [ -r "$PROFILE_DIR/$profile.sh" ] || { echo "no gate profile '$profile'" >&2; return 2; }
+  ( source "$PROFILE_DIR/$profile.sh" >/dev/null 2>&1 || exit 2
+    declare -F profile_siblings >/dev/null || exit 0
+    profile_siblings | while read -r n; do [ -z "$n" ] || { safe_name "$n" && printf '%s\n' "$n"; } || exit 2; done )
+}
+
 cmd_run() {
-  local profile="" repo="" head="" base="" tree="" bundle=0 shallow="" origin_main="" branch="" fwd_env=()
+  local profile="" repo="" head="" base="" tree="" bundle=0 shallow="" origin_main="" branch="" fwd_env=() sib_args=()
   while [ $# -gt 0 ]; do
     case "$1" in
       --shallow) shallow="$2"; shift 2;;
@@ -439,6 +454,10 @@ cmd_run() {
       --head) head="$2"; shift 2;; --base) base="$2"; shift 2;;
       --tree) tree="$2"; shift 2;; --bundle) bundle=1; shift;;
       --branch) branch="$2"; shift 2;;
+      --sibling)   # NAME=SHA of a sibling repo this submission ships (bound into the job key, checked against the bundle)
+        [[ "$2" =~ ^[A-Za-z0-9._-]{1,100}=[0-9a-f]{40}$ && "${2%%=*}" != . && "${2%%=*}" != .. ]] || { echo "refusing sibling '$2'" >&2; return 2; }
+        [ "${#sib_args[@]}" -lt 8 ] || { echo "refusing more than 8 sibling arguments" >&2; return 2; }
+        sib_args+=("$2"); shift 2;;
       *) echo "unknown arg $1" >&2; return 2;;
     esac
   done
@@ -450,8 +469,25 @@ cmd_run() {
   [ -r "$PROFILE_DIR/$profile.sh" ] || refuse "no gate profile '$profile' in $PROFILE_DIR"
   # GATE-QUEUE-1 / the scope key: every input that defines this verdict's scope is in ONE job key. A live job
   # with the same key is followed, never queued twice; anything that differs (even the base or an env flag) is a new job.
+  # The sibling arguments become validated (name, sha) pairs ONCE: no duplicate name, only names the profile declares,
+  # never more than it declares. Everything below (the job key, the lookup) uses exactly these pairs, by exact string
+  # comparison (an associative array), never a pattern built from input.
+  local -A sib_sha=() sib_declared=()
+  local sp sn dn sibs_s
+  while IFS= read -r dn; do [ -z "$dn" ] || sib_declared["$dn"]=1; done <<< "$(cmd_siblings --profile "$profile" 2>/dev/null || true)"
+  for sp in ${sib_args[@]+"${sib_args[@]}"}; do
+    sn="${sp%%=*}"
+    [ -z "${sib_sha[$sn]+x}" ] || refuse "duplicate sibling '$sn'"
+    [ -n "${sib_declared[$sn]+x}" ] || refuse "sibling '$sn' is not declared by profile $profile"
+    sib_sha["$sn"]="${sp#*=}"
+  done
+  [ "${#sib_sha[@]}" -le "${#sib_declared[@]}" ] || refuse "more sibling arguments than profile $profile declares"
+  sibs_s=""
+  if [ "${#sib_sha[@]}" -gt 0 ]; then
+    sibs_s="$(for sn in "${!sib_sha[@]}"; do printf '%s=%s\n' "$sn" "${sib_sha[$sn]}"; done | LC_ALL=C sort | paste -sd, -)"
+  fi
   local env_s; env_s="$(printf '%s\n' "${fwd_env[@]}" | sort | paste -sd, -)"
-  JOB_KEY="$(job_key "$repo" "$head" "$tree" "$SUBMITTER" "$profile" "$base" "$origin_main" "$env_s")"
+  JOB_KEY="$(job_key "$repo" "$head" "$tree" "$SUBMITTER" "$profile" "$base" "$origin_main" "$env_s" "$sibs_s")"
   R_BASE="$base"; R_ORIGIN="$origin_main"; R_ENV="$env_s"; R_SUBMITTER="$SUBMITTER"; R_JOBKEY="$JOB_KEY"
   local live_id; live_id="$(live_job_for_key "$JOB_KEY")"
   if [ -n "$live_id" ]; then
@@ -483,13 +519,19 @@ cmd_run() {
   fi
   if [ "$bundle" = 1 ]; then
     local bf="$BASE_DIR/queue/in-$$.bundle"
-    cat > "$bf"
+    # a generous cap (default 512 MiB), enforced while reading, so one stream cannot fill the builder's disk
+    local cap="${PNEUMA_GATE_MAX_BUNDLE_BYTES:-536870912}"
+    head -c "$((cap + 1))" > "$bf"
+    [ "$(stat -c %s "$bf")" -le "$cap" ] || { rm -f "$bf"; refuse "bundle is too large (over $cap bytes)"; }
     if [ -n "$branch" ]; then
       bundle_binds "$bf" "$repo" "$branch" "$head" || refuse "bundle does not carry $repo branch $branch at $head"
     fi
     if [ -n "$RUN_AS" ]; then chown "$RUN_AS" "$bf"; fi
     log "received bundle ($(du -h "$bf" | cut -f1))"
     fetch_keep_refs "$store" "$bf" "$repo" "$branch" || { rm -f "$bf"; refuse "bundle fetch failed"; }
+    # the sibling commits THIS submission shipped (name sha), read from its own bundle: the store's keep refs are shared
+    # between concurrent submissions, so they are never the source of which commit this run uses
+    SIB_SHIPPED="$(cd / && git bundle list-heads "$bf" 2>/dev/null | sed -n 's#^\([0-9a-f]\{40\}\) refs/pneuma-gate/sibling/\([A-Za-z0-9._-]\{1,100\}\)$#\2 \1#p')"
     rm -f "$bf"
   fi
   local o
@@ -543,6 +585,25 @@ run_job() {   # the detached worker: admission, workspace, the gate, the verdict
     git -c advice.detachedHead=false checkout -q --detach "$3"' _ "$work" "$store" "$head" "$base" "$origin_main" \
     || refuse "workspace checkout failed"
   [ "$(as_gate git -C "$work" rev-parse 'HEAD^{tree}')" = "$tree" ] || refuse "workspace tree mismatch"
+  # Sibling repos the profile declares (the engine reads pneuma-helm-charts beside the repo under test): laid out at
+  # $HOME/Repos/pneuma/<name> at the commit the submitter shipped, origin pointing at itself. A declared sibling that
+  # was not shipped is NO VERDICT (75), never a skipped phase.
+  if declare -F profile_siblings >/dev/null; then
+    local sib sha
+    while read -r sib; do
+      [ -n "$sib" ] || continue
+      safe_name "$sib" || refuse "bad sibling name"
+      sha="${sib_sha[$sib]:-}"
+      [ -z "$sha" ] || grep -qxF "$sib $sha" <<<"${SIB_SHIPPED:-}" || refuse "sibling '$sib' at $sha is not in the submission's bundle"
+      [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || refuse "sibling repo '$sib' is required by profile $profile but was not shipped (old client?)"
+      as_gate git --git-dir="$store" cat-file -e "${sha}^{commit}" 2>/dev/null || refuse "sibling commit for '$sib' is not in the store"
+      as_gate bash -c 'set -e; mkdir -p "$1"; cd "$1"; git init -q -b main .; echo "$2/objects" > .git/objects/info/alternates
+        git update-ref refs/heads/main "$3"; git update-ref refs/remotes/origin/main "$3"; git remote add origin "$1"
+        git -c advice.detachedHead=false checkout -q main' _ "$RUN_DIR/home/Repos/pneuma/$sib" "$store" "$sha" \
+        || refuse "cannot lay out sibling repo '$sib'"
+      log "sibling $sib at ${sha:0:12}"
+    done <<< "$(profile_siblings)"
+  fi
   [ -z "$(as_gate git -C "$work" status --porcelain)" ] || refuse "workspace not clean after checkout"
   # Optional profile hook: the scoping decision (diff size, selected services) at
   # the top of the log, so a wrong selection is visible in every verdict.
@@ -599,8 +660,9 @@ main() {
     run) [[ "$SUBMITTER" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] || refuse_noid; cmd_run "$@"; exit $?;;
     cancel) [[ "$SUBMITTER" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] || refuse_noid; cmd_cancel "$@"; exit $?;;
     status) cmd_status;;
+    siblings) cmd_siblings "$@"; exit $?;;
     janitor) cmd_janitor;;
-    *) echo "usage: pneuma-gate-runner {have|run|cancel|status|janitor}" >&2; exit 2;;
+    *) echo "usage: pneuma-gate-runner {have|run|cancel|status|siblings|janitor}" >&2; exit 2;;
   esac
 }
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then main "$@"; fi
