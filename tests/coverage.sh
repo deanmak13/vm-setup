@@ -28,7 +28,7 @@ OUT="$REPO_DIR/cov"
 [[ -d "$OUT" ]] && docker run --rm -v "$REPO_DIR:/src" "$IMAGE" rm -rf /src/cov
 docker run --rm -v "$REPO_DIR:/src" -w /src -e "HOST_ID=$(id -u):$(id -g)" "$IMAGE" bash -c '
     apt-get -qq update >/dev/null && apt-get -qq install -y jq git >/dev/null
-    filters=(--include-path=/src --exclude-pattern=/src/tests/coverage.sh
+    filters=(--include-path=/src --exclude-pattern=/src/tests/coverage.sh,/src/tests/fixtures
              "--exclude-region=[host-only-begin]:[host-only-end]")
     rc=0
     for t in tests/*.test.sh; do

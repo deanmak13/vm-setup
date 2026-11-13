@@ -242,8 +242,14 @@ marker=$(grep '^PNEUMA_GATE_RESULT ' "$log" | tail -1)
 field() { printf '%s' "$marker" | tr ' ' '\n' | sed -n "s/^$1=//p" | head -1; }
 # Must match the runner's job_key byte for byte: the scope key that binds a verdict's fields.
 job_key() {  # <repo> <head> <tree> <submitter> <profile> <base> <origin_main> <env> [siblings]
-  printf 'pneuma-gate-job-v1|repo=%s|head=%s|tree=%s|submitter=%s|profile=%s|base=%s|origin_main=%s|env=%s|siblings=%s' \
-    "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "${9:-}" | sha256sum | cut -d' ' -f1
+  # The siblings segment exists ONLY when there are siblings, so a submission without any keeps the exact 6ffda16 key and
+  # old/new clients and hosts still bind each other's verdicts.
+  local m
+  m="pneuma-gate-job-v1|repo=$1|head=$2|tree=$3|submitter=$4|profile=$5|base=$6|origin_main=$7|env=$8"
+  if [ -n "${9:-}" ]; then
+    m="$m|siblings=$9"
+  fi
+  printf '%s' "$m" | sha256sum | cut -d' ' -f1
 }
 [ "$(field head)" = "$head" ] && [ "$(field tree)" = "$tree" ] \
   || nogate "result is for head=$(field head) tree=$(field tree), expected $head/$tree — NOT green"

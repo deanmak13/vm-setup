@@ -453,6 +453,41 @@ sib_opts() { local i o=""; for i in $(seq 1 "$1"); do o="$o --sibling s$i=012345
 check "siblings entry: 8 --sibling options pass" bash -c 'SSH_ORIGINAL_COMMAND="run --profile fake --repo x$2" PNEUMA_GATE_RUNNER_BIN="$3" PNEUMA_GATE_SUDO="$4" "$1" --submitter test-lane >/dev/null 2>&1' _ "$ENTRY" "$(sib_opts 8)" "$work/bin/argv-recorder" "$work/bin/sudo-stub"
 check "siblings entry: 9 --sibling options are refused" bash -c '! SSH_ORIGINAL_COMMAND="run --profile fake --repo x$2" PNEUMA_GATE_RUNNER_BIN="$3" PNEUMA_GATE_SUDO="$4" "$1" --submitter test-lane >/dev/null 2>&1' _ "$ENTRY" "$(sib_opts 9)" "$work/bin/argv-recorder" "$work/bin/sudo-stub"
 check "siblings runner: more than 8 sibling arguments are refused" grep -q "refusing more than 8 sibling arguments" <<<"$("$RUNNER" run --submitter test-lane --profile sibfake --repo fakerepo --head "$head" --base "$base" --tree "$tree" --bundle $(sib_opts 9 | sed 's/--sibling/--sibling/g') </dev/null 2>&1 || true)"
+# ── version compatibility: a submission WITHOUT siblings keeps the exact 6ffda16 job key, so mixed old/new pairs bind ──
+# frozen, byte-exact copies of the deployed 6ffda16 runner and client (tests/fixtures/6ffda16), checked against the hashes
+# of `git show 6ffda16:bin/<file>` (the runner's hash is also what the build host runs), so these tests need no git history
+cp "$TESTS_DIR/fixtures/6ffda16/pneuma-gate-runner.fixture" "$work/old-runner"; cp "$TESTS_DIR/fixtures/6ffda16/pneuma-remote-gate.fixture" "$work/old-client"
+chmod +x "$work/old-runner" "$work/old-client"
+expect_eq "compat: the 6ffda16 runner fixture is the deployed file" b66748309bf8b34865ec360557ffc4f7da512c581ef23e97958612d7dbab316f "$(sha256sum < "$work/old-runner" | cut -d' ' -f1)"
+expect_eq "compat: the 6ffda16 client fixture is the deployed file" b6f5037d7af91f58060370e588829d4ba4ff671ff445ab52fac9a274d1844a1c "$(sha256sum < "$work/old-client" | cut -d' ' -f1)"
+okey="$(bash -c 'source "$1"; shift; job_key "$@"' _ "$work/old-runner" r1 "$head" "$tree" test-lane fake "$base" "$base" "")"
+nkey="$(bash -c 'source "$1"; shift; job_key "$@"' _ "$RUNNER" r1 "$head" "$tree" test-lane fake "$base" "$base" "")"
+nkey8="$(bash -c 'source "$1"; shift; job_key "$@"' _ "$RUNNER" r1 "$head" "$tree" test-lane fake "$base" "$base" "")"
+expect_eq "compat: the runner's key with no siblings equals the 6ffda16 runner's key byte for byte" "$okey" "$nkey"
+expect_eq "compat: a key with an empty siblings argument equals the one with the argument absent" "$nkey8" "$(bash -c 'source "$1"; shift; job_key "$@"' _ "$RUNNER" r1 "$head" "$tree" test-lane fake "$base" "$base" "" "")"
+expect_eq "compat: the 6ffda16 key of a fixed vector is still this value (pins the format)" "$(printf 'pneuma-gate-job-v1|repo=r|head=h|tree=t|submitter=s|profile=p|base=b|origin_main=o|env=e' | sha256sum | cut -d' ' -f1)" "$(bash -c 'source "$1"; shift; job_key "$@"' _ "$RUNNER" r h t s p b o e)"
+check "compat: with siblings the key differs from the no-sibling key" test "$(bash -c 'source "$1"; shift; job_key "$@"' _ "$RUNNER" r1 "$head" "$tree" test-lane fake "$base" "$base" "" "a=$sha40")" != "$nkey"
+# the client computes the same key function: verify by sourcing its job_key definition
+client_jk() { bash -c 'eval "$(sed -n "/^job_key() {/,/^}/p" "$1")"; shift; job_key "$@"' _ "$CLIENT" "$@"; }
+expect_eq "compat: the client's key with no siblings equals the 6ffda16 key" "$okey" "$(client_jk r1 "$head" "$tree" test-lane fake "$base" "$base" "" "")"
+expect_eq "compat: the client and the runner agree on a key WITH siblings" "$(bash -c 'source "$1"; shift; job_key "$@"' _ "$RUNNER" r1 "$head" "$tree" test-lane fake "$base" "$base" "" "a=$sha40")" "$(client_jk r1 "$head" "$tree" test-lane fake "$base" "$base" "" "a=$sha40")"
+# new client + OLD host (the 6ffda16 runner behind the new entry grammar's absence): an ordinary gate must bind and be green
+cat > "$work/bin/old-host-runner" <<STUB
+#!/usr/bin/env bash
+case "\$1" in siblings) echo "pneuma-gate-entry: refused: verb 'siblings' is not allowed" >&2; exit 75;; esac
+verb="\$1"; shift
+exec "$work/old-runner" "\$verb" --submitter test-lane "\$@"
+STUB
+chmod +x "$work/bin/old-host-runner"
+out=$(PNEUMA_GATE_RUNNER="$work/bin/old-host-runner" "$CLIENT" --repo-dir "$src" --profile fake --head "$head" --base "$base" --log-dir "$work/logs" 2>&1) && rc=0 || rc=$?
+expect_eq "compat: NEW client + OLD host: an ordinary gate is green (the key binds)" 0 "$rc"
+check "compat: ...and the old host was not asked for, nor sent, any sibling" not grep -q "sibling" <<<"$out"
+# OLD client + NEW host, a profile with no siblings: the key binds
+out=$(PNEUMA_GATE_RUNNER="$work/bin/gate-as-forced-command" "$work/old-client" --repo-dir "$src" --profile fake --head "$head" --base "$base" --log-dir "$work/logs" 2>&1) && rc=0 || rc=$?
+expect_eq "compat: OLD client + NEW host, no-sibling profile: green (the key binds)" 0 "$rc"
+# OLD client + NEW host, a profile that declares a sibling: no verdict, never green
+out=$(PNEUMA_GATE_RUNNER="$work/bin/gate-as-forced-command" "$work/old-client" --repo-dir "$src" --profile sibfake --head "$head" --base "$base" --log-dir "$work/logs" 2>&1) && rc=0 || rc=$?
+expect_eq "compat: OLD client + NEW host, sibling-declaring profile: exit 75 (declared, not shipped)" 75 "$rc"
 unset SHIM_GETURL PNEUMA_GATE_SIBLINGS_CONF
 unset PNEUMA_GATE_SIBLINGS_ROOT
 chmod -R u+w "$PNEUMA_GATE_BASE/envs" 2>/dev/null || true

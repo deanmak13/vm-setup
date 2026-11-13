@@ -184,8 +184,14 @@ RESULTS_DIR="${PNEUMA_GATE_RESULTS_DIR:-/var/lib/pneuma-gate-results}"
 # job_key: the ONE identity of a verdict's scope. Everything that can change what the gate decides is in it:
 # repo, head, tree, submitter, profile, base, origin-main and the scope env flags (sorted, comma-joined).
 job_key() {  # <repo> <head> <tree> <submitter> <profile> <base> <origin_main> <env> [siblings: sorted NAME=SHA, comma-joined]
-  printf 'pneuma-gate-job-v1|repo=%s|head=%s|tree=%s|submitter=%s|profile=%s|base=%s|origin_main=%s|env=%s|siblings=%s' \
-    "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "${9:-}" | sha256sum | cut -d' ' -f1
+  # The siblings segment exists ONLY when there are siblings, so a submission without any keeps the exact 6ffda16 key and
+  # old/new clients and hosts still bind each other's verdicts.
+  local m
+  m="pneuma-gate-job-v1|repo=$1|head=$2|tree=$3|submitter=$4|profile=$5|base=$6|origin_main=$7|env=$8"
+  if [ -n "${9:-}" ]; then
+    m="$m|siblings=$9"
+  fi
+  printf '%s' "$m" | sha256sum | cut -d' ' -f1
 }
 result() {   # result <exit> [reason]: the verdict is written to the result file, and the stream shows that file's line
   local line tmp
