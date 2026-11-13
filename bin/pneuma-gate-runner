@@ -183,9 +183,9 @@ R_REPO=""; R_HEAD=""; R_TREE=""; R_PROFILE=""; R_BASE=""; R_ORIGIN=""; R_ENV="";
 RESULTS_DIR="${PNEUMA_GATE_RESULTS_DIR:-/var/lib/pneuma-gate-results}"
 # job_key: the ONE identity of a verdict's scope. Everything that can change what the gate decides is in it:
 # repo, head, tree, submitter, profile, base, origin-main and the scope env flags (sorted, comma-joined).
-job_key() {  # <repo> <head> <tree> <submitter> <profile> <base> <origin_main> <env>
-  printf 'pneuma-gate-job-v1|repo=%s|head=%s|tree=%s|submitter=%s|profile=%s|base=%s|origin_main=%s|env=%s' \
-    "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" | sha256sum | cut -d' ' -f1
+job_key() {  # <repo> <head> <tree> <submitter> <profile> <base> <origin_main> <env> [siblings: sorted NAME=SHA, comma-joined]
+  printf 'pneuma-gate-job-v1|repo=%s|head=%s|tree=%s|submitter=%s|profile=%s|base=%s|origin_main=%s|env=%s|siblings=%s' \
+    "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "${9:-}" | sha256sum | cut -d' ' -f1
 }
 result() {   # result <exit> [reason]: the verdict is written to the result file, and the stream shows that file's line
   local line tmp
@@ -436,7 +436,7 @@ cmd_siblings() {   # --profile P: the sibling repo names profile P's gate needs,
 }
 
 cmd_run() {
-  local profile="" repo="" head="" base="" tree="" bundle=0 shallow="" origin_main="" branch="" fwd_env=()
+  local profile="" repo="" head="" base="" tree="" bundle=0 shallow="" origin_main="" branch="" fwd_env=() sib_args=()
   while [ $# -gt 0 ]; do
     case "$1" in
       --shallow) shallow="$2"; shift 2;;
@@ -448,6 +448,9 @@ cmd_run() {
       --head) head="$2"; shift 2;; --base) base="$2"; shift 2;;
       --tree) tree="$2"; shift 2;; --bundle) bundle=1; shift;;
       --branch) branch="$2"; shift 2;;
+      --sibling)   # NAME=SHA of a sibling repo this submission ships (bound into the job key, checked against the bundle)
+        [[ "$2" =~ ^[A-Za-z0-9._-]{1,100}=[0-9a-f]{40}$ && "${2%%=*}" != . && "${2%%=*}" != .. ]] || { echo "refusing sibling '$2'" >&2; return 2; }
+        sib_args+=("$2"); shift 2;;
       *) echo "unknown arg $1" >&2; return 2;;
     esac
   done
@@ -459,8 +462,9 @@ cmd_run() {
   [ -r "$PROFILE_DIR/$profile.sh" ] || refuse "no gate profile '$profile' in $PROFILE_DIR"
   # GATE-QUEUE-1 / the scope key: every input that defines this verdict's scope is in ONE job key. A live job
   # with the same key is followed, never queued twice; anything that differs (even the base or an env flag) is a new job.
+  local sibs_s; sibs_s="$(printf '%s\n' ${sib_args[@]+"${sib_args[@]}"} | grep . | LC_ALL=C sort | paste -sd, - || true)"
   local env_s; env_s="$(printf '%s\n' "${fwd_env[@]}" | sort | paste -sd, -)"
-  JOB_KEY="$(job_key "$repo" "$head" "$tree" "$SUBMITTER" "$profile" "$base" "$origin_main" "$env_s")"
+  JOB_KEY="$(job_key "$repo" "$head" "$tree" "$SUBMITTER" "$profile" "$base" "$origin_main" "$env_s" "$sibs_s")"
   R_BASE="$base"; R_ORIGIN="$origin_main"; R_ENV="$env_s"; R_SUBMITTER="$SUBMITTER"; R_JOBKEY="$JOB_KEY"
   local live_id; live_id="$(live_job_for_key "$JOB_KEY")"
   if [ -n "$live_id" ]; then
@@ -492,7 +496,10 @@ cmd_run() {
   fi
   if [ "$bundle" = 1 ]; then
     local bf="$BASE_DIR/queue/in-$$.bundle"
-    cat > "$bf"
+    # a generous cap (default 512 MiB), enforced while reading, so one stream cannot fill the builder's disk
+    local cap="${PNEUMA_GATE_MAX_BUNDLE_BYTES:-536870912}"
+    head -c "$((cap + 1))" > "$bf"
+    [ "$(stat -c %s "$bf")" -le "$cap" ] || { rm -f "$bf"; refuse "bundle is too large (over $cap bytes)"; }
     if [ -n "$branch" ]; then
       bundle_binds "$bf" "$repo" "$branch" "$head" || refuse "bundle does not carry $repo branch $branch at $head"
     fi
@@ -563,7 +570,8 @@ run_job() {   # the detached worker: admission, workspace, the gate, the verdict
     while read -r sib; do
       [ -n "$sib" ] || continue
       safe_name "$sib" || refuse "bad sibling name"
-      sha="$(awk -v n="$sib" '$1 == n {print $2}' <<<"${SIB_SHIPPED:-}" | head -1)"
+      sha="$(printf '%s\n' ${sib_args[@]+"${sib_args[@]}"} | sed -n "s#^$sib=\([0-9a-f]\{40\}\)\$#\1#p" | head -1)"
+      [ -z "$sha" ] || grep -qxF "$sib $sha" <<<"${SIB_SHIPPED:-}" || refuse "sibling '$sib' at $sha is not in the submission's bundle"
       [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || refuse "sibling repo '$sib' is required by profile $profile but was not shipped (old client?)"
       as_gate git --git-dir="$store" cat-file -e "${sha}^{commit}" 2>/dev/null || refuse "sibling commit for '$sib' is not in the store"
       as_gate bash -c 'set -e; mkdir -p "$1"; cd "$1"; git init -q -b main .; echo "$2/objects" > .git/objects/info/alternates

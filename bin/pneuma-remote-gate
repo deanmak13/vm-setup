@@ -128,8 +128,12 @@ SIBLINGS_CONF="${PNEUMA_GATE_SIBLINGS_CONF:-$(dirname "$(readlink -f "$0")")/pne
 SIBLINGS_ROOT="${PNEUMA_GATE_SIBLINGS_ROOT:-$HOME/Repos/pneuma}"
 declare -A sib_allowed=()          # repo name -> branch, for THIS profile only
 if [ -r "$SIBLINGS_CONF" ]; then
-  while read -r cp cn cb _; do
-    [ "$cp" = "$profile" ] && [[ "$cn" =~ ^[A-Za-z0-9._-]+$ && "$cn" != . && "$cn" != .. && "$cb" =~ ^[A-Za-z0-9._/-]+$ && "$cb" != *..* ]] && sib_allowed["$cn"]="$cb"
+  # exactly three fields; a branch must not start with '-' (git would read it as an option), nor hold '..', whitespace or
+  # control characters; anything else on the line makes the line invalid
+  while read -r cp cn cb cx; do
+    [ "$cp" = "$profile" ] && [ -z "$cx" ] \
+      && [[ "$cn" =~ ^[A-Za-z0-9._-]+$ && "$cn" != . && "$cn" != .. ]] \
+      && [[ "$cb" =~ ^[A-Za-z0-9._/][A-Za-z0-9._/-]*$ && "$cb" != *..* ]] && sib_allowed["$cn"]="$cb"
   done <<< "$(grep -v '^[[:space:]]*#' "$SIBLINGS_CONF")"
 fi
 sib_answer="$(ssh "${SSH_OPTS[@]}" "$HOST" "$RUNNER siblings --profile $profile" 2>/dev/null)" || sib_answer=""
@@ -140,7 +144,17 @@ while IFS= read -r sib; do
   [ -n "${sib_allowed[$sib]+x}" ] || nogate "builder asked for sibling repo '$sib', which $SIBLINGS_CONF does not allow for profile '$profile' — refused, nothing sent"
   sib_names+=("$sib")
 done <<< "$sib_answer"
-sib_refs=()
+sib_refs=(); sib_pairs=()
+# The canonical origin URLs of a listed sibling, and only these: an exact match, so a lookalike host, a path prefix or
+# suffix, or any userinfo (token@) is refused. The ssh forms carry the single user "git".
+sib_origin_ok() {  # <name> <url>
+  case "$2" in
+    "https://github.com/deanmak13/$1"|"https://github.com/deanmak13/$1.git") return 0;;
+    "git@github.com:deanmak13/$1"|"git@github.com:deanmak13/$1.git") return 0;;
+    "ssh://git@github.com/deanmak13/$1"|"ssh://git@github.com/deanmak13/$1.git") return 0;;
+  esac
+  return 1
+}
 
 # 2) Bundle: head (+ base) minus what the builder has. Temp refs name the tips.
 tmpref_head="refs/pneuma-gate/head-${head:0:12}"; tmpref_base="refs/pneuma-gate/base-${base:0:12}"
@@ -166,15 +180,12 @@ for sib in ${sib_names[@]+"${sib_names[@]}"}; do
   [ -n "$root_real" ] && [ ! -L "$sib_dir" ] && [ "$(realpath -e -- "$sib_dir" 2>/dev/null)" = "$root_real/$sib" ] && [ -e "$sib_dir/.git" ] \
     || nogate "profile '$profile' needs sibling repo '$sib' but $sib_dir is not a plain checkout directly under $SIBLINGS_ROOT (set PNEUMA_GATE_SIBLINGS_ROOT) — no verdict"
   sib_url="$(git -C "$sib_dir" config --get remote.origin.url 2>/dev/null || true)"
-  case "$sib_url" in
-    *github.com[:/]deanmak13/"$sib"|*github.com[:/]deanmak13/"$sib".git) ;;
-    *) [ "${PNEUMA_GATE_SIBLINGS_ANY_ORIGIN:-}" = 1 ] || nogate "sibling '$sib' origin is not a deanmak13 repository — refusing to send it" ;;
-  esac
-  git -C "$sib_dir" fetch -q --no-tags origin "${sib_allowed[$sib]}" || nogate "cannot fetch origin ${sib_allowed[$sib]} of sibling '$sib' — no verdict"
+  sib_origin_ok "$sib" "$sib_url" || nogate "sibling '$sib' origin is not the canonical deanmak13 repository URL — refusing to send it"
+  git -C "$sib_dir" fetch -q --no-tags -- origin "${sib_allowed[$sib]}" || nogate "cannot fetch origin ${sib_allowed[$sib]} of sibling '$sib' — no verdict"
   sib_sha="$(git -C "$sib_dir" rev-parse --verify --quiet 'FETCH_HEAD^{commit}')" || nogate "sibling '$sib' has no ${sib_allowed[$sib]} — no verdict"
   sib_ref="refs/pneuma-gate/sibling/$sib"
-  G fetch -q --no-tags "$sib_dir" "$sib_sha:$sib_ref" || nogate "cannot stage sibling '$sib' for the bundle"
-  sib_refs+=("$sib_ref"); refs+=("$sib_ref")
+  G fetch -q --no-tags -- "$sib_dir" "$sib_sha:$sib_ref" || nogate "cannot stage sibling '$sib' for the bundle"
+  sib_refs+=("$sib_ref"); refs+=("$sib_ref"); sib_pairs+=("$sib=$sib_sha")
   echo "remote-gate: sibling $sib at ${sib_sha:0:12}" >&2
 done
 if [ -n "$prereq" ] && [ "$prereq" != "$head" ]; then
@@ -185,6 +196,13 @@ else
 fi
 # Same scope knobs the local hook honours travel with the commit.
 fwd_args=()
+# the sibling commits this submission ships travel as arguments too, so the runner binds them into the job key and checks
+# them against the bundle; sibs_s is the canonical (sorted, comma-joined) form both sides hash
+sibs_s=""
+if [ "${#sib_pairs[@]}" -gt 0 ]; then
+  sibs_s="$(printf '%s\n' "${sib_pairs[@]}" | LC_ALL=C sort | paste -sd, -)"
+  for sp in "${sib_pairs[@]}"; do fwd_args+=(--sibling "$sp"); done
+fi
 [ "${PNEUMA_PREPUSH_FULL:-}" = 1 ] && fwd_args+=(--env PNEUMA_PREPUSH_FULL=1)
 # the scope env flags this submission sends, as the runner echoes them (sorted, comma-joined)
 env_s=""; [ "${PNEUMA_PREPUSH_FULL:-}" = 1 ] && env_s="PNEUMA_PREPUSH_FULL=1"
@@ -210,9 +228,9 @@ marker=$(grep '^PNEUMA_GATE_RESULT ' "$log" | tail -1)
 [ -n "$marker" ] || nogate "no PNEUMA_GATE_RESULT marker (ssh exit $ssh_rc) — treating as NOT green; log $log"
 field() { printf '%s' "$marker" | tr ' ' '\n' | sed -n "s/^$1=//p" | head -1; }
 # Must match the runner's job_key byte for byte: the scope key that binds a verdict's fields.
-job_key() {  # <repo> <head> <tree> <submitter> <profile> <base> <origin_main> <env>
-  printf 'pneuma-gate-job-v1|repo=%s|head=%s|tree=%s|submitter=%s|profile=%s|base=%s|origin_main=%s|env=%s' \
-    "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" | sha256sum | cut -d' ' -f1
+job_key() {  # <repo> <head> <tree> <submitter> <profile> <base> <origin_main> <env> [siblings]
+  printf 'pneuma-gate-job-v1|repo=%s|head=%s|tree=%s|submitter=%s|profile=%s|base=%s|origin_main=%s|env=%s|siblings=%s' \
+    "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "${9:-}" | sha256sum | cut -d' ' -f1
 }
 [ "$(field head)" = "$head" ] && [ "$(field tree)" = "$tree" ] \
   || nogate "result is for head=$(field head) tree=$(field tree), expected $head/$tree — NOT green"
@@ -223,7 +241,7 @@ job_key() {  # <repo> <head> <tree> <submitter> <profile> <base> <origin_main> <
 [ "$(field repo)" = "$repo" ] && [ "$(field profile)" = "$profile" ] && [ "$(field base)" = "$base" ] \
   && [ "$(field origin_main)" = "$origin_main" ] && [ "$(field env)" = "$env_s" ] \
   || nogate "result is for another scope (repo/profile/base/origin-main/env differ from this submission) — NOT green; log $log"
-[ -n "$(field jobkey)" ] && [ "$(field jobkey)" = "$(job_key "$repo" "$head" "$tree" "$(field submitter)" "$profile" "$base" "$origin_main" "$env_s")" ] \
+[ -n "$(field jobkey)" ] && [ "$(field jobkey)" = "$(job_key "$repo" "$head" "$tree" "$(field submitter)" "$profile" "$base" "$origin_main" "$env_s" "$sibs_s")" ] \
   || nogate "result's job key does not bind its fields — NOT green; log $log"
 rc="$(field exit)"
 case "$rc" in

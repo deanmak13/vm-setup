@@ -333,13 +333,70 @@ rm "$work/sibs/sibrepo" && mv "$work/sibs-real" "$work/sibs/sibrepo"
 # a listed sibling whose origin is not a deanmak13 repository is not sent
 git -C "$sibsrc" remote set-url origin https://example.invalid/other/sibrepo.git
 expect_eq "siblings: a sibling whose origin is not a deanmak13 repository is refused" 75 "$(sib_answer_rc sibrepo)"
-check "siblings: ...and the message says so" grep -q "origin is not a deanmak13 repository" "$work/sib-answer.out"
+check "siblings: ...and the message says so" grep -q "origin is not the canonical deanmak13 repository URL" "$work/sib-answer.out"
 git -C "$sibsrc" remote set-url origin https://github.com/deanmak13/sibrepo.git
 # the verb is reachable through the submit path (sudo), the builder-side listing
 check "siblings: available to a submitter that arrived through sudo" bash -c '[ "$(SUDO_USER=pneuma-submit "$1" siblings --profile sibfake)" = sibrepo ]' _ "$RUNNER"
 # the list is per profile: another profile's entry does not authorise this one
 printf 'otherprofile sibrepo main\n' > "$PNEUMA_GATE_SIBLINGS_CONF"
 expect_eq "siblings: an entry for another profile does not allow this profile's request" 75 "$(sib_answer_rc sibrepo)"
+# ── hardening: anchored origin, hostile conf branches, no bypass, sibling sha in the job key, bundle cap ──
+printf 'sibfake sibrepo main\n' > "$PNEUMA_GATE_SIBLINGS_CONF"
+bare="$work/sibs-origin/sibrepo.git"
+origin_rc() {  # the client's exit with the sibling's origin url set to $1 (insteadOf maps it to the local bare repo when it is a canonical form)
+  git -C "$sibsrc" remote set-url origin "$1"
+  sib_answer_rc sibrepo
+}
+for u in https://github.com/deanmak13/sibrepo https://github.com/deanmak13/sibrepo.git git@github.com:deanmak13/sibrepo \
+         git@github.com:deanmak13/sibrepo.git ssh://git@github.com/deanmak13/sibrepo ssh://git@github.com/deanmak13/sibrepo.git; do
+  git -C "$sibsrc" config url."$bare".insteadOf "$u"
+  expect_eq "siblings origin: canonical form $u is accepted" 0 "$(origin_rc "$u")"
+  git -C "$sibsrc" config --unset-all url."$bare".insteadOf
+done
+for u in https://evil.example/github.com/deanmak13/sibrepo https://tok@github.com/deanmak13/sibrepo.git \
+         https://user:pw@github.com/deanmak13/sibrepo https://github.com/deanmak13/sibrepo/extra https://github.com/deanmak13/sibrepo.git/ \
+         https://github.com/deanmak13/sibrepo2 https://github.com/other/sibrepo https://github.com.evil.example/deanmak13/sibrepo \
+         git@evil.com:deanmak13/sibrepo.git tok@github.com:deanmak13/sibrepo.git ssh://tok@github.com/deanmak13/sibrepo \
+         ssh://git@github.com/deanmak13/sibrepo/x http://github.com/deanmak13/sibrepo; do
+  git -C "$sibsrc" config url."$bare".insteadOf "$u"      # even though it would resolve locally, the lookalike must be refused up front
+  expect_eq "siblings origin: lookalike $u is refused" 75 "$(origin_rc "$u")"
+  git -C "$sibsrc" config --unset-all url."$bare".insteadOf
+done
+git -C "$sibsrc" remote set-url origin https://github.com/deanmak13/sibrepo.git
+git -C "$sibsrc" config url."$bare".insteadOf https://github.com/deanmak13/sibrepo.git
+# hostile conf branches are dropped at parse: the request is then not allowed, and nothing runs
+printf '#!/bin/sh\ntouch "%s"\n' "$work/up-ran" > "$work/up.sh"; chmod +x "$work/up.sh"
+for b in -x "--upload-pack=$work/up.sh" 'a b' a..b "$(printf 'a\tb')" ''; do
+  printf 'sibfake sibrepo %s\n' "$b" > "$PNEUMA_GATE_SIBLINGS_CONF"
+  expect_eq "siblings conf: branch '$(printf %q "$b")' is refused at config parse" 75 "$(sib_answer_rc sibrepo)"
+done
+check "siblings conf: ...and a hostile --upload-pack branch ran nothing" test ! -e "$work/up-ran"
+printf 'sibfake sibrepo main\n' > "$PNEUMA_GATE_SIBLINGS_CONF"
+# no environment switch widens the origin check
+git -C "$sibsrc" remote set-url origin https://evil.example/github.com/deanmak13/sibrepo
+any_rc=$(SIB_ANSWER=sibrepo PNEUMA_GATE_SIBLINGS_ANY_ORIGIN=1 PNEUMA_GATE_RUNNER="$work/bin/answer-runner" "$CLIENT" --repo-dir "$src" --profile sibfake --head "$head" --base "$base" --log-dir "$work/logs" >/dev/null 2>&1; echo $?)
+expect_eq "siblings origin: PNEUMA_GATE_SIBLINGS_ANY_ORIGIN does nothing" 75 "$any_rc"
+git -C "$sibsrc" remote set-url origin https://github.com/deanmak13/sibrepo.git
+check "siblings: the shipped client has no origin-check bypass" not grep -q ANY_ORIGIN "$CLIENT"
+# the sibling commit is part of the job key: same engine head, a different sibling tip is a different job
+key_of() { grep -o 'jobkey=[0-9a-f]*' "$work/sib-answer.out" | tail -1; }
+expect_eq "siblings key: first run green" 0 "$(sib_answer_rc sibrepo)"
+k1="$(key_of)"
+git -C "$sibsrc" fetch -q origin main && git -C "$sibsrc" reset -q --hard FETCH_HEAD
+printf 'extra\n' > "$sibsrc/other.txt"; git -C "$sibsrc" add other.txt; git -C "$sibsrc" commit -qm other; git -C "$sibsrc" push -q origin main
+expect_eq "siblings key: second run (new sibling tip) green" 0 "$(sib_answer_rc sibrepo)"
+k2="$(key_of)"
+check "siblings key: a different sibling tip gives a different job key" test -n "$k1" -a -n "$k2" -a "$k1" != "$k2"
+expect_eq "siblings key: the same sibling tip gives the same key" "$k2" "$( sib_answer_rc sibrepo >/dev/null; key_of)"
+check "siblings key: the runner's job_key binds the siblings argument" bash -c '[ "$(source "$1"; job_key r h t s p b o e a:1)" != "$(source "$1"; job_key r h t s p b o e a:2)" ]' _ "$RUNNER"
+# the forced-command grammar: --sibling NAME=SHA only
+check "siblings entry: --sibling name=sha is passed" bash -c 'SSH_ORIGINAL_COMMAND="run --profile fake --repo x --sibling pneuma-helm-charts=0123456789012345678901234567890123456789" PNEUMA_GATE_RUNNER_BIN="$2" PNEUMA_GATE_SUDO="$3" "$1" --submitter test-lane >/dev/null 2>&1' _ "$ENTRY" "$work/bin/argv-recorder" "$work/bin/sudo-stub"
+check "siblings entry: a traversal name is refused" bash -c '! SSH_ORIGINAL_COMMAND="run --profile fake --repo x --sibling ../x=0123456789012345678901234567890123456789" PNEUMA_GATE_RUNNER_BIN="$2" PNEUMA_GATE_SUDO="$3" "$1" --submitter test-lane >/dev/null 2>&1' _ "$ENTRY" "$work/bin/argv-recorder" "$work/bin/sudo-stub"
+check "siblings entry: a short sha is refused" bash -c '! SSH_ORIGINAL_COMMAND="run --profile fake --repo x --sibling a=abc" PNEUMA_GATE_RUNNER_BIN="$2" PNEUMA_GATE_SUDO="$3" "$1" --submitter test-lane >/dev/null 2>&1' _ "$ENTRY" "$work/bin/argv-recorder" "$work/bin/sudo-stub"
+# the runner refuses a sibling the profile did not ask for, and a bundle over the cap
+out=$(PNEUMA_GATE_MAX_BUNDLE_BYTES=64 SIB_ANSWER=sibrepo PNEUMA_GATE_RUNNER="$work/bin/answer-runner" "$CLIENT" --repo-dir "$src" --profile sibfake --head "$head" --base "$base" --log-dir "$work/logs" 2>&1) && rc=0 || rc=$?
+expect_eq "siblings cap: a bundle over the cap is refused (75)" 75 "$rc"
+check "siblings cap: ...with a clear reason" grep -q "bundle is too large" <<<"$out"
 unset PNEUMA_GATE_SIBLINGS_CONF
 unset PNEUMA_GATE_SIBLINGS_ROOT
 chmod -R u+w "$PNEUMA_GATE_BASE/envs" 2>/dev/null || true
