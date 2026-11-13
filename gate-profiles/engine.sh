@@ -23,6 +23,13 @@ profile_siblings() {
   echo pneuma-helm-charts
 }
 
+# Binaries the gate needs on PATH (/usr/local/bin:/usr/bin:/bin, the gate sandbox's PATH). The runner refuses to start the
+# gate, as infrastructure (exit 75), when one is missing; gate-tools/tools.conf says how the host gets it. helm: the
+# messaging cross-check renders the pneuma-shared-data chart with `helm template` (offline, no repo or cluster access).
+profile_tools() {
+  echo helm
+}
+
 profile_cores() { echo "${PNEUMA_GATE_ENGINE_CORES:-2}"; }
 profile_mem_mb() { echo "${PNEUMA_GATE_ENGINE_MEM_MB:-3072}"; }
 
