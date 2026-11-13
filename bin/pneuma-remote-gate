@@ -119,11 +119,27 @@ have=$(printf '%s\n' "$cands" | xargs ssh "${SSH_OPTS[@]}" "$HOST" "$RUNNER have
   || { cat "$log.err" >&2; nogate "cannot reach $HOST (ssh failed) — no verdict"; }
 prereq=$(printf '%s\n' "$cands" | grep -Fx -f <(printf '%s\n' "$have") | grep -vFx "$head" | head -1 || true)
 
-# 1b) Sibling repos the profile's gate reads beside this one (data on the builder, in the profile). The builder holds no
-# credentials, so they travel in the same bundle, each at its freshly fetched origin/main. An old builder that does not know
-# the verb answers nothing: the gate then runs as before.
-sib_names="$(ssh "${SSH_OPTS[@]}" "$HOST" "$RUNNER siblings --profile $profile" 2>/dev/null)" || sib_names=""
+# 1b) Sibling repos the profile's gate reads beside this one. WHAT MAY BE SENT is this client's own list
+# (pneuma-remote-gate.siblings: profile -> repo, branch); the builder can only state what it NEEDS, and a name outside
+# the list for this profile is refused, never widened to. The builder holds no credentials, so each listed+needed
+# sibling travels in the same bundle, as the tip of that branch freshly fetched from its origin. An old builder that does
+# not know the verb answers nothing: no sibling is sent and the gate runs as before.
+SIBLINGS_CONF="${PNEUMA_GATE_SIBLINGS_CONF:-$(dirname "$(readlink -f "$0")")/pneuma-remote-gate.siblings}"
 SIBLINGS_ROOT="${PNEUMA_GATE_SIBLINGS_ROOT:-$HOME/Repos/pneuma}"
+declare -A sib_allowed=()          # repo name -> branch, for THIS profile only
+if [ -r "$SIBLINGS_CONF" ]; then
+  while read -r cp cn cb _; do
+    [ "$cp" = "$profile" ] && [[ "$cn" =~ ^[A-Za-z0-9._-]+$ && "$cn" != . && "$cn" != .. && "$cb" =~ ^[A-Za-z0-9._/-]+$ && "$cb" != *..* ]] && sib_allowed["$cn"]="$cb"
+  done < <(grep -v '^[[:space:]]*#' "$SIBLINGS_CONF")
+fi
+sib_answer="$(ssh "${SSH_OPTS[@]}" "$HOST" "$RUNNER siblings --profile $profile" 2>/dev/null)" || sib_answer=""
+sib_names=()
+while IFS= read -r sib; do
+  [ -n "$sib" ] || continue
+  [[ "$sib" =~ ^[A-Za-z0-9._-]+$ && "$sib" != . && "$sib" != .. ]] || nogate "builder asked for an unusable sibling name — refused, nothing sent"
+  [ -n "${sib_allowed[$sib]+x}" ] || nogate "builder asked for sibling repo '$sib', which $SIBLINGS_CONF does not allow for profile '$profile' — refused, nothing sent"
+  sib_names+=("$sib")
+done <<< "$sib_answer"
 sib_refs=()
 
 # 2) Bundle: head (+ base) minus what the builder has. Temp refs name the tips.
@@ -143,12 +159,19 @@ G update-ref "$tmpref_repo" "$head" && refs+=("$tmpref_repo") || nogate "cannot 
 if [ -n "$branch" ]; then G update-ref "$tmpref_branch" "$head" && refs+=("$tmpref_branch") || nogate "cannot name the branch in the bundle"; fi
 if [ -n "$origin_main" ]; then G update-ref "$tmpref_om" "$origin_main"; refs+=("$tmpref_om"); fi
 [ "$base" != "$head" ] && refs+=("$tmpref_base")
-for sib in $sib_names; do
-  [[ "$sib" =~ ^[A-Za-z0-9._-]+$ && "$sib" != . && "$sib" != .. ]] || nogate "builder named an unusable sibling repo '$sib'"
+root_real="$(realpath -e -- "$SIBLINGS_ROOT" 2>/dev/null || true)"
+for sib in ${sib_names[@]+"${sib_names[@]}"}; do
   sib_dir="$SIBLINGS_ROOT/$sib"
-  [ -e "$sib_dir/.git" ] || nogate "profile '$profile' needs sibling repo '$sib' but $sib_dir is not a checkout (set PNEUMA_GATE_SIBLINGS_ROOT) — no verdict"
-  git -C "$sib_dir" fetch -q origin main || nogate "cannot fetch origin/main of sibling '$sib' — no verdict"
-  sib_sha="$(git -C "$sib_dir" rev-parse --verify --quiet 'FETCH_HEAD^{commit}')" || nogate "sibling '$sib' has no origin/main — no verdict"
+  # a symlink, or anything resolving outside the siblings root, is not a sibling checkout
+  [ -n "$root_real" ] && [ ! -L "$sib_dir" ] && [ "$(realpath -e -- "$sib_dir" 2>/dev/null)" = "$root_real/$sib" ] && [ -e "$sib_dir/.git" ] \
+    || nogate "profile '$profile' needs sibling repo '$sib' but $sib_dir is not a plain checkout directly under $SIBLINGS_ROOT (set PNEUMA_GATE_SIBLINGS_ROOT) — no verdict"
+  sib_url="$(git -C "$sib_dir" config --get remote.origin.url 2>/dev/null || true)"
+  case "$sib_url" in
+    *github.com[:/]deanmak13/"$sib"|*github.com[:/]deanmak13/"$sib".git) ;;
+    *) [ "${PNEUMA_GATE_SIBLINGS_ANY_ORIGIN:-}" = 1 ] || nogate "sibling '$sib' origin is not a deanmak13 repository — refusing to send it" ;;
+  esac
+  git -C "$sib_dir" fetch -q --no-tags origin "${sib_allowed[$sib]}" || nogate "cannot fetch origin ${sib_allowed[$sib]} of sibling '$sib' — no verdict"
+  sib_sha="$(git -C "$sib_dir" rev-parse --verify --quiet 'FETCH_HEAD^{commit}')" || nogate "sibling '$sib' has no ${sib_allowed[$sib]} — no verdict"
   sib_ref="refs/pneuma-gate/sibling/$sib"
   G fetch -q --no-tags "$sib_dir" "$sib_sha:$sib_ref" || nogate "cannot stage sibling '$sib' for the bundle"
   sib_refs+=("$sib_ref"); refs+=("$sib_ref")

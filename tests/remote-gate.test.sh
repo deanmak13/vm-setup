@@ -495,7 +495,9 @@ chmod -R u+w "$PNEUMA_GATE_BASE/envs" 2>/dev/null || true
 sibsrc="$work/sibs/sibrepo"; mkdir -p "$sibsrc" "$work/sibs-origin"
 git -C "$sibsrc" init -q -b main; printf 'v1\n' > "$sibsrc/marker.txt"; git -C "$sibsrc" add marker.txt; git -C "$sibsrc" commit -qm v1
 git init -q --bare "$work/sibs-origin/sibrepo.git"
-git -C "$sibsrc" remote add origin "$work/sibs-origin/sibrepo.git"; git -C "$sibsrc" push -q origin main
+git -C "$sibsrc" remote add origin https://github.com/deanmak13/sibrepo.git
+git -C "$sibsrc" config url."$work/sibs-origin/sibrepo.git".insteadOf https://github.com/deanmak13/sibrepo.git
+git -C "$sibsrc" push -q origin main
 printf 'v2\n' > "$sibsrc/marker.txt"; git -C "$sibsrc" commit -qam v2; git -C "$sibsrc" push -q origin main
 sib_tip=$(git -C "$sibsrc" rev-parse HEAD)
 git -C "$sibsrc" reset -q --hard HEAD~1        # the dev box's local checkout is STALE: the client must ship fresh origin/main
@@ -514,6 +516,9 @@ profile_gate() {
 }
 PROFILE
 export PNEUMA_GATE_SIBLINGS_ROOT="$work/sibs"
+# the client's OWN list is the only source of what may be sent: profile repo branch
+export PNEUMA_GATE_SIBLINGS_CONF="$work/siblings.conf"
+printf '# test list\nsibfake sibrepo main\n' > "$PNEUMA_GATE_SIBLINGS_CONF"
 out=$("$CLIENT" --repo-dir "$src" --profile sibfake --head "$head" --base "$base" --log-dir "$work/logs" 2>&1) && rc=0 || rc=$?
 expect_eq "siblings: a declared sibling is provisioned at origin/main inside the run's HOME -> green" 0 "$rc"
 check "siblings: the client shipped the FRESH origin/main, not the stale local checkout" grep -q "sibling-origin-main=v2" <<<"$out"
@@ -537,6 +542,44 @@ check "siblings: the runner lists a profile's siblings; a profile without any li
 check "siblings: the engine profile declares pneuma-helm-charts" bash -c 'source "$1"; [ "$(profile_siblings)" = pneuma-helm-charts ]' _ "$ENGINE_PROFILE"
 check "siblings: the forced-command grammar passes the verb with only --profile" bash -c 'SSH_ORIGINAL_COMMAND="siblings --profile engine" PNEUMA_GATE_RUNNER_BIN="$2" PNEUMA_GATE_SUDO="$3" "$1" --submitter test-lane >/dev/null 2>&1' _ "$ENTRY" "$work/bin/argv-recorder" "$work/bin/sudo-stub"
 check "siblings: the entry refuses any other option on the verb" bash -c '! SSH_ORIGINAL_COMMAND="siblings --repo x" PNEUMA_GATE_RUNNER_BIN="$2" PNEUMA_GATE_SUDO="$3" "$1" --submitter test-lane >/dev/null 2>&1' _ "$ENTRY" "$work/bin/argv-recorder" "$work/bin/sudo-stub"
+# ── the builder may state what it NEEDS, never widen what the client sends ──
+cat > "$work/bin/answer-runner" <<STUB
+#!/usr/bin/env bash
+case "\$1" in siblings) printf '%s\n' "\$SIB_ANSWER"; exit 0;; esac
+exec "$work/bin/gate-as-forced-command" "\$@"
+STUB
+chmod +x "$work/bin/answer-runner"
+secret="$work/sibs/privaterepo"; mkdir -p "$secret"; git -C "$secret" init -q -b main; printf 's\n' > "$secret/s.txt"; git -C "$secret" add s.txt; git -C "$secret" commit -qm s
+git -C "$secret" remote add origin https://github.com/deanmak13/privaterepo.git
+objs_before=$(git -C "$src" count-objects | tr -d ' ')
+sib_answer_rc() {  # the client's exit when the builder answers the siblings query with this text
+  SIB_ANSWER="$1" PNEUMA_GATE_RUNNER="$work/bin/answer-runner" "$CLIENT" --repo-dir "$src" --profile sibfake --head "$head" --base "$base" \
+    --log-dir "$work/logs" > "$work/sib-answer.out" 2>&1 && echo 0 || echo $?
+}
+expect_eq "siblings: a builder-requested name NOT in the client's list is refused (75), nothing sent" 75 "$(sib_answer_rc privaterepo)"
+check "siblings: ...and the message says it is not allowed" grep -q "does not allow for profile 'sibfake' — refused, nothing sent" "$work/sib-answer.out"
+check "siblings: ...and no sibling ref was staged for it" bash -c '[ -z "$(git -C "$1" for-each-ref refs/pneuma-gate)" ]' _ "$src"
+expect_eq "siblings: ...and nothing was fetched into the repo being bundled" "$objs_before" "$(git -C "$src" count-objects | tr -d ' ')"
+expect_eq "siblings: a listed name plus an unlisted one -> refused as a whole" 75 "$(sib_answer_rc "$(printf 'sibrepo\nprivaterepo')")"
+expect_eq "siblings: '..' is refused" 75 "$(sib_answer_rc '..')"
+expect_eq "siblings: '.' is refused" 75 "$(sib_answer_rc '.')"
+expect_eq "siblings: an absolute path is refused" 75 "$(sib_answer_rc '/etc')"
+expect_eq "siblings: a traversal name is refused" 75 "$(sib_answer_rc '../privaterepo')"
+expect_eq "siblings: a glob is refused (never expanded against the siblings root)" 75 "$(sib_answer_rc '*')"
+expect_eq "siblings: a name with a space is refused" 75 "$(sib_answer_rc 'sibrepo privaterepo')"
+expect_eq "siblings: a name with an embedded glob is refused" 75 "$(sib_answer_rc 'sib*')"
+expect_eq "siblings: an empty answer sends nothing and the runner decides (this profile needs one -> 75)" 75 "$(sib_answer_rc '')"
+check "siblings: ...and the empty answer shipped no sibling" not grep -q "remote-gate: sibling " "$work/sib-answer.out"
+expect_eq "siblings: exactly the listed name is accepted -> green" 0 "$(sib_answer_rc sibrepo)"
+check "siblings: ...and exactly origin/main's SHA was sent" grep -q "remote-gate: sibling sibrepo at ${sib_tip:0:12}" "$work/sib-answer.out"
+# a symlink under the siblings root, even for a listed name, is not a sibling checkout
+mv "$work/sibs/sibrepo" "$work/sibs-real" && ln -s "$work/sibs-real" "$work/sibs/sibrepo"
+expect_eq "siblings: a symlinked sibling directory is refused" 75 "$(sib_answer_rc sibrepo)"
+rm "$work/sibs/sibrepo" && mv "$work/sibs-real" "$work/sibs/sibrepo"
+# the list is per profile: another profile's entry does not authorise this one
+printf 'otherprofile sibrepo main\n' > "$PNEUMA_GATE_SIBLINGS_CONF"
+expect_eq "siblings: an entry for another profile does not allow this profile's request" 75 "$(sib_answer_rc sibrepo)"
+unset PNEUMA_GATE_SIBLINGS_CONF
 unset PNEUMA_GATE_SIBLINGS_ROOT
 chmod -R u+w "$PNEUMA_GATE_BASE/envs" 2>/dev/null || true
 
