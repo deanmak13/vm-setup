@@ -56,6 +56,14 @@ err() { echo "[ci-builder-bootstrap] ERROR: $*" >&2; exit 1; }
 # for that repo. Terraformer and mem0 artifact builds also select ci-builder.
 # pneuma-branding/-docs run on ubuntu-latest only, so they have no row.
 #
+# Engine image-build lane: four ci-builder-build runners (build-1..-4). The
+# engine build matrix holds one of them back from its legs (max-parallel: 3 in
+# pneuma-engine's build-and-publish.yml), so a full 14-leg fan-out runs 3 wide
+# and the build-builder / ml-base / migrations jobs always find a free runner.
+# All four share one buildkit daemon (max-parallelism caps in-flight steps) and
+# run as ubuntu, so adding runners adds overlap of the non-buildkit leg steps
+# (checkout, login, inputs hash, push), not unbounded CPU.
+#
 # GitHub adds self-hosted/Linux/X64 itself. The labels column is the lane the
 # workflows' runs-on: selects: `ci-builder` for gate jobs, `ci-builder-build`
 # for image builds (engine and portal keep the lanes apart so a build never
@@ -68,6 +76,8 @@ pneuma-engine pneuma-engine-contabo ci-builder y
 pneuma-engine pneuma-engine-contabo-2 ci-builder y
 pneuma-engine pneuma-engine-contabo-build-1 ci-builder-build y
 pneuma-engine pneuma-engine-contabo-build-2 ci-builder-build y
+pneuma-engine pneuma-engine-contabo-build-3 ci-builder-build y
+pneuma-engine pneuma-engine-contabo-build-4 ci-builder-build y
 pneuma-portal pneuma-portal-contabo ci-builder y
 pneuma-portal pneuma-portal-contabo-2 ci-builder y
 pneuma-portal pneuma-portal-contabo-build-1 ci-builder-build y
