@@ -269,6 +269,13 @@ profile_gate() {
 }
 PROFILE
 export PNEUMA_GATE_SIBLINGS_ROOT="$work/sibs"
+# Test-only seam, in the TEST's PATH and nowhere in the product: the fixture can only reach its "GitHub" through a
+# url.<base>.insteadOf rewrite, which the client (rightly) refuses. While SHIM_GETURL is set this git answers
+# `ls-remote --get-url` with that string, as a host with no rewrite would; every other git call is real.
+real_git="$(type -P git)"
+printf '#!/usr/bin/env bash\nif [ -n "${SHIM_GETURL:-}" ]; then for a in "$@"; do [ "$a" = --get-url ] && { echo "$SHIM_GETURL"; exit 0; }; done; fi\nexec %s "$@"\n' "$real_git" > "$work/bin/git"
+chmod +x "$work/bin/git"
+export SHIM_GETURL=https://github.com/deanmak13/sibrepo.git
 # the client's OWN list is the only source of what may be sent: profile repo branch
 export PNEUMA_GATE_SIBLINGS_CONF="$work/siblings.conf"
 printf '# test list\nsibfake sibrepo main\n' > "$PNEUMA_GATE_SIBLINGS_CONF"
@@ -345,7 +352,7 @@ printf 'sibfake sibrepo main\n' > "$PNEUMA_GATE_SIBLINGS_CONF"
 bare="$work/sibs-origin/sibrepo.git"
 origin_rc() {  # the client's exit with the sibling's origin url set to $1 (insteadOf maps it to the local bare repo when it is a canonical form)
   git -C "$sibsrc" remote set-url origin "$1"
-  sib_answer_rc sibrepo
+  SHIM_GETURL="$1" sib_answer_rc sibrepo
 }
 for u in https://github.com/deanmak13/sibrepo https://github.com/deanmak13/sibrepo.git git@github.com:deanmak13/sibrepo \
          git@github.com:deanmak13/sibrepo.git ssh://git@github.com/deanmak13/sibrepo ssh://git@github.com/deanmak13/sibrepo.git; do
@@ -397,7 +404,56 @@ check "siblings entry: a short sha is refused" bash -c '! SSH_ORIGINAL_COMMAND="
 out=$(PNEUMA_GATE_MAX_BUNDLE_BYTES=64 SIB_ANSWER=sibrepo PNEUMA_GATE_RUNNER="$work/bin/answer-runner" "$CLIENT" --repo-dir "$src" --profile sibfake --head "$head" --base "$base" --log-dir "$work/logs" 2>&1) && rc=0 || rc=$?
 expect_eq "siblings cap: a bundle over the cap is refused (75)" 75 "$rc"
 check "siblings cap: ...with a clear reason" grep -q "bundle is too large" <<<"$out"
-unset PNEUMA_GATE_SIBLINGS_CONF
+# ── sibling arguments: strict (name, sha) pairs, exact lookup, the key is f(the pairs used) ──
+sha40=0123456789012345678901234567890123456789
+run_sib() {  # the runner's output and rc for these arguments; every refusal must happen before anything runs
+  local o r=0
+  o=$("$RUNNER" run --submitter test-lane --profile "$1" --repo fakerepo --head "$head" --base "$base" --tree "$tree" --bundle "${@:2}" </dev/null 2>&1) || r=$?
+  printf '%s\nrc=%s\n' "$o" "$r"
+}
+jobs_before=$(ls "$PNEUMA_GATE_BASE/jobs" 2>/dev/null | wc -l)
+o=$(run_sib sibfake --sibling sibrepo=$sha40 --sibling sibrepo=$sha40)
+check "siblings args: a duplicate name is refused" grep -q "duplicate sibling 'sibrepo'" <<<"$o"
+check "siblings args: ...with a non-zero exit" not grep -qx "rc=0" <<<"$o"
+o=$(run_sib sibfake --sibling other=$sha40)
+check "siblings args: a name the profile did not declare is refused" grep -q "sibling 'other' is not declared by profile sibfake" <<<"$o"
+o=$(run_sib sibfake --sibling sibrepo=$sha40 --sibling other=$sha40)
+check "siblings args: more pairs than the profile declares are refused" grep -q "is not declared by profile sibfake" <<<"$o"
+check "siblings args: a malformed pair (no sha) is refused" grep -q "refusing sibling" <<<"$(run_sib sibfake --sibling sibrepo)"
+check "siblings args: a malformed pair (short sha) is refused" grep -q "refusing sibling" <<<"$(run_sib sibfake --sibling sibrepo=abc)"
+check "siblings args: nothing ran for any refusal (no job was started)" test "$jobs_before" = "$(ls "$PNEUMA_GATE_BASE/jobs" 2>/dev/null | wc -l)"
+# a dotted name is matched exactly: a look-alike cannot stand in for it
+printf 'profile_siblings() {\n  echo sib.repo\n}\nprofile_cores() { echo 1; }\nprofile_mem_mb() { echo 256; }\nprofile_env_key() { echo dotkey; }\n' > "$work/profiles/dotfake.sh"
+o=$(run_sib dotfake --sibling sibXrepo=$sha40)
+check "siblings args: a look-alike of a dotted name does not satisfy it" grep -q "sibling 'sibXrepo' is not declared by profile dotfake" <<<"$o"
+check "siblings args: a name that is only a prefix of a declared name is refused" grep -q "is not declared by profile dotfake" <<<"$(run_sib dotfake --sibling sib=$sha40)"
+# the client refuses a builder answer that repeats a name
+printf 'sibfake sibrepo main\n' > "$PNEUMA_GATE_SIBLINGS_CONF"
+expect_eq "siblings args: a builder answer that repeats a name is refused by the client" 75 "$(sib_answer_rc "$(printf 'sibrepo\nsibrepo')")"
+check "siblings args: ...naming the duplicate" grep -q "twice" "$work/sib-answer.out"
+# the job key in the verdict is exactly f(the pairs used)
+expect_eq "siblings key: green" 0 "$(sib_answer_rc sibrepo)"
+mk="$(grep '^PNEUMA_GATE_RESULT ' "$work/sib-answer.out" | tail -1)"
+mf() { printf '%s' "$mk" | tr ' ' '\n' | sed -n "s/^$1=//p" | head -1; }
+want_key="$(bash -c 'source "$1"; shift; job_key "$@"' _ "$RUNNER" "$(mf repo)" "$(mf head)" "$(mf tree)" "$(mf submitter)" "$(mf profile)" "$(mf base)" "$(mf origin_main)" "$(mf env)" "sibrepo=$(git -C "$sibsrc" rev-parse HEAD)")"
+expect_eq "siblings key: the verdict's key is f(exactly the sibling pair that was used)" "$want_key" "$(mf jobkey)"
+# what git will REALLY use: a rewrite, a second url or a pushurl is refused even when the configured url is canonical
+git -C "$sibsrc" remote set-url origin https://github.com/deanmak13/sibrepo.git
+expect_eq "siblings effective origin: an insteadOf rewrite that moves a canonical url elsewhere is refused" 75 "$(SHIM_GETURL= sib_answer_rc sibrepo)"
+check "siblings effective origin: ...and the message says so" grep -q "origin is not the canonical deanmak13 repository URL" "$work/sib-answer.out"
+git -C "$sibsrc" config --add remote.origin.url https://github.com/deanmak13/sibrepo.git
+expect_eq "siblings effective origin: a second fetch url is refused" 75 "$(sib_answer_rc sibrepo)"
+git -C "$sibsrc" config --unset-all remote.origin.url && git -C "$sibsrc" config remote.origin.url https://github.com/deanmak13/sibrepo.git
+git -C "$sibsrc" config remote.origin.pushurl https://evil.example/x
+expect_eq "siblings effective origin: a pushurl is refused" 75 "$(sib_answer_rc sibrepo)"
+git -C "$sibsrc" config --unset remote.origin.pushurl
+expect_eq "siblings effective origin: back to a single canonical url is accepted" 0 "$(sib_answer_rc sibrepo)"
+# at most 8 --sibling options at the entry and in the runner
+sib_opts() { local i o=""; for i in $(seq 1 "$1"); do o="$o --sibling s$i=0123456789012345678901234567890123456789"; done; printf '%s' "$o"; }
+check "siblings entry: 8 --sibling options pass" bash -c 'SSH_ORIGINAL_COMMAND="run --profile fake --repo x$2" PNEUMA_GATE_RUNNER_BIN="$3" PNEUMA_GATE_SUDO="$4" "$1" --submitter test-lane >/dev/null 2>&1' _ "$ENTRY" "$(sib_opts 8)" "$work/bin/argv-recorder" "$work/bin/sudo-stub"
+check "siblings entry: 9 --sibling options are refused" bash -c '! SSH_ORIGINAL_COMMAND="run --profile fake --repo x$2" PNEUMA_GATE_RUNNER_BIN="$3" PNEUMA_GATE_SUDO="$4" "$1" --submitter test-lane >/dev/null 2>&1' _ "$ENTRY" "$(sib_opts 9)" "$work/bin/argv-recorder" "$work/bin/sudo-stub"
+check "siblings runner: more than 8 sibling arguments are refused" grep -q "refusing more than 8 sibling arguments" <<<"$("$RUNNER" run --submitter test-lane --profile sibfake --repo fakerepo --head "$head" --base "$base" --tree "$tree" --bundle $(sib_opts 9 | sed 's/--sibling/--sibling/g') </dev/null 2>&1 || true)"
+unset SHIM_GETURL PNEUMA_GATE_SIBLINGS_CONF
 unset PNEUMA_GATE_SIBLINGS_ROOT
 chmod -R u+w "$PNEUMA_GATE_BASE/envs" 2>/dev/null || true
 

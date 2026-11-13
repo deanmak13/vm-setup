@@ -45,6 +45,9 @@ case "$verb" in
   *) die "verb '$verb' is not allowed";;
 esac
 
+# at most 8 sibling pairs (the profile's own list is checked again by the runner)
+n_sib=0; for w in "${words[@]}"; do [ "$w" != --sibling ] || n_sib=$((n_sib + 1)); done
+[ "$n_sib" -le 8 ] || die "more than 8 --sibling options"
 args=("$verb")
 i=0
 while [ "$i" -lt "${#words[@]}" ]; do

@@ -137,9 +137,11 @@ if [ -r "$SIBLINGS_CONF" ]; then
   done <<< "$(grep -v '^[[:space:]]*#' "$SIBLINGS_CONF")"
 fi
 sib_answer="$(ssh "${SSH_OPTS[@]}" "$HOST" "$RUNNER siblings --profile $profile" 2>/dev/null)" || sib_answer=""
-sib_names=()
+sib_names=(); declare -A sib_seen=()
 while IFS= read -r sib; do
   [ -n "$sib" ] || continue
+  [ -z "${sib_seen[$sib]+x}" ] || nogate "builder named sibling repo '$sib' twice — refused, nothing sent"
+  sib_seen["$sib"]=1
   [[ "$sib" =~ ^[A-Za-z0-9._-]+$ && "$sib" != . && "$sib" != .. ]] || nogate "builder asked for an unusable sibling name — refused, nothing sent"
   [ -n "${sib_allowed[$sib]+x}" ] || nogate "builder asked for sibling repo '$sib', which $SIBLINGS_CONF does not allow for profile '$profile' — refused, nothing sent"
   sib_names+=("$sib")
@@ -154,6 +156,18 @@ sib_origin_ok() {  # <name> <url>
     "ssh://git@github.com/deanmak13/$1"|"ssh://git@github.com/deanmak13/$1.git") return 0;;
   esac
   return 1
+}
+
+# What git will REALLY use for origin, not just one config value: exactly one fetch url, no pushurl, and the url after any
+# url.<base>.insteadOf rewrite (git ls-remote --get-url applies them) must be the same canonical form. A rewrite that
+# sends a canonical-looking origin somewhere else is refused.
+sib_origin_effective_ok() {  # <name> <dir>
+  local urls resolved
+  urls="$(git -C "$2" config --get-all remote.origin.url 2>/dev/null)" || return 1
+  [ "$(printf '%s\n' "$urls" | grep -c .)" = 1 ] || return 1
+  [ -z "$(git -C "$2" config --get-all remote.origin.pushurl 2>/dev/null)" ] || return 1
+  resolved="$(git -C "$2" ls-remote --get-url origin 2>/dev/null)" || return 1
+  [ "$resolved" = "$urls" ] && sib_origin_ok "$1" "$urls"
 }
 
 # 2) Bundle: head (+ base) minus what the builder has. Temp refs name the tips.
@@ -179,8 +193,7 @@ for sib in ${sib_names[@]+"${sib_names[@]}"}; do
   # a symlink, or anything resolving outside the siblings root, is not a sibling checkout
   [ -n "$root_real" ] && [ ! -L "$sib_dir" ] && [ "$(realpath -e -- "$sib_dir" 2>/dev/null)" = "$root_real/$sib" ] && [ -e "$sib_dir/.git" ] \
     || nogate "profile '$profile' needs sibling repo '$sib' but $sib_dir is not a plain checkout directly under $SIBLINGS_ROOT (set PNEUMA_GATE_SIBLINGS_ROOT) — no verdict"
-  sib_url="$(git -C "$sib_dir" config --get remote.origin.url 2>/dev/null || true)"
-  sib_origin_ok "$sib" "$sib_url" || nogate "sibling '$sib' origin is not the canonical deanmak13 repository URL — refusing to send it"
+  sib_origin_effective_ok "$sib" "$sib_dir" || nogate "sibling '$sib' origin is not the canonical deanmak13 repository URL — refusing to send it"
   git -C "$sib_dir" fetch -q --no-tags -- origin "${sib_allowed[$sib]}" || nogate "cannot fetch origin ${sib_allowed[$sib]} of sibling '$sib' — no verdict"
   sib_sha="$(git -C "$sib_dir" rev-parse --verify --quiet 'FETCH_HEAD^{commit}')" || nogate "sibling '$sib' has no ${sib_allowed[$sib]} — no verdict"
   sib_ref="refs/pneuma-gate/sibling/$sib"

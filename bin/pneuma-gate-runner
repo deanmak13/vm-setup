@@ -450,6 +450,7 @@ cmd_run() {
       --branch) branch="$2"; shift 2;;
       --sibling)   # NAME=SHA of a sibling repo this submission ships (bound into the job key, checked against the bundle)
         [[ "$2" =~ ^[A-Za-z0-9._-]{1,100}=[0-9a-f]{40}$ && "${2%%=*}" != . && "${2%%=*}" != .. ]] || { echo "refusing sibling '$2'" >&2; return 2; }
+        [ "${#sib_args[@]}" -lt 8 ] || { echo "refusing more than 8 sibling arguments" >&2; return 2; }
         sib_args+=("$2"); shift 2;;
       *) echo "unknown arg $1" >&2; return 2;;
     esac
@@ -462,7 +463,23 @@ cmd_run() {
   [ -r "$PROFILE_DIR/$profile.sh" ] || refuse "no gate profile '$profile' in $PROFILE_DIR"
   # GATE-QUEUE-1 / the scope key: every input that defines this verdict's scope is in ONE job key. A live job
   # with the same key is followed, never queued twice; anything that differs (even the base or an env flag) is a new job.
-  local sibs_s; sibs_s="$(printf '%s\n' ${sib_args[@]+"${sib_args[@]}"} | grep . | LC_ALL=C sort | paste -sd, - || true)"
+  # The sibling arguments become validated (name, sha) pairs ONCE: no duplicate name, only names the profile declares,
+  # never more than it declares. Everything below (the job key, the lookup) uses exactly these pairs, by exact string
+  # comparison (an associative array), never a pattern built from input.
+  local -A sib_sha=() sib_declared=()
+  local sp sn dn sibs_s
+  while IFS= read -r dn; do [ -z "$dn" ] || sib_declared["$dn"]=1; done <<< "$(cmd_siblings --profile "$profile" 2>/dev/null || true)"
+  for sp in ${sib_args[@]+"${sib_args[@]}"}; do
+    sn="${sp%%=*}"
+    [ -z "${sib_sha[$sn]+x}" ] || refuse "duplicate sibling '$sn'"
+    [ -n "${sib_declared[$sn]+x}" ] || refuse "sibling '$sn' is not declared by profile $profile"
+    sib_sha["$sn"]="${sp#*=}"
+  done
+  [ "${#sib_sha[@]}" -le "${#sib_declared[@]}" ] || refuse "more sibling arguments than profile $profile declares"
+  sibs_s=""
+  if [ "${#sib_sha[@]}" -gt 0 ]; then
+    sibs_s="$(for sn in "${!sib_sha[@]}"; do printf '%s=%s\n' "$sn" "${sib_sha[$sn]}"; done | LC_ALL=C sort | paste -sd, -)"
+  fi
   local env_s; env_s="$(printf '%s\n' "${fwd_env[@]}" | sort | paste -sd, -)"
   JOB_KEY="$(job_key "$repo" "$head" "$tree" "$SUBMITTER" "$profile" "$base" "$origin_main" "$env_s" "$sibs_s")"
   R_BASE="$base"; R_ORIGIN="$origin_main"; R_ENV="$env_s"; R_SUBMITTER="$SUBMITTER"; R_JOBKEY="$JOB_KEY"
@@ -570,7 +587,7 @@ run_job() {   # the detached worker: admission, workspace, the gate, the verdict
     while read -r sib; do
       [ -n "$sib" ] || continue
       safe_name "$sib" || refuse "bad sibling name"
-      sha="$(printf '%s\n' ${sib_args[@]+"${sib_args[@]}"} | sed -n "s#^$sib=\([0-9a-f]\{40\}\)\$#\1#p" | head -1)"
+      sha="${sib_sha[$sib]:-}"
       [ -z "$sha" ] || grep -qxF "$sib $sha" <<<"${SIB_SHIPPED:-}" || refuse "sibling '$sib' at $sha is not in the submission's bundle"
       [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || refuse "sibling repo '$sib' is required by profile $profile but was not shipped (old client?)"
       as_gate git --git-dir="$store" cat-file -e "${sha}^{commit}" 2>/dev/null || refuse "sibling commit for '$sib' is not in the store"
