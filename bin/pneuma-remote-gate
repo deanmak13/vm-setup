@@ -136,7 +136,21 @@ if [ -r "$SIBLINGS_CONF" ]; then
       && [[ "$cb" =~ ^[A-Za-z0-9._/][A-Za-z0-9._/-]*$ && "$cb" != *..* ]] && sib_allowed["$cn"]="$cb"
   done <<< "$(grep -v '^[[:space:]]*#' "$SIBLINGS_CONF")"
 fi
-sib_answer="$(ssh "${SSH_OPTS[@]}" "$HOST" "$RUNNER siblings --profile $profile" 2>/dev/null)" || sib_answer=""
+# Three outcomes, told apart: the builder answers (rc 0); an OLD builder's entry refuses the unknown verb by name
+# (expected, proceed without siblings); anything else (a sudo rule that lacks the verb, an ssh error) is a FAILED query:
+# stop with exit 75 and the error text, never carry on as if no sibling were needed.
+sib_err="$(mktemp "${TMPDIR:-/tmp}/pneuma-gate-sib.XXXXXX")"
+sib_rc=0
+sib_answer="$(ssh "${SSH_OPTS[@]}" "$HOST" "$RUNNER siblings --profile $profile" 2>"$sib_err")" || sib_rc=$?
+if [ "$sib_rc" -ne 0 ]; then
+  if [ "$sib_rc" -eq 75 ] && grep -qF "verb 'siblings' is not allowed" "$sib_err"; then
+    sib_answer=""
+  else
+    sib_msg="$(head -c 400 "$sib_err" | tr '\n' ' ')"; rm -f "$sib_err"
+    nogate "cannot ask $HOST which sibling repos profile '$profile' needs (exit $sib_rc: ${sib_msg:-no message}) — no verdict"
+  fi
+fi
+rm -f "$sib_err"
 sib_names=(); declare -A sib_seen=()
 while IFS= read -r sib; do
   [ -n "$sib" ] || continue

@@ -488,6 +488,30 @@ expect_eq "compat: OLD client + NEW host, no-sibling profile: green (the key bin
 # OLD client + NEW host, a profile that declares a sibling: no verdict, never green
 out=$(PNEUMA_GATE_RUNNER="$work/bin/gate-as-forced-command" "$work/old-client" --repo-dir "$src" --profile sibfake --head "$head" --base "$base" --log-dir "$work/logs" 2>&1) && rc=0 || rc=$?
 expect_eq "compat: OLD client + NEW host, sibling-declaring profile: exit 75 (declared, not shipped)" 75 "$rc"
+# the sudoers rule the installer renders names the siblings verb, in the one rule line (the real sudo is exercised by
+# tests/gate-real-sudo.check.sh, which renders it through the same path)
+bash "$REPO_DIR/host/pneuma-submit-install.sh" --render-sudoers "$work/rendered-sudoers"
+check "sudoers: the rendered rule allows 'siblings *' for the runner" grep -qF "/usr/local/bin/pneuma-gate-runner siblings *" "$work/rendered-sudoers"
+expect_eq "sudoers: the rule is still ONE NOPASSWD line with five verbs" 5 "$(grep '^pneuma-submit ' "$work/rendered-sudoers" | grep -o 'pneuma-gate-runner [a-z]* \*' | wc -l)"
+check "sudoers: env_reset stays on for the runner" grep -qx "Defaults!/usr/local/bin/pneuma-gate-runner env_reset" "$work/rendered-sudoers"
+# a FAILED siblings query (the sudo rule lacks the verb, an ssh error) is not "an old host": exit 75 with the error text
+for failure in "sudo: a password is required|1" "ssh: connect to host x port 22: Connection refused|255" "sudo: sorry, you are not allowed to execute|1"; do
+  msg="${failure%|*}"; code="${failure#*|}"
+  printf '#!/usr/bin/env bash\ncase "$1" in siblings) echo "%s" >&2; exit %s;; esac\nexec "%s/bin/gate-as-forced-command" "$@"\n' "$msg" "$code" "$work" > "$work/bin/failing-query-runner"
+  chmod +x "$work/bin/failing-query-runner"
+  out=$(PNEUMA_GATE_RUNNER="$work/bin/failing-query-runner" "$CLIENT" --repo-dir "$src" --profile fake --head "$head" --base "$base" --log-dir "$work/logs" 2>&1) && rc=0 || rc=$?
+  expect_eq "siblings query: '$msg' (exit $code) is a failed query -> exit 75, not a silent no-sibling gate" 75 "$rc"
+  check "siblings query: ...and the message carries the error text" grep -qF "$msg" <<<"$out"
+done
+# an old host's refusal of the unknown verb is the one expected failure: the gate proceeds without siblings
+printf '#!/usr/bin/env bash\ncase "$1" in siblings) echo "pneuma-gate-entry: refused: verb '"'"'siblings'"'"' is not allowed" >&2; exit 75;; esac\nexec "%s/bin/gate-as-forced-command" "$@"\n' "$work" > "$work/bin/oldentry-runner"
+chmod +x "$work/bin/oldentry-runner"
+out=$(PNEUMA_GATE_RUNNER="$work/bin/oldentry-runner" "$CLIENT" --repo-dir "$src" --profile fake --head "$head" --base "$base" --log-dir "$work/logs" 2>&1) && rc=0 || rc=$?
+expect_eq "siblings query: an old entry's refusal of the verb proceeds without siblings (green)" 0 "$rc"
+# the same exit 75 WITHOUT the refusal text is a failure, not an old host
+printf '#!/usr/bin/env bash\ncase "$1" in siblings) echo "something else" >&2; exit 75;; esac\nexec "%s/bin/gate-as-forced-command" "$@"\n' "$work" > "$work/bin/other75-runner"
+chmod +x "$work/bin/other75-runner"
+expect_eq "siblings query: exit 75 with some other message is a failed query" 75 "$(PNEUMA_GATE_RUNNER="$work/bin/other75-runner" "$CLIENT" --repo-dir "$src" --profile fake --head "$head" --base "$base" --log-dir "$work/logs" >/dev/null 2>&1; echo $?)"
 unset SHIM_GETURL PNEUMA_GATE_SIBLINGS_CONF
 unset PNEUMA_GATE_SIBLINGS_ROOT
 chmod -R u+w "$PNEUMA_GATE_BASE/envs" 2>/dev/null || true

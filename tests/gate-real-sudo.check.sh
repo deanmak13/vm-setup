@@ -51,6 +51,7 @@ ALLOW=(
   "status --submitter dean-devbox"
   "have --submitter dean-devbox"
   "run --submitter dean-devbox"
+  "siblings --submitter dean-devbox --profile engine"
 )
 REFUSE=(
   "janitor"
@@ -60,6 +61,7 @@ REFUSE=(
   "run"
   "status"
   "have"
+  "siblings"
   "__BARE_RUNNER__"
 )
 
@@ -97,6 +99,26 @@ runuser -u pneuma-submit -- env SSH_ORIGINAL_COMMAND=status /usr/local/bin/pneum
 grep -q '^uid=0 sudo_user=pneuma-submit args=status --submitter dean-devbox$' /tmp/entry-check.out 2>/dev/null \
   && pass "entry reaches the runner as root via the real sudo (SUDO_USER=pneuma-submit)" \
   || bad "entry->runner: $(cat /tmp/entry-check.out 2>/dev/null)"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$RUNNER"; chmod 0755 "$RUNNER"
+
+# The REAL runner's siblings verb through the real entry and the real sudo, as the unprivileged account: it prints the
+# names the profile declares and nothing else, writes nothing, and a profile name that is not a plain name reads nothing.
+install -m 0755 /src/bin/pneuma-gate-runner "$RUNNER"
+install -d -m 0755 /usr/local/lib/pneuma-gate/profiles
+install -m 0644 /src/gate-profiles/engine.sh /src/gate-profiles/portal.sh /usr/local/lib/pneuma-gate/profiles/
+sib_via_entry() { runuser -u pneuma-submit -- env SSH_ORIGINAL_COMMAND="$1" /usr/local/bin/pneuma-gate-entry --submitter dean-devbox 2>/dev/null; }
+before="$(find / -xdev -newer "$RUNNER" -type f -not -path '/proc/*' -not -path '/tmp/*' -not -path '/var/log/*' -not -path '/var/lib/apt/*' -not -path '/var/cache/*' 2>/dev/null | sort | md5sum)"
+[ "$(sib_via_entry 'siblings --profile engine')" = pneuma-helm-charts ] \
+  && pass "real runner via real sudo: siblings --profile engine prints exactly the declared name" \
+  || bad "real siblings verb: got '$(sib_via_entry 'siblings --profile engine')'"
+[ -z "$(sib_via_entry 'siblings --profile portal')" ] \
+  && pass "real runner via real sudo: a profile with no siblings prints nothing" || bad "portal siblings not empty"
+[ -z "$(sib_via_entry 'siblings --profile nosuch')" ] \
+  && pass "real runner via real sudo: an unknown profile prints nothing" || bad "unknown profile printed something"
+[ -z "$(sib_via_entry 'siblings --profile ..')" ] && [ -z "$(sib_via_entry 'siblings --profile engine --x y')" ] \
+  && pass "real runner via real sudo: a dot-dot profile and an extra option print nothing" || bad "hostile siblings args printed something"
+after="$(find / -xdev -newer "$RUNNER" -type f -not -path '/proc/*' -not -path '/tmp/*' -not -path '/var/log/*' -not -path '/var/lib/apt/*' -not -path '/var/cache/*' 2>/dev/null | sort | md5sum)"
+[ "$before" = "$after" ] && pass "real runner via real sudo: the siblings verb wrote no file" || bad "the siblings verb changed files on disk"
 printf '#!/usr/bin/env bash\nexit 0\n' > "$RUNNER"; chmod 0755 "$RUNNER"
 
 # mutation: widen the rule to the bare runner path. The matrix MUST go red, or the test proves nothing.
