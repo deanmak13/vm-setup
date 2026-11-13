@@ -120,17 +120,17 @@ have=$(printf '%s\n' "$cands" | xargs ssh "${SSH_OPTS[@]}" "$HOST" "$RUNNER have
 prereq=$(printf '%s\n' "$cands" | grep -Fx -f <(printf '%s\n' "$have") | grep -vFx "$head" | head -1 || true)
 
 # 1b) Sibling repos the profile's gate reads beside this one. WHAT MAY BE SENT is this client's own list
-# (pneuma-remote-gate.siblings: profile -> repo, branch); the builder can only state what it NEEDS, and a name outside
+# (pneuma-remote-gate.siblings.conf: profile -> repo, branch); the builder can only state what it NEEDS, and a name outside
 # the list for this profile is refused, never widened to. The builder holds no credentials, so each listed+needed
 # sibling travels in the same bundle, as the tip of that branch freshly fetched from its origin. An old builder that does
 # not know the verb answers nothing: no sibling is sent and the gate runs as before.
-SIBLINGS_CONF="${PNEUMA_GATE_SIBLINGS_CONF:-$(dirname "$(readlink -f "$0")")/pneuma-remote-gate.siblings}"
+SIBLINGS_CONF="${PNEUMA_GATE_SIBLINGS_CONF:-$(dirname "$(readlink -f "$0")")/pneuma-remote-gate.siblings.conf}"
 SIBLINGS_ROOT="${PNEUMA_GATE_SIBLINGS_ROOT:-$HOME/Repos/pneuma}"
 declare -A sib_allowed=()          # repo name -> branch, for THIS profile only
 if [ -r "$SIBLINGS_CONF" ]; then
   while read -r cp cn cb _; do
     [ "$cp" = "$profile" ] && [[ "$cn" =~ ^[A-Za-z0-9._-]+$ && "$cn" != . && "$cn" != .. && "$cb" =~ ^[A-Za-z0-9._/-]+$ && "$cb" != *..* ]] && sib_allowed["$cn"]="$cb"
-  done < <(grep -v '^[[:space:]]*#' "$SIBLINGS_CONF")
+  done <<< "$(grep -v '^[[:space:]]*#' "$SIBLINGS_CONF")"
 fi
 sib_answer="$(ssh "${SSH_OPTS[@]}" "$HOST" "$RUNNER siblings --profile $profile" 2>/dev/null)" || sib_answer=""
 sib_names=()

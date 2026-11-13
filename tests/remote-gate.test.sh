@@ -539,7 +539,8 @@ out=$(PNEUMA_GATE_RUNNER="$work/bin/old-client-runner" "$CLIENT" --repo-dir "$sr
 expect_eq "siblings: a required sibling that was not shipped is NO VERDICT (75), never a pass" 75 "$rc"
 check "siblings: ...with the reason in the log" grep -q "required by this profile but was not shipped" <<<"$out"
 check "siblings: the runner lists a profile's siblings; a profile without any lists none" bash -c '[ "$("$1" siblings --profile sibfake)" = sibrepo ] && [ -z "$("$1" siblings --profile fake)" ]' _ "$RUNNER"
-check "siblings: the engine profile declares pneuma-helm-charts" bash -c 'source "$1"; [ "$(profile_siblings)" = pneuma-helm-charts ]' _ "$ENGINE_PROFILE"
+( source "$ENGINE_PROFILE"; profile_siblings ) > "$work/engine-sibs.out"   # in-process, so the coverage tracer sees it
+expect_eq "siblings: the engine profile declares pneuma-helm-charts" pneuma-helm-charts "$(cat "$work/engine-sibs.out")"
 check "siblings: the forced-command grammar passes the verb with only --profile" bash -c 'SSH_ORIGINAL_COMMAND="siblings --profile engine" PNEUMA_GATE_RUNNER_BIN="$2" PNEUMA_GATE_SUDO="$3" "$1" --submitter test-lane >/dev/null 2>&1' _ "$ENTRY" "$work/bin/argv-recorder" "$work/bin/sudo-stub"
 check "siblings: the entry refuses any other option on the verb" bash -c '! SSH_ORIGINAL_COMMAND="siblings --repo x" PNEUMA_GATE_RUNNER_BIN="$2" PNEUMA_GATE_SUDO="$3" "$1" --submitter test-lane >/dev/null 2>&1' _ "$ENTRY" "$work/bin/argv-recorder" "$work/bin/sudo-stub"
 # ── the builder may state what it NEEDS, never widen what the client sends ──
@@ -576,6 +577,13 @@ check "siblings: ...and exactly origin/main's SHA was sent" grep -q "remote-gate
 mv "$work/sibs/sibrepo" "$work/sibs-real" && ln -s "$work/sibs-real" "$work/sibs/sibrepo"
 expect_eq "siblings: a symlinked sibling directory is refused" 75 "$(sib_answer_rc sibrepo)"
 rm "$work/sibs/sibrepo" && mv "$work/sibs-real" "$work/sibs/sibrepo"
+# a listed sibling whose origin is not a deanmak13 repository is not sent
+git -C "$sibsrc" remote set-url origin https://example.invalid/other/sibrepo.git
+expect_eq "siblings: a sibling whose origin is not a deanmak13 repository is refused" 75 "$(sib_answer_rc sibrepo)"
+check "siblings: ...and the message says so" grep -q "origin is not a deanmak13 repository" "$work/sib-answer.out"
+git -C "$sibsrc" remote set-url origin https://github.com/deanmak13/sibrepo.git
+# the verb is reachable through the submit path (sudo), the builder-side listing
+check "siblings: available to a submitter that arrived through sudo" bash -c '[ "$(SUDO_USER=pneuma-submit "$1" siblings --profile sibfake)" = sibrepo ]' _ "$RUNNER"
 # the list is per profile: another profile's entry does not authorise this one
 printf 'otherprofile sibrepo main\n' > "$PNEUMA_GATE_SIBLINGS_CONF"
 expect_eq "siblings: an entry for another profile does not allow this profile's request" 75 "$(sib_answer_rc sibrepo)"

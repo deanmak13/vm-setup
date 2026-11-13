@@ -1116,7 +1116,7 @@ unit_siblings() {   # <ws>
       && git -C "$dir" fetch -q origin main \
       || { echo "cannot lay out sibling repo '$name'"; return 75; }
     echo "sibling $name at $(git -C "$dir" rev-parse --short=12 HEAD)"
-  done < <(profile_siblings)
+  done <<< "$(profile_siblings)"
 }
 
 cmd_unit() {
