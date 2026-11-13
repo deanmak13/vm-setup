@@ -489,6 +489,57 @@ out=$(PNEUMA_GATE_MIN_FREE_GIB=1 "$CLIENT" --repo-dir "$src" --profile fake --he
 expect_eq "client: ample free space (floor 1GiB) is admitted regardless of percent used" 0 "$rc"
 chmod -R u+w "$PNEUMA_GATE_BASE/envs" 2>/dev/null || true
 
+# ── sibling repos: a gate that reads a second repo beside the one under test ───────────────────
+# The builder holds no credentials: the submitter ships each sibling the profile declares (data in the profile) in the
+# same bundle, at its freshly fetched origin/main; the unit lays it out at $HOME/Repos/pneuma/<name> with origin = itself.
+sibsrc="$work/sibs/sibrepo"; mkdir -p "$sibsrc" "$work/sibs-origin"
+git -C "$sibsrc" init -q -b main; printf 'v1\n' > "$sibsrc/marker.txt"; git -C "$sibsrc" add marker.txt; git -C "$sibsrc" commit -qm v1
+git init -q --bare "$work/sibs-origin/sibrepo.git"
+git -C "$sibsrc" remote add origin "$work/sibs-origin/sibrepo.git"; git -C "$sibsrc" push -q origin main
+printf 'v2\n' > "$sibsrc/marker.txt"; git -C "$sibsrc" commit -qam v2; git -C "$sibsrc" push -q origin main
+sib_tip=$(git -C "$sibsrc" rev-parse HEAD)
+git -C "$sibsrc" reset -q --hard HEAD~1        # the dev box's local checkout is STALE: the client must ship fresh origin/main
+cat > "$work/profiles/sibfake.sh" <<'PROFILE'
+profile_siblings() { echo sibrepo; }
+profile_cores() { echo 1; }
+profile_mem_mb() { echo 256; }
+profile_env_key() { echo "sibkey1"; }
+profile_env_build() { mkdir -p "$1" && echo built > "$1/marker"; }
+profile_gate() {
+  local d="$HOME/Repos/pneuma/sibrepo"
+  # exactly what the engine hook does: fetch origin main in the sibling, then read origin/main from it
+  git -C "$d" fetch --quiet origin main || { echo "SIBLING-FETCH-FAILED"; return 1; }
+  echo "sibling-origin-main=$(git -C "$d" show origin/main:marker.txt)"
+  [ "$(git -C "$d" show origin/main:marker.txt)" = v2 ]
+}
+PROFILE
+export PNEUMA_GATE_SIBLINGS_ROOT="$work/sibs"
+out=$("$CLIENT" --repo-dir "$src" --profile sibfake --head "$head" --base "$base" --log-dir "$work/logs" 2>&1) && rc=0 || rc=$?
+expect_eq "siblings: a declared sibling is provisioned at origin/main inside the run's HOME -> green" 0 "$rc"
+check "siblings: the client shipped the FRESH origin/main, not the stale local checkout" grep -q "sibling-origin-main=v2" <<<"$out"
+check "siblings: the client says which commit it shipped" grep -q "remote-gate: sibling sibrepo at ${sib_tip:0:12}" <<<"$out"
+check "siblings: the unit says which commit it laid out" grep -q "^  job:   gate: sibling sibrepo at ${sib_tip:0:12}" <<<"$out"
+check "siblings: the client left no sibling ref behind in the repo it bundled" not bash -c 'git -C "$1" for-each-ref refs/pneuma-gate | grep -q .' _ "$src"
+out=$(PNEUMA_GATE_SIBLINGS_ROOT="$work/nowhere" "$CLIENT" --repo-dir "$src" --profile sibfake --head "$head" --base "$base" --log-dir "$work/logs" 2>&1) && rc=0 || rc=$?
+expect_eq "siblings: no local checkout of a required sibling -> exit 75, no verdict" 75 "$rc"
+check "siblings: ...and it names the sibling and the override" grep -q "needs sibling repo 'sibrepo'.*PNEUMA_GATE_SIBLINGS_ROOT" <<<"$out"
+# an old client (never ships siblings) against a profile that needs one: the unit refuses, it does not skip or pass
+cat > "$work/bin/old-client-runner" <<STUB
+#!/usr/bin/env bash
+case "\$1" in siblings) exit 0;; esac
+exec "$work/bin/gate-as-forced-command" "\$@"
+STUB
+chmod +x "$work/bin/old-client-runner"
+out=$(PNEUMA_GATE_RUNNER="$work/bin/old-client-runner" "$CLIENT" --repo-dir "$src" --profile sibfake --head "$head" --base "$base" --log-dir "$work/logs" 2>&1) && rc=0 || rc=$?
+expect_eq "siblings: a required sibling that was not shipped is NO VERDICT (75), never a pass" 75 "$rc"
+check "siblings: ...with the reason in the log" grep -q "required by this profile but was not shipped" <<<"$out"
+check "siblings: the runner lists a profile's siblings; a profile without any lists none" bash -c '[ "$("$1" siblings --profile sibfake)" = sibrepo ] && [ -z "$("$1" siblings --profile fake)" ]' _ "$RUNNER"
+check "siblings: the engine profile declares pneuma-helm-charts" bash -c 'source "$1"; [ "$(profile_siblings)" = pneuma-helm-charts ]' _ "$ENGINE_PROFILE"
+check "siblings: the forced-command grammar passes the verb with only --profile" bash -c 'SSH_ORIGINAL_COMMAND="siblings --profile engine" PNEUMA_GATE_RUNNER_BIN="$2" PNEUMA_GATE_SUDO="$3" "$1" --submitter test-lane >/dev/null 2>&1' _ "$ENTRY" "$work/bin/argv-recorder" "$work/bin/sudo-stub"
+check "siblings: the entry refuses any other option on the verb" bash -c '! SSH_ORIGINAL_COMMAND="siblings --repo x" PNEUMA_GATE_RUNNER_BIN="$2" PNEUMA_GATE_SUDO="$3" "$1" --submitter test-lane >/dev/null 2>&1' _ "$ENTRY" "$work/bin/argv-recorder" "$work/bin/sudo-stub"
+unset PNEUMA_GATE_SIBLINGS_ROOT
+chmod -R u+w "$PNEUMA_GATE_BASE/envs" 2>/dev/null || true
+
 out=$("$RUNNER" status 2>&1)
 check "status reports the free-space floor" grep -q 'disk_free>=40GiB' <<<"$out"
 
@@ -1445,7 +1496,7 @@ check "job log is 0640 (the submitter group reads it; nobody else does)" \
 
 # the client verifies EVERY field of the verdict against the submission, and the job key that binds them
 VERDICT_BIN="$work/bin/verdict-runner"
-printf '%s\n' '#!/usr/bin/env bash' 'printf "%s\n" "$VERDICT_LINE"' 'exit 0' > "$VERDICT_BIN"; chmod +x "$VERDICT_BIN"
+printf '%s\n' '#!/usr/bin/env bash' '[ "$1" = siblings ] && exit 0' 'printf "%s\n" "$VERDICT_LINE"' 'exit 0' > "$VERDICT_BIN"; chmod +x "$VERDICT_BIN"
 om="$base"                                   # the client's origin-main: the fixture's origin/main is the base
 vj() { jk fakerepo "$head" "$tree" "${1:-test-lane}" "${2:-fake}" "$base" "$om" ""; }
 vline() {  # vline <submitter> <profile> <base> <origin_main> <env> <jobkey>
@@ -1795,8 +1846,9 @@ GREEN="$(verdict_line 0 "$K")"; RED="$(verdict_line 1 "$K")"
 # ── the client: the verdict is the stream's final authoritative line, and the transport must agree with it ──
 cat > "$work/bin/stream-runner" <<'STUB'
 #!/usr/bin/env bash
-# a runner stand-in for the client tests: `have` is empty; `run` replays $STREAM_FILE and exits $STREAM_RC
+# a runner stand-in for the client tests: `have` and `siblings` are empty; `run` replays $STREAM_FILE and exits $STREAM_RC
 [ "$1" = have ] && exit 0
+[ "$1" = siblings ] && exit 0
 cat "$STREAM_FILE"; exit "$STREAM_RC"
 STUB
 chmod +x "$work/bin/stream-runner"

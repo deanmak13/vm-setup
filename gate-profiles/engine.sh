@@ -20,6 +20,10 @@
 ENGINE_EXTRAS=(dev mimesis brain gateway)        # = the union the pre-push suites import
 ENGINE_ENV_SCHEMA=2                              # bump to force every env to rebuild
 
+# Repos the gate reads beside the repo under test, at $HOME/Repos/pneuma/<name> (see the runner's cmd_siblings):
+# the pre-push messaging cross-check judges services/common/messaging against pneuma-helm-charts' origin/main.
+profile_siblings() { echo pneuma-helm-charts; }
+
 profile_cores() { echo "${PNEUMA_GATE_ENGINE_CORES:-2}"; }
 profile_mem_mb() { echo "${PNEUMA_GATE_ENGINE_MEM_MB:-3072}"; }
 
