@@ -512,6 +512,56 @@ expect_eq "siblings query: an old entry's refusal of the verb proceeds without s
 printf '#!/usr/bin/env bash\ncase "$1" in siblings) echo "something else" >&2; exit 75;; esac\nexec "%s/bin/gate-as-forced-command" "$@"\n' "$work" > "$work/bin/other75-runner"
 chmod +x "$work/bin/other75-runner"
 expect_eq "siblings query: exit 75 with some other message is a failed query" 75 "$(PNEUMA_GATE_RUNNER="$work/bin/other75-runner" "$CLIENT" --repo-dir "$src" --profile fake --head "$head" --base "$base" --log-dir "$work/logs" >/dev/null 2>&1; echo $?)"
+# ── host tools: pinned, checksum-verified installs, and a profile refuses to start without the tools it needs ──
+TOOLS_INSTALL="$REPO_DIR/host/pneuma-gate-tools-install.sh"
+tdir="$work/tools"; mkdir -p "$tdir/src/linux-amd64" "$tdir/dest"
+printf '#!/bin/sh\necho fakehelm\n' > "$tdir/src/linux-amd64/faketool"; chmod +x "$tdir/src/linux-amd64/faketool"
+tar -czf "$tdir/faketool.tgz" -C "$tdir/src" linux-amd64/faketool
+tar_sha="$(sha256sum < "$tdir/faketool.tgz" | cut -d' ' -f1)"; bin_sha="$(sha256sum < "$tdir/src/linux-amd64/faketool" | cut -d' ' -f1)"
+mklist() {  # mklist <tarball sha> <binary sha> → a one-entry data file
+  printf '# name version url tarball_sha256 member binary_sha256 dest\nfaketool 1.0.0 file://%s/faketool.tgz %s linux-amd64/faketool %s %s/dest/faketool\n' "$tdir" "$1" "$2" "$tdir" > "$tdir/tools.conf"
+}
+mklist "$tar_sha" "$bin_sha"
+out=$(bash "$TOOLS_INSTALL" --as-user "$(id -un)" "$tdir/tools.conf" 2>&1) && rc=0 || rc=$?
+expect_eq "tools: a verified tool installs (rc 0)" 0 "$rc"
+check "tools: ...to the pinned destination, executable" test -x "$tdir/dest/faketool"
+expect_eq "tools: ...with exactly the pinned binary hash" "$bin_sha" "$(sha256sum < "$tdir/dest/faketool" | cut -d' ' -f1)"
+out=$(bash "$TOOLS_INSTALL" --as-user "$(id -un)" "$tdir/tools.conf" 2>&1) && rc=0 || rc=$?
+expect_eq "tools: running it again is a no-op (idempotent, rc 0)" 0 "$rc"
+check "tools: ...and it says it is already installed" grep -q "already installed" <<<"$out"
+rm -f "$tdir/dest/faketool"
+mklist "0000000000000000000000000000000000000000000000000000000000000000" "$bin_sha"
+out=$(bash "$TOOLS_INSTALL" --as-user "$(id -un)" "$tdir/tools.conf" 2>&1) && rc=0 || rc=$?
+check "tools: a tarball checksum mismatch is refused (non-zero)" test "$rc" -ne 0
+check "tools: ...with the mismatch named" grep -q "checksum mismatch" <<<"$out"
+check "tools: ...and NOTHING was installed" test ! -e "$tdir/dest/faketool"
+mklist "$tar_sha" "1111111111111111111111111111111111111111111111111111111111111111"
+out=$(bash "$TOOLS_INSTALL" --as-user "$(id -un)" "$tdir/tools.conf" 2>&1) && rc=0 || rc=$?
+check "tools: a binary hash that differs from the pin is refused and installs nothing" bash -c '[ "$1" -ne 0 ] && [ ! -e "$2" ]' _ "$rc" "$tdir/dest/faketool"
+printf 'faketool 1.0.0 http://example.invalid/x.tgz %s linux-amd64/faketool %s %s/dest/faketool\n' "$tar_sha" "$bin_sha" "$tdir" > "$tdir/tools.conf"
+check "tools: a non-https/file url is refused" not bash "$TOOLS_INSTALL" --as-user "$(id -un)" "$tdir/tools.conf"
+printf 'faketool 1.0.0 file://%s/faketool.tgz %s ../escape %s /etc/passwd\n' "$tdir" "$tar_sha" "$bin_sha" > "$tdir/tools.conf"
+check "tools: a traversal member or a non-bin destination is refused" not bash "$TOOLS_INSTALL" --as-user "$(id -un)" "$tdir/tools.conf"
+check "tools: the shipped data lists helm with a pinned sha256 and /usr/local/bin/helm" grep -Eq '^helm 3\.[0-9]+\.[0-9]+ https://get\.helm\.sh/helm-v[0-9.]+-linux-amd64\.tar\.gz [0-9a-f]{64} linux-amd64/helm [0-9a-f]{64} /usr/local/bin/helm$' "$REPO_DIR/gate-tools/tools.conf"
+# the runner refuses, as INFRA, a profile whose declared tool is missing, BEFORE any gate starts
+cat > "$work/profiles/toolfake.sh" <<'PROFILE'
+profile_tools() { echo nosuchtool-xyz; }
+profile_cores() { echo 1; }
+profile_mem_mb() { echo 256; }
+profile_env_key() { echo toolkey; }
+profile_env_build() { mkdir -p "$1"; }
+profile_gate() { echo GATE-STARTED; return 0; }
+PROFILE
+sed 's/nosuchtool-xyz/bash/' "$work/profiles/toolfake.sh" > "$work/profiles/toolokfake.sh"
+out=$("$CLIENT" --repo-dir "$src" --profile toolfake --head "$head" --base "$base" --log-dir "$work/logs" 2>&1) && rc=0 || rc=$?
+expect_eq "tools: a missing required tool -> the runner refuses, exit 75 (infrastructure, not a red test)" 75 "$rc"
+check "tools: ...with the clear message" grep -q "tool 'nosuchtool-xyz' required by profile toolfake is not installed" <<<"$out"
+check "tools: ...before the gate started" not grep -q "GATE-STARTED" <<<"$out"
+out=$("$CLIENT" --repo-dir "$src" --profile toolokfake --head "$head" --base "$base" --log-dir "$work/logs" 2>&1) && rc=0 || rc=$?
+expect_eq "tools: with the tool present the gate proceeds (green)" 0 "$rc"
+check "tools: ...and the gate ran" grep -q "GATE-STARTED" <<<"$out"
+( source "$ENGINE_PROFILE"; profile_tools ) > "$work/engine-tools.out"
+expect_eq "tools: the engine profile declares helm" helm "$(cat "$work/engine-tools.out")"
 unset SHIM_GETURL PNEUMA_GATE_SIBLINGS_CONF
 unset PNEUMA_GATE_SIBLINGS_ROOT
 chmod -R u+w "$PNEUMA_GATE_BASE/envs" 2>/dev/null || true

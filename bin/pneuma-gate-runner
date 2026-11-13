@@ -509,6 +509,20 @@ cmd_run() {
   # shellcheck disable=SC1090
   source "$PROFILE_DIR/$profile.sh" || refuse "profile $profile failed to load"
   local cores mem; cores="$(profile_cores)"; mem="$(profile_mem_mb)"
+  # A tool the profile needs that the gate sandbox cannot find is infrastructure, never a red test: refuse BEFORE the
+  # bundle is read or anything runs. The search path is the sandbox's own PATH.
+  if declare -F profile_tools >/dev/null; then
+    local tool tdir tfound
+    while read -r tool; do
+      [ -n "$tool" ] || continue
+      safe_name "$tool" || refuse "bad tool name in profile $profile"
+      tfound=""
+      for tdir in $(tr ':' ' ' <<<"${PNEUMA_GATE_TOOL_PATH:-/usr/local/bin:/usr/bin:/bin}"); do
+        if [ -x "$tdir/$tool" ] && [ -f "$tdir/$tool" ]; then tfound=1; break; fi
+      done
+      [ -n "$tfound" ] || refuse "tool '$tool' required by profile $profile is not installed"
+    done <<< "$(profile_tools)"
+  fi
 
   local store; store="$(store_for "$repo")"
   if [ ! -d "$store" ]; then as_gate git init -q --bare "$store" || refuse "cannot init object store"; fi
