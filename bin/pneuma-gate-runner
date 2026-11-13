@@ -99,7 +99,7 @@ fetch_keep_refs() {  # <store> <bundle> <repo> <branch-or-empty>
   safe_name "$repo" || return 1
   specs+=("+refs/pneuma-gate/repo/$repo:refs/gate-keep/repo/$repo")
   if [ -n "$branch" ]; then specs+=("+refs/pneuma-gate/branch/$branch:refs/gate-keep/branch/$branch"); fi
-  specs+=("+refs/pneuma-gate/head-*:refs/gate-keep/head-*" "+refs/pneuma-gate/base-*:refs/gate-keep/base-*" "+refs/pneuma-gate/om-*:refs/gate-keep/om-*")
+  specs+=("+refs/pneuma-gate/head-*:refs/gate-keep/head-*" "+refs/pneuma-gate/base-*:refs/gate-keep/base-*" "+refs/pneuma-gate/om-*:refs/gate-keep/om-*" "+refs/pneuma-gate/sibling/*:refs/gate-keep/sibling/*")
   as_gate git --git-dir="$store" fetch "$bundle" "${specs[@]}" 2>&1 | sed 's/^/  fetch: /'
   return "${PIPESTATUS[0]}"
 }
@@ -426,6 +426,15 @@ cmd_cancel() {  # --repo R --head SHA: cancel THIS submitter's live jobs for tha
   )
 }
 
+cmd_siblings() {   # --profile P: the sibling repo names profile P's gate needs, one per line (data in the profile)
+  local profile=""
+  while [ $# -gt 0 ]; do case "$1" in --profile) profile="$2"; shift 2;; *) echo "unknown arg $1" >&2; return 2;; esac; done
+  safe_name "$profile" && [ -r "$PROFILE_DIR/$profile.sh" ] || { echo "no gate profile '$profile'" >&2; return 2; }
+  ( source "$PROFILE_DIR/$profile.sh" >/dev/null 2>&1 || exit 2
+    declare -F profile_siblings >/dev/null || exit 0
+    profile_siblings | while read -r n; do [ -z "$n" ] || { safe_name "$n" && printf '%s\n' "$n"; } || exit 2; done )
+}
+
 cmd_run() {
   local profile="" repo="" head="" base="" tree="" bundle=0 shallow="" origin_main="" branch="" fwd_env=()
   while [ $# -gt 0 ]; do
@@ -490,6 +499,9 @@ cmd_run() {
     if [ -n "$RUN_AS" ]; then chown "$RUN_AS" "$bf"; fi
     log "received bundle ($(du -h "$bf" | cut -f1))"
     fetch_keep_refs "$store" "$bf" "$repo" "$branch" || { rm -f "$bf"; refuse "bundle fetch failed"; }
+    # the sibling commits THIS submission shipped (name sha), read from its own bundle: the store's keep refs are shared
+    # between concurrent submissions, so they are never the source of which commit this run uses
+    SIB_SHIPPED="$(cd / && git bundle list-heads "$bf" 2>/dev/null | sed -n 's#^\([0-9a-f]\{40\}\) refs/pneuma-gate/sibling/\([A-Za-z0-9._-]\{1,100\}\)$#\2 \1#p')"
     rm -f "$bf"
   fi
   local o
@@ -543,6 +555,24 @@ run_job() {   # the detached worker: admission, workspace, the gate, the verdict
     git -c advice.detachedHead=false checkout -q --detach "$3"' _ "$work" "$store" "$head" "$base" "$origin_main" \
     || refuse "workspace checkout failed"
   [ "$(as_gate git -C "$work" rev-parse 'HEAD^{tree}')" = "$tree" ] || refuse "workspace tree mismatch"
+  # Sibling repos the profile declares (the engine reads pneuma-helm-charts beside the repo under test): laid out at
+  # $HOME/Repos/pneuma/<name> at the commit the submitter shipped, origin pointing at itself. A declared sibling that
+  # was not shipped is NO VERDICT (75), never a skipped phase.
+  if declare -F profile_siblings >/dev/null; then
+    local sib sha
+    while read -r sib; do
+      [ -n "$sib" ] || continue
+      safe_name "$sib" || refuse "bad sibling name"
+      sha="$(awk -v n="$sib" '$1 == n {print $2}' <<<"${SIB_SHIPPED:-}" | head -1)"
+      [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || refuse "sibling repo '$sib' is required by profile $profile but was not shipped (old client?)"
+      as_gate git --git-dir="$store" cat-file -e "${sha}^{commit}" 2>/dev/null || refuse "sibling commit for '$sib' is not in the store"
+      as_gate bash -c 'set -e; mkdir -p "$1"; cd "$1"; git init -q -b main .; echo "$2/objects" > .git/objects/info/alternates
+        git update-ref refs/heads/main "$3"; git update-ref refs/remotes/origin/main "$3"; git remote add origin "$1"
+        git -c advice.detachedHead=false checkout -q main' _ "$RUN_DIR/home/Repos/pneuma/$sib" "$store" "$sha" \
+        || refuse "cannot lay out sibling repo '$sib'"
+      log "sibling $sib at ${sha:0:12}"
+    done <<< "$(profile_siblings)"
+  fi
   [ -z "$(as_gate git -C "$work" status --porcelain)" ] || refuse "workspace not clean after checkout"
   # Optional profile hook: the scoping decision (diff size, selected services) at
   # the top of the log, so a wrong selection is visible in every verdict.
@@ -599,8 +629,9 @@ main() {
     run) [[ "$SUBMITTER" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] || refuse_noid; cmd_run "$@"; exit $?;;
     cancel) [[ "$SUBMITTER" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] || refuse_noid; cmd_cancel "$@"; exit $?;;
     status) cmd_status;;
+    siblings) cmd_siblings "$@"; exit $?;;
     janitor) cmd_janitor;;
-    *) echo "usage: pneuma-gate-runner {have|run|cancel|status|janitor}" >&2; exit 2;;
+    *) echo "usage: pneuma-gate-runner {have|run|cancel|status|siblings|janitor}" >&2; exit 2;;
   esac
 }
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then main "$@"; fi
