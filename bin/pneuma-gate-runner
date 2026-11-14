@@ -1084,6 +1084,41 @@ unit_env() {   # <ws> <work> <profile> → sets ENV_DIR
   touch "$ENV_DIR/.ready"
 }
 
+# Sibling repos: some gates read a second repo checked out beside the one under test (the engine's pre-push reads
+# pneuma-helm-charts at $HOME/Repos/pneuma/<name>). The build host holds no credentials, so the SUBMITTER ships each
+# one as refs/pneuma-gate/sibling/<name> in the same bundle. The profile declares which (data, not code in the runner).
+cmd_siblings() {   # --profile P: the sibling repo names profile P's gate needs, one per line
+  local profile=""
+  while [ $# -gt 0 ]; do case "$1" in --profile) profile="$2"; shift 2;; *) echo "unknown arg $1" >&2; return 2;; esac; done
+  safe_name "$profile" && [ -r "$PROFILE_DIR/$profile.sh" ] || { echo "no gate profile '$profile'" >&2; return 2; }
+  # shellcheck disable=SC1090
+  ( source "$PROFILE_DIR/$profile.sh" >/dev/null 2>&1 || exit 2
+    declare -F profile_siblings >/dev/null || exit 0
+    profile_siblings | while read -r n; do [ -z "$n" ] || { safe_name "$n" && printf '%s\n' "$n"; } || exit 2; done )
+}
+
+# Inside the unit: lay each declared sibling out where the gate expects it, at the commit the submitter shipped, with
+# `origin` pointing at itself so a hook's `git fetch origin main` is a no-op and `origin/main` is that commit. A
+# declared sibling that was not shipped is NO VERDICT (75): never a skipped phase, never a green without it.
+unit_siblings() {   # <ws>
+  local ws="$1" name dir
+  declare -F profile_siblings >/dev/null || return 0
+  while read -r name; do
+    [ -n "$name" ] || continue
+    safe_name "$name" || { echo "bad sibling name '$name'"; return 75; }
+    git -C "$ws" rev-parse --verify --quiet "refs/gate-keep/sibling/$name^{commit}" >/dev/null \
+      || { echo "sibling repo '$name' is required by this profile but was not shipped in the submission (old client?): no verdict"; return 75; }
+    dir="$HOME/Repos/pneuma/$name"
+    mkdir -p "$dir" && git -C "$dir" init -q -b main . \
+      && git -C "$dir" fetch -q "$ws" "refs/gate-keep/sibling/$name:refs/remotes/origin/main" \
+      && git -C "$dir" remote add origin "$dir" \
+      && git -C "$dir" checkout -q -B main refs/remotes/origin/main \
+      && git -C "$dir" fetch -q origin main \
+      || { echo "cannot lay out sibling repo '$name'"; return 75; }
+    echo "sibling $name at $(git -C "$dir" rev-parse --short=12 HEAD)"
+  done <<< "$(profile_siblings)"
+}
+
 cmd_unit() {
   local profile="" head="" base="" tree="" om="" shallow="" timeout_s=7200
   while [ $# -gt 0 ]; do
@@ -1099,6 +1134,7 @@ cmd_unit() {
   # shellcheck disable=SC1090
   source "$PROFILE_DIR/$profile.sh" || { echo "profile $profile failed to load"; return 75; }
   unit_checkout "$work" "$head" "$base" "$tree" "$om" "$shallow" || return $?
+  unit_siblings "$work/ws" || return $?
   # Optional profile hook: the scoping decision (diff size, selected services) at the top of the log,
   # so a wrong selection is visible in every verdict. It runs here, in the sandbox, with the PR's code.
   if declare -F profile_scope_report >/dev/null; then
@@ -1240,7 +1276,7 @@ main() {
   # verbs (unit, promote, warm-unit) and the operator verbs (janitor, guard, warm-env) are never a submitter's.
   if [ -n "${SUDO_USER:-}" ]; then
     case "$sub" in
-      have|run|cancel|status) ;;
+      have|run|cancel|status|siblings) ;;
       *) echo "pneuma-gate-runner: refused: verb '$sub' is not available through the submit path" >&2; exit 75;;
     esac
   fi
@@ -1252,13 +1288,14 @@ main() {
     run) [[ "$SUBMITTER" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] || refuse_noid; cmd_run "$@"; exit $?;;
     cancel) [[ "$SUBMITTER" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] || refuse_noid; cmd_cancel "$@"; exit $?;;
     status) cmd_status;;
+    siblings) cmd_siblings "$@"; exit $?;;
     janitor) cmd_janitor;;
     guard) cmd_guard;;
     unit) cmd_unit "$@"; exit $?;;
     promote) cmd_promote "$@"; exit $?;;
     warm-env) cmd_warm_env "$@"; exit $?;;
     warm-unit) cmd_warm_unit "$@"; exit $?;;
-    *) echo "usage: pneuma-gate-runner {have|run|cancel|status|janitor|guard|warm-env}" >&2; exit 2;;
+    *) echo "usage: pneuma-gate-runner {have|run|cancel|status|siblings|janitor|guard|warm-env}" >&2; exit 2;;
   esac
 }
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then main "$@"; fi
