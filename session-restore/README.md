@@ -1,7 +1,7 @@
 # session-restore
 
 Brings every tmux window and its Claude Code / Codex conversation back after the dev box reboots.
-User-level systemd units; no sudo to install.
+User-level systemd units (in `../systemd/`); no sudo to install.
 
 ## How it works
 

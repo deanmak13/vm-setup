@@ -10,7 +10,7 @@ run mkdir -p "$BIN" "$UNITS" "$HOME/.cache/pneuma-session-restore"
 run install -m 755 "$HERE/snapshot.sh" "$BIN/pneuma-session-snapshot"
 run install -m 755 "$HERE/restore.sh" "$BIN/pneuma-session-restore"
 for u in pneuma-session-snapshot.service pneuma-session-snapshot.timer pneuma-session-restore.service; do
-  run install -m 644 "$HERE/systemd/$u" "$UNITS/$u"
+  run install -m 644 "$HERE/../systemd/$u" "$UNITS/$u"
 done
 run systemctl --user daemon-reload
 run systemctl --user enable --now pneuma-session-snapshot.timer
