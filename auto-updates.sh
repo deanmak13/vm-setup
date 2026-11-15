@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # auto-updates.sh — Configure unattended-upgrades for automatic security patches
-# and schedule a weekly reboot at 4am Sunday.
+# and schedule a weekly reboot at 3am Sunday.
 #
 # Usage:
 #   sudo bash ~/vm-setup/auto-updates.sh
 #
 # What it does:
 #   1. Installs and configures unattended-upgrades (security patches only)
-#   2. Schedules a weekly reboot via systemd timer (Sunday 4:00 AM)
+#   2. Schedules a weekly reboot via systemd timer (Sunday 3:00 AM)
 #   3. Enables automatic removal of unused kernel/dependency packages
 
 set -euo pipefail
@@ -60,8 +60,8 @@ AUTOCFG
 
 log "Unattended-upgrades configured (security patches only)."
 
-# --- Schedule weekly reboot at 4am Sunday via systemd ---
-log "Setting up weekly reboot timer (Sunday 4:00 AM)..."
+# --- Schedule weekly reboot at 3am Sunday via systemd ---
+log "Setting up weekly reboot timer (Sunday 3:00 AM)..."
 
 cat > /etc/systemd/system/weekly-reboot.service <<'SVC'
 [Unit]
@@ -75,10 +75,10 @@ SVC
 
 cat > /etc/systemd/system/weekly-reboot.timer <<'TMR'
 [Unit]
-Description=Weekly reboot timer (Sunday 4am)
+Description=Weekly reboot timer (Sunday 3am)
 
 [Timer]
-OnCalendar=Sun *-*-* 04:00:00
+OnCalendar=Sun *-*-* 03:00:00
 Persistent=true
 RandomizedDelaySec=300
 
@@ -89,6 +89,6 @@ TMR
 systemctl daemon-reload
 systemctl enable --now weekly-reboot.timer
 
-log "Weekly reboot scheduled: Sunday 4:00 AM (±5min jitter)."
+log "Weekly reboot scheduled: Sunday 3:00 AM (±5min jitter)."
 log "Verify with: systemctl list-timers weekly-reboot.timer"
 log "Done."

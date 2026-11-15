@@ -102,7 +102,7 @@ sudo bash ~/vm-setup/auto-updates.sh
 ```
 
 This installs `unattended-upgrades` (security-only), configures daily auto-updates,
-and schedules a reboot every Sunday at 4:00 AM via a systemd timer. The reboot has
+and schedules a reboot every Sunday at 3:00 AM via a systemd timer. The reboot has
 a ±5 minute randomized delay to avoid thundering herd on multi-VM setups.
 
 Verify the timer: `systemctl list-timers weekly-reboot.timer`
