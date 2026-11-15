@@ -1,0 +1,17 @@
+[Unit]
+Description=Restore tmux windows and resume agent sessions after boot
+After=network-online.target default.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Short delay so the user manager, network and PATH-providing login setup are settled.
+ExecStartPre=/usr/bin/sleep 45
+# The tmux server must outlive this oneshot unit: start it in its own transient scope.
+Environment="PNEUMA_RESTORE_SERVER_WRAP=systemd-run --user --scope --quiet"
+ExecStart=%h/.local/bin/pneuma-session-restore
+TimeoutStartSec=3min
+
+[Install]
+WantedBy=default.target

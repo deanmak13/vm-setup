@@ -1,0 +1,11 @@
+[Unit]
+Description=Snapshot tmux windows and agent sessions every 5 minutes
+
+[Timer]
+# OnBootSec > restore delay: a fresh post-reboot tmux server must not overwrite latest.json before restore reads it.
+OnBootSec=10min
+OnUnitActiveSec=5min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target
