@@ -1,0 +1,9 @@
+[Unit]
+Description=Snapshot tmux layout and agent session ids (for post-reboot restore)
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/pneuma-session-snapshot
+Nice=19
+IOSchedulingClass=idle
+TimeoutStartSec=2min
