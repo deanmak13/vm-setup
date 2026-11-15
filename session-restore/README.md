@@ -9,13 +9,13 @@ User-level systemd units (in `../systemd/`); no sudo to install.
   process tree. For every pane it records session, window index/name, pane index, cwd, client
   (`claude|codex|shell`), the exact resume command, the agent session id, a confidence
   (`confident|inferred|guess`) and the Paperclip slug. Output: `~/.cache/pneuma-session-restore/snapshot-<UTC>.json`
-  plus `latest.json` (newest 288 kept; an empty tmux server never overwrites `latest.json`).
+  Directory is 0700 (refused if a symlink or not ours), files 0600, written via temp file + rename. Windows whose session/window names fail `^[A-Za-z0-9._-]+$` are dropped from the snapshot (reported on stderr). `agent_cmdline` holds only the validated relaunch argv. Two Claude panes sharing a cwd with no id are marked `guess` and NOT auto-resumed (candidates printed). plus `latest.json` (newest 288 kept; an empty tmux server never overwrites `latest.json`).
   - Every launch is stored as an argv list (never a shell string); session ids and flags are validated against allow-lists.
   - Claude id: `CLAUDE_CODE_SESSION_ID` from a child process environ (confident); fallback newest
     `~/.claude/projects/<cwd>/*.jsonl` (guess).
   - Codex id: Paperclip link file (`~/.local/state/paperclip-link/<slug>`) matched by pane id and slug in the pane
     title (confident), then by elimination (inferred), then newest rollout for the cwd (guess).
-- `restore.sh` (boot, 45 s after the user manager): for each session/window in snapshot order, creates the tmux
+- `restore.sh` refuses a snapshot that is not owned by the user or is group/world-writable; if `latest.json` is corrupt it falls back to the newest valid `snapshot-*.json` (and says so); with no valid snapshot or no `jq` it exits non-zero (the unit has no `Restart=`). `base-index` is read from tmux. (boot, 45 s after the user manager): for each session/window in snapshot order, creates the tmux
   session or window with the same name and index if it is missing (existing ones are skipped, so it is idempotent),
   `cd`s to the cwd (falls back to `~/Repos/pneuma` when the cwd is gone), and starts the client with tmux argv form (no shell string, no send-keys; re-validated from the snapshot)
   (`claude --resume <id> <original flags>` / `codex resume <id> <original flags>`). `--dry-run` prints the plan only.

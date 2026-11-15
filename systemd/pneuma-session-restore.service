@@ -1,7 +1,6 @@
 [Unit]
 Description=Restore tmux windows and resume agent sessions after boot
-After=network-online.target default.target
-Wants=network-online.target
+After=default.target
 
 [Service]
 Type=oneshot

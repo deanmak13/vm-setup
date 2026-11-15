@@ -5,6 +5,8 @@
 #   --dir DIR       output dir (default: $PNEUMA_SESSION_RESTORE_DIR or ~/.cache/pneuma-session-restore)
 #   --stdout        print JSON, write nothing
 set -euo pipefail
+umask 077
+command -v jq >/dev/null || { echo "snapshot: jq is required" >&2; exit 1; }
 SOCKET="${PNEUMA_TMUX_SOCKET:-}"   # empty = let tmux pick its own socket (tmux's ownership checks apply)
 SOCKNAME=""
 DIR="${PNEUMA_SESSION_RESTORE_DIR:-$HOME/.cache/pneuma-session-restore}"
@@ -30,7 +32,10 @@ if [ -n "$SOCKET" ]; then check_socket "$SOCKET"; TM=(tmux -S "$SOCKET"); SOCK_M
 elif [ -n "$SOCKNAME" ]; then TM=(tmux -L "$SOCKNAME"); SOCK_MODE=-L; SOCK_VAL="$SOCKNAME"
 else SOCK_MODE=""; SOCK_VAL=""; fi
 "${TM[@]}" list-sessions >/dev/null 2>&1 || { echo "snapshot: no tmux server reachable; nothing to snapshot" >&2; exit 0; }
-mkdir -p "$DIR"
+if [ -L "$DIR" ]; then echo "refusing: $DIR is a symlink" >&2; exit 1; fi
+[ -e "$DIR" ] || mkdir -m 700 -p -- "$DIR"
+[ -d "$DIR" ] && [ "$(stat -c %u -- "$DIR")" = "$(id -u)" ] || { echo "refusing: $DIR is not a directory owned by uid $(id -u)" >&2; exit 1; }
+chmod 700 -- "$DIR"
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
 export SOCK_MODE SOCK_VAL DIR TS
 OUT="$(python3 -I - <<'PY'
@@ -84,7 +89,7 @@ def report(msg): print("snapshot: DROPPED " + msg, file=sys.stderr)
 entries = []
 for sess, widx, wname, pidx, pane_id, ppid, pcwd, pcmd, ptitle in panes:
     e = dict(session=sess, window_index=int(widx), window_name=wname, pane_index=int(pidx), pane_id=pane_id,
-             pane_title=ptitle, cwd=pcwd, client="shell", launch=None, agent_pid=None, agent_cmdline=None,
+             pane_title=ptitle, cwd=pcwd, client="shell", launch=None, agent_pid=None, agent_cmdline=None, candidates=None,
              session_id=None, confidence=None, id_source=None, paperclip_slug=None, note="")
     desc = descendants(int(ppid))
     agent = None
@@ -100,7 +105,7 @@ for sess, widx, wname, pidx, pane_id, ppid, pcwd, pcmd, ptitle in panes:
             if a and os.path.basename(a[0]) == "codex": agent = ("codex", pid, a); break
     if agent:
         client, apid, argv = agent
-        e["client"] = client; e["agent_pid"] = apid; e["agent_cmdline"] = argv
+        e["client"] = client; e["agent_pid"] = apid
         e["cwd"] = cwd(apid) or pcwd
         flags, skip = [], False
         for i, x in enumerate(argv[1:], 1):
@@ -114,10 +119,6 @@ for sess, widx, wname, pidx, pane_id, ppid, pcwd, pcmd, ptitle in panes:
             for pid in desc:
                 sid = environ(pid).get("CLAUDE_CODE_SESSION_ID")
                 if sid: e.update(session_id=sid, confidence="confident", id_source="CLAUDE_CODE_SESSION_ID in child environ"); break
-            if not e["session_id"]:
-                pd = home + "/.claude/projects/" + re.sub(r"[/.]", "-", e["cwd"])
-                fs = sorted(glob.glob(pd + "/*.jsonl"), key=os.path.getmtime)
-                if fs: e.update(session_id=os.path.basename(fs[-1])[:-6], confidence="guess", id_source="newest jsonl for cwd")
         else:
             ar = [x for x in argv[1:] if x == "resume"]
             for slug, d in links.items():
@@ -127,6 +128,19 @@ for sess, widx, wname, pidx, pane_id, ppid, pcwd, pcmd, ptitle in panes:
     elif pcmd in tools:
         e["launch"] = [pcmd]; e["note"] = "tool relaunched, no state"
     entries.append(e)
+# Claude fallback: newest jsonl per cwd, skipping ids used by another pane; panes sharing a cwd are ambiguous.
+claimed = {e["session_id"] for e in entries if e["session_id"]}
+need = [e for e in entries if e["client"] == "claude" and not e["session_id"]]
+for cwd_ in {e["cwd"] for e in need}:
+    grp = [e for e in need if e["cwd"] == cwd_]
+    pd = home + "/.claude/projects/" + re.sub(r"[/.]", "-", cwd_)
+    cand = [os.path.basename(f)[:-6] for f in sorted(glob.glob(pd + "/*.jsonl"), key=os.path.getmtime)[::-1]]
+    cand = [c for c in cand if c not in claimed and ID_RE.match(c)][:len(grp) + 2]
+    if len(grp) == 1 and cand:
+        grp[0].update(session_id=cand[0], confidence="guess", id_source="newest unclaimed jsonl for cwd")
+    elif len(grp) > 1:
+        for e in grp:
+            e.update(confidence="guess", candidates=cand, note=f"ambiguous: {len(grp)} panes share cwd; NOT auto-resumed; candidates (newest first): {', '.join(cand)}")
 # Codex: resolve remaining panes by link pane id (unique) then by elimination.
 claimed = {e["session_id"] for e in entries if e["session_id"]}
 for e in entries:
@@ -158,9 +172,9 @@ for e in entries:
         elif e["client"] == "claude": e["launch"] = ["claude", "--resume", e["session_id"]] + e["flags"]
         else: e["launch"] = ["codex", "resume", e["session_id"]] + [x for x in e["flags"] if x != "resume"]
     elif e["client"] in ("claude","codex"):
-        e["note"] = "session id not found; window restored as plain shell"
+        e["note"] = e["note"] or "session id not found; window restored as plain shell"
         e["launch"] = None
-    e.pop("launch_base", None)
+    e.pop("launch_base", None); e["agent_cmdline"] = e["launch"] if e["client"] in ("claude", "codex") else None
 ok = []
 for e in entries:
     if NAME_RE.match(e["session"]) and NAME_RE.match(e["window_name"]): ok.append(e)
@@ -172,9 +186,10 @@ PY
 )"
 if [ "$STDOUT" = 1 ]; then printf '%s\n' "$OUT"; exit 0; fi
 [ "$(printf '%s' "$OUT" | jq '.panes | length')" -gt 0 ] || { echo "snapshot: tmux server has no panes; keeping previous snapshot" >&2; exit 0; }
-printf '%s\n' "$OUT" > "$DIR/snapshot-$TS.json.tmp"
-mv "$DIR/snapshot-$TS.json.tmp" "$DIR/snapshot-$TS.json"
-cp "$DIR/snapshot-$TS.json" "$DIR/latest.json.tmp"; mv "$DIR/latest.json.tmp" "$DIR/latest.json"
+TMPF="$(mktemp -p "$DIR" .snapshot.XXXXXX)"; TMPL="$(mktemp -p "$DIR" .latest.XXXXXX)"   # mktemp creates 0600, same dir
+trap 'rm -f -- "$TMPF" "$TMPL"' EXIT
+printf '%s\n' "$OUT" > "$TMPF"; printf '%s\n' "$OUT" > "$TMPL"
+mv -- "$TMPF" "$DIR/snapshot-$TS.json"; mv -- "$TMPL" "$DIR/latest.json"
 # keep the newest 288 (one day at 5 min)
 ls -1t "$DIR"/snapshot-*.json 2>/dev/null | tail -n +289 | xargs -r rm -f
 echo "$DIR/snapshot-$TS.json"
