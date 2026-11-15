@@ -73,6 +73,8 @@ if [ "$do_host" = 1 ]; then
       || { echo "refusing: unexpected staging path '$STAGE'" >&2; exit 1; }
     trap 'rm -rf -- "$STAGE"' EXIT
     install -m 0755 "$REPO_DIR/bin/pneuma-gate-runner" "$STAGE/pneuma-gate-runner"
+    install -m 0755 "$REPO_DIR/host/gate-durations-dirs.sh" "$STAGE/gate-durations-dirs.sh"
+    install -m 0644 "$REPO_DIR/gate-durations-repos.txt" "$STAGE/gate-durations-repos.txt"
     mkdir "$STAGE/profiles" && cp -a "$REPO_DIR/gate-profiles/." "$STAGE/profiles/"
     bash "$REPO_DIR/ci-builder-gate-host.sh" "$STAGE"
   else
@@ -94,6 +96,7 @@ if [ "$do_host" = 1 ]; then
     if [ "$do_runner" = 1 ]; then
       rsync -a "$REPO_DIR/bin/pneuma-gate-runner" "$HOST:$STAGE/pneuma-gate-runner"
       rsync -a "$REPO_DIR/gate-profiles/" "$HOST:$STAGE/profiles/"
+      rsync -a "$REPO_DIR/host/gate-durations-dirs.sh" "$REPO_DIR/gate-durations-repos.txt" "$HOST:$STAGE/"
     fi
 
     # STAGED MIGRATION (PR #20): the submit path (account, entry, sudoers, keys, sshd Match block, from.conf) is

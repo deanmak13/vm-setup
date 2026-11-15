@@ -13,6 +13,8 @@
 #     envs/        the dependency-env cache, root-owned and frozen read-only; units mount it read-only
 #     wheels/      staged proto wheels, root-owned; units mount them read-only
 #     queue/       FIFO tickets of waiting runners (root)
+#     durations/<repo>/  per-test durations a repo's nightly publishes (the CI runner user writes; everyone reads);
+#                  the repos are the data in gate-durations-repos.txt
 #   /var/lib/pneuma-gate-state      root 0700: reservation markers and staged bundles (never visible to a unit)
 # A gate itself runs as a transient service with DynamicUser=yes: a unique uid per run, so no run
 # can read or write another's files, processes or sockets.
@@ -26,6 +28,9 @@ install -d -o pneuma-gate -g pneuma-gate -m 0755 /var/lib/pneuma-gate/repos
 install -d -o root -g root -m 0700 /var/lib/pneuma-gate-state /var/lib/pneuma-gate-state/runs /var/lib/pneuma-gate-state/in
 # The profiles run as root (the runner sources them as root): root owns everything, dirs 0755, files 0644,
 # set in the root-owned staging copy BEFORE anything reaches the live path.
+# The durations directories: the repos list and the creator are staged beside the runner. The nightly runs as
+# the CI runner user (ci-builder-bootstrap.sh: `svc.sh install ubuntu`), so that user owns each repo directory.
+bash "$STAGE/gate-durations-dirs.sh" /var/lib/pneuma-gate "${PNEUMA_GATE_RUNNER_USER:-ubuntu}" "$STAGE/gate-durations-repos.txt"
 chown -R root:root "$STAGE/profiles"
 find "$STAGE/profiles" -type d -exec chmod 0755 {} +
 find "$STAGE/profiles" -type f -exec chmod 0644 {} +

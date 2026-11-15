@@ -1,0 +1,3 @@
+# Repos whose nightly publishes per-test durations for the merge gate (one name per line).
+# Each gets /var/lib/pneuma-gate/durations/<repo>/, owned by the CI runner user. Adding a repo is one line here.
+pneuma-engine
