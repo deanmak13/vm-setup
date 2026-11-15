@@ -5,29 +5,41 @@
 #   --dir DIR       output dir (default: $PNEUMA_SESSION_RESTORE_DIR or ~/.cache/pneuma-session-restore)
 #   --stdout        print JSON, write nothing
 set -euo pipefail
-SOCKET="${PNEUMA_TMUX_SOCKET:-/tmp/tmux-$(id -u)/default}"
+SOCKET="${PNEUMA_TMUX_SOCKET:-}"   # empty = let tmux pick its own socket (tmux's ownership checks apply)
+SOCKNAME=""
 DIR="${PNEUMA_SESSION_RESTORE_DIR:-$HOME/.cache/pneuma-session-restore}"
 STDOUT=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --socket) SOCKET="$2"; shift 2 ;;
+    --socket-name) SOCKNAME="$2"; shift 2 ;;
     --dir) DIR="$2"; shift 2 ;;
     --stdout) STDOUT=1; shift ;;
     -h|--help) sed -n '2,7p' "$0"; exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
-[ -S "$SOCKET" ] || { echo "snapshot: no tmux server at $SOCKET; nothing to snapshot" >&2; exit 0; }
+# An explicit socket path is only trusted if its directory and the socket belong to us and the dir is private.
+check_socket() {
+  local s="$1" d; d="$(dirname -- "$s")"
+  [ ! -L "$d" ] && [ -d "$d" ] && [ "$(stat -c '%u %a' -- "$d")" = "$(id -u) 700" ] || { echo "refusing socket $s: parent dir must be a non-symlink owned by uid $(id -u), mode 0700" >&2; exit 1; }
+  [ -S "$s" ] && [ ! -L "$s" ] && [ "$(stat -c %u -- "$s")" = "$(id -u)" ] || { echo "refusing socket $s: not a socket owned by uid $(id -u)" >&2; exit 1; }
+}
+TM=(tmux)
+if [ -n "$SOCKET" ]; then check_socket "$SOCKET"; TM=(tmux -S "$SOCKET"); SOCK_MODE=-S; SOCK_VAL="$SOCKET"
+elif [ -n "$SOCKNAME" ]; then TM=(tmux -L "$SOCKNAME"); SOCK_MODE=-L; SOCK_VAL="$SOCKNAME"
+else SOCK_MODE=""; SOCK_VAL=""; fi
+"${TM[@]}" list-sessions >/dev/null 2>&1 || { echo "snapshot: no tmux server reachable; nothing to snapshot" >&2; exit 0; }
 mkdir -p "$DIR"
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
-export SOCKET DIR TS
+export SOCK_MODE SOCK_VAL DIR TS
 OUT="$(python3 -I - <<'PY'
 import json, os, re, subprocess, glob, datetime
-sock = os.environ["SOCKET"]; home = os.path.expanduser("~")
+sock = os.environ["SOCK_VAL"] or "(tmux default)"; home = os.path.expanduser("~")
 link_dir = os.environ.get("PAPERCLIP_LINK_DIR", home + "/.local/state/paperclip-link")
 tools = os.environ.get("PNEUMA_RESTORE_TOOLS", "k9s").split()
 def tmux(*a):
-    return subprocess.run(["tmux", "-S", sock, *a], capture_output=True, text=True).stdout
+    return subprocess.run(["tmux", *([os.environ["SOCK_MODE"], os.environ["SOCK_VAL"]] if os.environ["SOCK_MODE"] else []), *a], capture_output=True, text=True).stdout
 fmt = "\t".join("#{%s}" % f for f in ["session_name","window_index","window_name","pane_index","pane_id","pane_pid","pane_current_path","pane_current_command","pane_title"])
 panes = [l.split("\t") for l in tmux("list-panes","-a","-F",fmt).splitlines() if l]
 ps = {}
@@ -57,6 +69,18 @@ for f in glob.glob(link_dir + "/*"):
         if isinstance(d, dict) and "session" in d: links[os.path.basename(f)] = d
     except Exception: pass
 def codex_file(sid): return glob.glob(f"{home}/.codex/sessions/*/*/*/rollout-*{sid}*.jsonl")
+import sys
+ID_RE = re.compile(r"^[0-9a-fA-F-]{8,64}$"); VAL_RE = re.compile(r"^[A-Za-z0-9._/@-]+$"); NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+NOVAL = {"--dangerously-skip-permissions", "--dangerously-bypass-approvals-and-sandbox"}
+WITHVAL = {"--settings", "--name"}
+def flags_ok(fl):
+    i = 0
+    while i < len(fl):
+        if fl[i] in NOVAL: i += 1
+        elif fl[i] in WITHVAL and i + 1 < len(fl) and VAL_RE.match(fl[i+1]): i += 2
+        else: return False
+    return True
+def report(msg): print("snapshot: DROPPED " + msg, file=sys.stderr)
 entries = []
 for sess, widx, wname, pidx, pane_id, ppid, pcwd, pcmd, ptitle in panes:
     e = dict(session=sess, window_index=int(widx), window_name=wname, pane_index=int(pidx), pane_id=pane_id,
@@ -101,7 +125,7 @@ for sess, widx, wname, pidx, pane_id, ppid, pcwd, pcmd, ptitle in panes:
                     e.update(session_id=d["session"], confidence="confident", id_source=f"paperclip link {slug} (pane+title)")
         e["launch_base"] = " ".join([client] + [x for x in flags])
     elif pcmd in tools:
-        e["launch"] = pcmd; e["note"] = "tool relaunched, no state"
+        e["launch"] = [pcmd]; e["note"] = "tool relaunched, no state"
     entries.append(e)
 # Codex: resolve remaining panes by link pane id (unique) then by elimination.
 claimed = {e["session_id"] for e in entries if e["session_id"]}
@@ -128,15 +152,20 @@ for e in entries:
     if e["session_id"]:
         for slug, d in links.items():
             if d["session"] == e["session_id"]: e["paperclip_slug"] = slug
-        if e["client"] == "claude": e["launch"] = f"claude --resume {e['session_id']} " + " ".join(e["flags"])
-        else:
-            fl = " ".join(x for x in e["flags"] if x != "resume")
-            e["launch"] = f"codex resume {e['session_id']} {fl}"
-        e["launch"] = e["launch"].strip()
+        if not ID_RE.match(e["session_id"]) or not flags_ok(e["flags"]):
+            report(f"launch for {e['session']}:{e['window_index']} (bad session id or flag: {e['session_id']!r} {e['flags']!r}); window kept as plain shell")
+            e["launch"] = None; e["note"] = "launch dropped: failed validation"
+        elif e["client"] == "claude": e["launch"] = ["claude", "--resume", e["session_id"]] + e["flags"]
+        else: e["launch"] = ["codex", "resume", e["session_id"]] + [x for x in e["flags"] if x != "resume"]
     elif e["client"] in ("claude","codex"):
         e["note"] = "session id not found; window restored as plain shell"
         e["launch"] = None
     e.pop("launch_base", None)
+ok = []
+for e in entries:
+    if NAME_RE.match(e["session"]) and NAME_RE.match(e["window_name"]): ok.append(e)
+    else: report(f"pane {e['session']!r}:{e['window_index']} {e['window_name']!r} (name fails ^[A-Za-z0-9._-]+$)")
+entries = ok
 snap = dict(taken_at_utc=os.environ["TS"], socket=sock, host=os.uname().nodename, panes=entries)
 print(json.dumps(snap, indent=2))
 PY

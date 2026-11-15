@@ -10,13 +10,14 @@ User-level systemd units (in `../systemd/`); no sudo to install.
   (`claude|codex|shell`), the exact resume command, the agent session id, a confidence
   (`confident|inferred|guess`) and the Paperclip slug. Output: `~/.cache/pneuma-session-restore/snapshot-<UTC>.json`
   plus `latest.json` (newest 288 kept; an empty tmux server never overwrites `latest.json`).
+  - Every launch is stored as an argv list (never a shell string); session ids and flags are validated against allow-lists.
   - Claude id: `CLAUDE_CODE_SESSION_ID` from a child process environ (confident); fallback newest
     `~/.claude/projects/<cwd>/*.jsonl` (guess).
   - Codex id: Paperclip link file (`~/.local/state/paperclip-link/<slug>`) matched by pane id and slug in the pane
     title (confident), then by elimination (inferred), then newest rollout for the cwd (guess).
 - `restore.sh` (boot, 45 s after the user manager): for each session/window in snapshot order, creates the tmux
   session or window with the same name and index if it is missing (existing ones are skipped, so it is idempotent),
-  `cd`s to the cwd (falls back to `~/Repos/pneuma` when the cwd is gone), and types the resume command
+  `cd`s to the cwd (falls back to `~/Repos/pneuma` when the cwd is gone), and starts the client with tmux argv form (no shell string, no send-keys; re-validated from the snapshot)
   (`claude --resume <id> <original flags>` / `codex resume <id> <original flags>`). `--dry-run` prints the plan only.
   Prints a table of what was restored. Manual run: `pneuma-session-restore [--dry-run] [--snapshot FILE]`.
 - The tmux server started by the restore unit is launched through `systemd-run --user --scope` so it outlives the
@@ -57,5 +58,5 @@ service has finished.
 
 ## Environment overrides
 
-`PNEUMA_TMUX_SOCKET`, `PNEUMA_SESSION_RESTORE_DIR`, `PNEUMA_RESTORE_FALLBACK_CWD`, `PNEUMA_RESTORE_TOOLS`,
+`PNEUMA_TMUX_SOCKET` (explicit socket; parent dir must be private, uid-owned, non-symlink; default: tmux chooses), `PNEUMA_SESSION_RESTORE_DIR`, `PNEUMA_RESTORE_FALLBACK_CWD`, `PNEUMA_RESTORE_TOOLS`,
 `PNEUMA_RESTORE_SERVER_WRAP`, `PAPERCLIP_LINK_DIR`.
